@@ -22,7 +22,7 @@
     <a href="https://github.com/floofycrew/kirocrew-ide/issues"><img alt="Issues" src="https://img.shields.io/github/issues/floofycrew/kirocrew-ide?style=for-the-badge&color=2d2d34"></a>
   </p>
   <br>
-  <img src=".github/shots/kirocrew-ide-dark.png" alt="The KiroCrew IDE: a VS Code workbench docked in the KiroCrew dashboard, with KiroCrew chat in the side bar" width="900">
+  <img src=".github/shots/kirocrew-ide.png" alt="The KiroCrew IDE: a VS Code workbench docked in the KiroCrew dashboard, with KiroCrew chat in the side bar" width="900">
 </div>
 
 <br>
@@ -102,12 +102,9 @@ while the engine runs. **Fullscreen** raises it over the whole dashboard.
 
 **The workbench** is VS Code with KiroCrew in the secondary side bar: one
 session per chat tab, every installed agent in the picker, approvals inline,
-file paths as links into editor tabs. The dashboard chrome follows your light
-or dark mode; the editor keeps the VS Code theme you choose.
-
-<div align="center">
-  <img src=".github/shots/kirocrew-ide-light.png" alt="The workbench with the dashboard in light mode" width="860">
-</div>
+file paths as links into editor tabs. Out of the box the workbench follows the
+dashboard's light or dark mode with the matching stock VS Code theme; pick any
+other theme and it stays yours.
 
 <div align="right">[<a href="#readme-top">back to top</a>]</div>
 
