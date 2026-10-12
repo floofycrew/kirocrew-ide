@@ -1,0 +1,305 @@
+{
+  "name": "kirocrew-ide-bridge",
+  "displayName": "KiroCrew",
+  "description": "KiroCrew chat (tabbed, with per-project history), agents, approvals, and the Kiro spec / steering / skills / hooks workflow inside the IDE. Sessions run in the KiroCrew gateway and survive a dropped connection. Installed by the kirocrew-ide FloofyCrew mod. Unofficial.",
+  "version": "0.17.3",
+  "publisher": "kirocrew-ide",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "web"
+  ],
+  "browser": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true,
+      "description": "Chat and sessions run in the KiroCrew gateway; the extension itself executes nothing from the workspace."
+    },
+    "virtualWorkspaces": true
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kirocrew",
+          "title": "KiroCrew",
+          "icon": "media/kiro.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "kirocrew-chat",
+          "title": "KiroCrew Chat",
+          "icon": "media/kiro.svg"
+        }
+      ]
+    },
+    "views": {
+      "kirocrew-chat": [
+        {
+          "type": "webview",
+          "id": "kirocrew.chat",
+          "name": "Chat",
+          "initialSize": 1
+        }
+      ],
+      "kirocrew": [
+        {
+          "id": "kirocrew.specs",
+          "name": "Specs"
+        },
+        {
+          "id": "kirocrew.steering",
+          "name": "Steering"
+        },
+        {
+          "id": "kirocrew.skills",
+          "name": "Skills"
+        },
+        {
+          "id": "kirocrew.hooks",
+          "name": "Agent Hooks"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "kirocrew.newSession",
+        "title": "KiroCrew: New session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "kirocrew.toggleChat",
+        "title": "KiroCrew: Toggle chat side bar",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "kirocrew.chat.reload",
+        "title": "KiroCrew: Reload chat view",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "kirocrew.pickAgent",
+        "title": "KiroCrew: Choose agent",
+        "icon": "$(person)"
+      },
+      {
+        "command": "kirocrew.openSession",
+        "title": "KiroCrew: Open session"
+      },
+      {
+        "command": "kirocrew.refresh",
+        "title": "KiroCrew: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "kirocrew.spec.new",
+        "title": "KiroCrew Spec: New spec",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "kirocrew.spec.requirements",
+        "title": "KiroCrew Spec: Write requirements"
+      },
+      {
+        "command": "kirocrew.spec.design",
+        "title": "KiroCrew Spec: Write design"
+      },
+      {
+        "command": "kirocrew.spec.tasks",
+        "title": "KiroCrew Spec: Write tasks"
+      },
+      {
+        "command": "kirocrew.spec.runTask",
+        "title": "KiroCrew Spec: Start task",
+        "icon": "$(play)"
+      },
+      {
+        "command": "kirocrew.spec.runAll",
+        "title": "KiroCrew Spec: Run all tasks",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "kirocrew.spec.runAllOptional",
+        "title": "KiroCrew Spec: Run all required and optional tasks"
+      },
+      {
+        "command": "kirocrew.spec.open",
+        "title": "KiroCrew Spec: Open file"
+      },
+      {
+        "command": "kirocrew.openInDashboard",
+        "title": "KiroCrew: Open session in dashboard",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "kirocrew.stopSession",
+        "title": "KiroCrew: Stop session",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "kirocrew.history",
+        "title": "KiroCrew: Session history for this folder",
+        "icon": "$(history)"
+      },
+      {
+        "command": "kirocrew.steering.new",
+        "title": "KiroCrew: New steering file",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "kirocrew.skills.new",
+        "title": "KiroCrew: New skill",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "kirocrew.hooks.new",
+        "title": "KiroCrew: New agent hook",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "kirocrew.openFile",
+        "title": "KiroCrew: Open file"
+      },
+      {
+        "command": "kirocrew.spec.editSource",
+        "title": "KiroCrew Spec: Edit markdown source",
+        "icon": "$(go-to-file)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "kirocrew.newSession",
+          "when": "view == kirocrew.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "kirocrew.history",
+          "when": "view == kirocrew.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "kirocrew.chat.reload",
+          "when": "view == kirocrew.chat",
+          "group": "1_view@1"
+        },
+        {
+          "command": "kirocrew.refresh",
+          "when": "view =~ /^kirocrew\\.(specs|steering|skills|hooks)$/",
+          "group": "navigation@9"
+        },
+        {
+          "command": "kirocrew.spec.new",
+          "when": "view == kirocrew.specs",
+          "group": "navigation"
+        },
+        {
+          "command": "kirocrew.steering.new",
+          "when": "view == kirocrew.steering",
+          "group": "navigation"
+        },
+        {
+          "command": "kirocrew.skills.new",
+          "when": "view == kirocrew.skills",
+          "group": "navigation"
+        },
+        {
+          "command": "kirocrew.hooks.new",
+          "when": "view == kirocrew.hooks",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "kirocrew.spec.runTask",
+          "when": "view == kirocrew.specs && viewItem == task-open",
+          "group": "inline"
+        },
+        {
+          "command": "kirocrew.spec.runAll",
+          "when": "view == kirocrew.specs && viewItem == spec",
+          "group": "inline"
+        },
+        {
+          "command": "kirocrew.spec.runAllOptional",
+          "when": "view == kirocrew.specs && viewItem == spec"
+        },
+        {
+          "command": "kirocrew.spec.requirements",
+          "when": "view == kirocrew.specs && viewItem == spec"
+        },
+        {
+          "command": "kirocrew.spec.design",
+          "when": "view == kirocrew.specs && viewItem == spec"
+        },
+        {
+          "command": "kirocrew.spec.tasks",
+          "when": "view == kirocrew.specs && viewItem == spec"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "KiroCrew",
+      "properties": {
+        "kirocrew.agent": {
+          "type": "string",
+          "default": "",
+          "description": "KiroCrew agent used for new chats and spec phases (empty = the crew's default)."
+        },
+        "kirocrew.specAgent": {
+          "type": "string",
+          "default": "",
+          "description": "KiroCrew agent used to execute spec tasks (empty = same as kirocrew.agent)."
+        },
+        "kirocrew.specAutopilot": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run spec tasks (Start task, Run all tasks) with Autopilot on, as Kiro's IDE does: every tool of that session is approved without asking, so a run-all goes through the whole task list without stopping."
+        },
+        "kirocrew.folderName": {
+          "type": "string",
+          "default": "KiroCrew IDE",
+          "description": "Dashboard chat folder that sessions created from the IDE are grouped under."
+        },
+        "kirocrew.notifyApprovals": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a notification with Approve / Reject when a session waits for a tool approval."
+        },
+        "kirocrew.syncTheme": {
+          "type": "boolean",
+          "default": true,
+          "description": "Follow the KiroCrew dashboard's light/dark scheme with the workbench's stock theme (a theme you picked yourself is never changed)."
+        },
+        "kirocrew.chatFontSize": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 32,
+          "description": "Font size (px) of the messages in KiroCrew Chat; 0 = the workbench font size. Only the transcript changes, not the UI."
+        }
+      }
+    },
+    "customEditors": [
+      {
+        "viewType": "kirocrew.spec",
+        "displayName": "Kiro Spec",
+        "selector": [
+          {
+            "filenamePattern": "**/.kiro/specs/**/{requirements,design,tasks}.md"
+          }
+        ],
+        "priority": "default"
+      }
+    ]
+  }
+}

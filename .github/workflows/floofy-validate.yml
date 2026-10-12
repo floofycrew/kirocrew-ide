@@ -1,0 +1,25 @@
+name: floofy validate
+on: [push, pull_request]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the floofy CLI (the wheel from FloofyCrew's latest GitHub release, verified against SHA256SUMS)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$(gh release view --repo floofycrew/FloofyCrew --json tagName --jq .tagName)
+          gh release download "$tag" --repo floofycrew/FloofyCrew --pattern 'SHA256SUMS' --pattern 'floofycrew-*-py3-none-any.whl' --dir dist
+          cd dist
+          grep -- '-py3-none-any.whl$' SHA256SUMS > wheel.sum
+          sha256sum -c wheel.sum
+          pip install ./floofycrew-*-py3-none-any.whl
+      - name: Validate the mod (schema, hashes, parts, targets, network scan)
+        run: floofy validate .
+      - name: Smoke test
+        run: python tests/smoke_test.py

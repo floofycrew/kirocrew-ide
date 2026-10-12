@@ -1,0 +1,307 @@
+{
+  "schema": 1,
+  "id": "kirocrew-ide",
+  "name": "KiroCrew IDE",
+  "version": "0.18.1",
+  "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
+  "authors": [
+    "Oscar Tseng"
+  ],
+  "license": "MIT",
+  "icon": "ui/icon.svg",
+  "tags": [
+    "ide",
+    "vscode",
+    "editor",
+    "productivity"
+  ],
+  "kirocrew": {
+    "version": ">=0.7.0 <0.9.0",
+    "editions": [
+      "internal",
+      "external"
+    ],
+    "strict": false
+  },
+  "dependsOn": {
+    "floofycrew": "^1.2"
+  },
+  "recommends": {
+    "kiro-spec-plan": ">=0.1.0"
+  },
+  "network": {
+    "hosts": [
+      "api.github.com",
+      "github.com",
+      "objects.githubusercontent.com",
+      "release-assets.githubusercontent.com"
+    ],
+    "credentials": false
+  },
+  "parts": [
+    {
+      "kind": "python-hook",
+      "side": "gateway",
+      "path": "hook/",
+      "module": "hook",
+      "early": true,
+      "description": "IDE engine supervisor: spawns openvscode-server/code-server on 127.0.0.1; routes status/start/stop/engines; adopts a still-running engine across gateway restarts. early: installs the same-origin workbench proxy (a raw WebSocket-capable aiohttp route) so no second port needs forwarding on a remote host"
+    },
+    {
+      "kind": "ui",
+      "side": "spa",
+      "path": "ui/",
+      "entry": "ui/page.mjs",
+      "title": "KiroCrew IDE",
+      "icon": "ui/icon.svg",
+      "description": "fallback control panel in the FloofyCrew App: engine status, folder, start/stop"
+    },
+    {
+      "kind": "spa",
+      "side": "spa",
+      "path": "spa/layer.mjs",
+      "activation": "runtime",
+      "description": "the IDE layer: the one workbench iframe as a persistent element of the dashboard (never unmounted) that is fullscreen over KiroCrew, docked inside the KiroCrew IDE App page, or hidden; a '<host> IDE' chip in KiroCrew's crew switcher, and a title-bar tag stack that switches hosts, returns to this host's dashboard or exits fullscreen to the App page without reloading the IDE; a per-workspace spec-task completeness donut at the workbench's top right with a per-spec breakdown"
+    },
+    {
+      "kind": "app",
+      "side": "gateway",
+      "path": "app/app.json",
+      "description": "the KiroCrew IDE App: a first-class sidebar app whose page is the controller (engine install, folder, start/stop, Fullscreen) and the dock the spa layer shows the workbench in while the page is open"
+    }
+  ],
+  "files": [
+    {
+      "path": "Config",
+      "sha256": "44b1c9e97982b933fca84841ee8483c7445454be4f5080f38c44712f02146820"
+    },
+    {
+      "path": "DESIGN.md",
+      "sha256": "8624edc4561c02e092e108ace8b1c0b060e5a701ab9fbf49daf32806a1a6b6bb"
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "b57d9b53507e9a8f736dc1598dbb8d3738c0cfe3c5eeb6c3eaacf208b7c6607c"
+    },
+    {
+      "path": "README.md",
+      "sha256": "f73287d47eb70ebd9f80a51e23a3ad335c1d9bfac1387a0287ff89b112ba7af6"
+    },
+    {
+      "path": "app/app.json",
+      "sha256": "2fcba45b89fff129c5eb3b5b2cc9e095dff8ff47217e23c8d9a2170a5b0ec8fa"
+    },
+    {
+      "path": "app/ui/art/fox.svg",
+      "sha256": "da1ab5c356a82b0d7157773d24015bcb0e816b3a9d2916a062b45c06e885e8af"
+    },
+    {
+      "path": "app/ui/art/icon.svg",
+      "sha256": "1b8da99b3eb82202138aeb7a6ee26aa57bba9a2658af83478b3d5c3d7337523d"
+    },
+    {
+      "path": "app/ui/index.mjs",
+      "sha256": "0628c0e8fe14b76cfb18354d5742eb097ec8db9e03f7b49bbc9b2e9bada666b3"
+    },
+    {
+      "path": "extension/extension.js",
+      "sha256": "472774b2a177611660495ac68d56c9d2e8ab319f936760931db6d82a34bffa3c"
+    },
+    {
+      "path": "extension/media/fox.svg",
+      "sha256": "da1ab5c356a82b0d7157773d24015bcb0e816b3a9d2916a062b45c06e885e8af"
+    },
+    {
+      "path": "extension/media/kiro.svg",
+      "sha256": "31b58d5aceeaab69dbcc35cf26938809882bac1ec3e9fc55a1e79c6a2366ad31"
+    },
+    {
+      "path": "extension/package.json",
+      "sha256": "5cf251abed2cc390e2f7461270572a37a8f473626f4c5dd691d5df71e79523d5"
+    },
+    {
+      "path": "hook/__init__.py",
+      "sha256": "855945906a9b6e4514a66eb39e27dc655ff198a9c6e544c3daf39e0b5352c657"
+    },
+    {
+      "path": "spa/hostmodel.mjs",
+      "sha256": "96b59c309ed679713555fa36eaa512203e0b75dd6e3f6d85f1e5a8baa000c2ba"
+    },
+    {
+      "path": "spa/layer.mjs",
+      "sha256": "cb0ad0f8f605d2e11f4e18a0607f153e319e42727489808856823e5aadd9f258"
+    },
+    {
+      "path": "spa/progress.mjs",
+      "sha256": "c603b1ecab1bf3c8da523be1f1436a68771e8a0504cf978c20f5c8bae205c4bc"
+    },
+    {
+      "path": "spa/workbench.mjs",
+      "sha256": "010dafa9dfc3f5603c4c744fd60151063f3806f2b02c2fa787a8de659fd8bd0d"
+    },
+    {
+      "path": "tests/activity_order_test.py",
+      "sha256": "bc37af7d058f9f2b6ca7ff5e5e2c7482f2f8ee06549975b6f4c26b5bcd3e051b"
+    },
+    {
+      "path": "tests/app_icon_test.py",
+      "sha256": "290cdb89ad9e52d5562ed8337958acc004834b193e80ade2a931a302eed202f9"
+    },
+    {
+      "path": "tests/app_theme.test.mjs",
+      "sha256": "c6e03ef8ea9de0d7c5fe2fe909f71c732965f94fe16f9f698642893000b2ebe0"
+    },
+    {
+      "path": "tests/browse_test.py",
+      "sha256": "fbac2523e8248cf1ad717113381646550d8ff86888fb91ec31d1da4b329dfd2d"
+    },
+    {
+      "path": "tests/e2e/chat_roundtrip.py",
+      "sha256": "9e9b7ccf01dbcf4a5f93ae819ea8383120f2a83fbfc6c27c486dfd137e3733db"
+    },
+    {
+      "path": "tests/e2e/probe_activity_order.py",
+      "sha256": "8f882abdaddf21849e1059888a474290aa849c01a9bea455241eb9bb1e3fd7b7"
+    },
+    {
+      "path": "tests/e2e/probe_chat_webview.py",
+      "sha256": "6b4396d2909ddb968a68b28d2ff91ca29704f9068029d9e5530f2d3d9690805b"
+    },
+    {
+      "path": "tests/e2e/probe_composer.py",
+      "sha256": "d3965b1d3058bdf0d3090725052970551ee244f56233317c97582b0778490a74"
+    },
+    {
+      "path": "tests/e2e/probe_extension.py",
+      "sha256": "7636b3c8e6d38c989fbc27007885be65e3d64fa0fc0e3833f4091d6ff61de48a"
+    },
+    {
+      "path": "tests/e2e/probe_hosts.py",
+      "sha256": "495940cbf29638217834365a6fc9a3b13c58608ddd187e9fdabd0e4c8b590c1a"
+    },
+    {
+      "path": "tests/e2e/probe_markdown.py",
+      "sha256": "fa150dac8a06fc444148cb4e23e75f05be99a23980fe33dd3d6227f3a19a4150"
+    },
+    {
+      "path": "tests/e2e/probe_measure.py",
+      "sha256": "3f8fb89596ed4675f25f4c20fd5ae70b22b32cdc3eb70b1a799aa17c6bc2e134"
+    },
+    {
+      "path": "tests/e2e/probe_profile.py",
+      "sha256": "b5a16464d269f4eb710f8a2a82afad6533b008fc23b37b2f4193099c3a83710d"
+    },
+    {
+      "path": "tests/e2e/probe_spec_editor.py",
+      "sha256": "215dee7bac1f9963cff37ec4d20f024cc3c92ccd3ba0311091d92ea3113b4a46"
+    },
+    {
+      "path": "tests/e2e/proxy_harness.py",
+      "sha256": "38af593800e86caf36ff4e8d83560bd33db32e0fb69cd5169b10b0578eba3d3f"
+    },
+    {
+      "path": "tests/e2e/render_chat_html.mjs",
+      "sha256": "51fc9833aaf0f685ae4ef9c2f0c19e65a7ca84a696d947244d54ec4a3e020bb3"
+    },
+    {
+      "path": "tests/early_contract_test.py",
+      "sha256": "adacc09d980a0dcca3a4bf7d05949b7aec3d3dbb561676c61f6a9be190932908"
+    },
+    {
+      "path": "tests/extension_provision_test.py",
+      "sha256": "79a5732870b9346645cb9cf65ebc80a70b115097bd236c06b8c3d65b46ca09d6"
+    },
+    {
+      "path": "tests/extension_unit.test.mjs",
+      "sha256": "8427163f0e3b5688623f8def496a32fec61e830113b59d42c5ca98dbf68a70d3"
+    },
+    {
+      "path": "tests/gitdiff_test.py",
+      "sha256": "ded8a4995b3507df7ba71c2518b051d12af8e081a80ceef23a18515990735bb1"
+    },
+    {
+      "path": "tests/hostmodel.test.mjs",
+      "sha256": "5985b30a7ff10d09e135d7dcccb281dd8290cc08a7f37230ca1a52234268ac26"
+    },
+    {
+      "path": "tests/import_check.py",
+      "sha256": "e31f605803b223761efc11245a6e089b61dc1dbbd12d856e242ed199878e40c2"
+    },
+    {
+      "path": "tests/layer.test.mjs",
+      "sha256": "8687c6c855eeb819e87a6442c699ad554a7fc6440e905d6c1305eae55aae3625"
+    },
+    {
+      "path": "tests/lazy_armer_test.py",
+      "sha256": "6a0be3aa2079bbbddaa7fabe56052feade3272301a381881442044082faeb28e"
+    },
+    {
+      "path": "tests/letterpress_test.py",
+      "sha256": "138c8b2af10c9b3a584661d3af2b647cc113865d5aab37fa2d42f3ff2247ec2d"
+    },
+    {
+      "path": "tests/machine_settings_test.py",
+      "sha256": "bb3a0fc37c42658a6c48ffc8f6c81d0b32a274253cb33d3511cb391d681b0eb1"
+    },
+    {
+      "path": "tests/mod_icon_test.py",
+      "sha256": "3c312f748bfa4f996ec9952357885981b45e33f00610ce1fe8e41fa9cbcc6cf6"
+    },
+    {
+      "path": "tests/mode_mismatch_test.py",
+      "sha256": "c4de3be24d5b4d859b7e18b44c0ffde047a181b2c2b30c6d9ea1d5477d5ffb8c"
+    },
+    {
+      "path": "tests/profile_seed_test.py",
+      "sha256": "28f2a9d1a70c331d2a4b4b4a5b7fa25c84b3bfec72ee9e5f6dfbe0b0c1cae858"
+    },
+    {
+      "path": "tests/progress.test.mjs",
+      "sha256": "d59c055d397458d080a59b2f6b3ae22a3b26c74d50f3e1b10b624b86ab5893cb"
+    },
+    {
+      "path": "tests/progress_test.py",
+      "sha256": "f9293ffc1dfa1ccd01ac4ad2411f3cf7ad7da57f551f7397d851a823ecf37e8a"
+    },
+    {
+      "path": "tests/reload_survives_test.py",
+      "sha256": "283046734313ec38ea96e000402cc97b61f7b42b7d462b9ddc78a06a4a9b8e6f"
+    },
+    {
+      "path": "tests/smoke_test.py",
+      "sha256": "0af2adc8bc063e2d00b3d21caca9bb22a99e4384aef1bacb845748182cebdc60"
+    },
+    {
+      "path": "tests/spec_editor.test.mjs",
+      "sha256": "f169d0ee2e2d89e0fec1a8b8898dccaa5f5b1723aabae2ded6f8da0e726a8d11"
+    },
+    {
+      "path": "tests/sw_cookie_probe.py",
+      "sha256": "05e7645bf4092cfb5abeef9ea4bd924459e271981f8f8510c79873647f9d0e2f"
+    },
+    {
+      "path": "tests/theme_test.py",
+      "sha256": "6f42453bb0756b2e7fe6244e61050559d40ad50e16b840b7bb6c66fe33b2ad7a"
+    },
+    {
+      "path": "tests/trampoline_test.py",
+      "sha256": "fb2d2c2c24cc877d0083349ab09aa46575b261c04b24a2eaf4a95c820fb80b8f"
+    },
+    {
+      "path": "tests/webview_endpoint_test.py",
+      "sha256": "a79d649d09f4353a26141ddcb8e576c9a878676097d7d111ed1066852630e101"
+    },
+    {
+      "path": "tests/workspaces_test.py",
+      "sha256": "3a65e9885b2e3f683c29dffa0c6bbd2f4280d9225cc9542da6e1a57e81bafdaa"
+    },
+    {
+      "path": "ui/icon.svg",
+      "sha256": "da1ab5c356a82b0d7157773d24015bcb0e816b3a9d2916a062b45c06e885e8af"
+    },
+    {
+      "path": "ui/page.mjs",
+      "sha256": "a411f07bfee31355a9603edd8910a6df18a69f58006abc09240f8f2e1f1624b3"
+    }
+  ]
+}
