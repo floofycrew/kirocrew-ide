@@ -299,6 +299,195 @@ test("a task run dispatched to Kiro's Spec agent sends Kiro's own request, shows
 });
 
 
+test("attachments go the dashboard's way: [attached_file N] markers in the text plus meta.files, never 'Attached file:' prose or a markdown image", async () => {
+  // Before: an image went as `![name](path)` and any other file as "Attached file: <path>" with no meta, a shape
+  // the host never writes itself (the dashboard sends `[attached_file N] <path>` + meta.files); the host's own
+  // renderer then had nothing to resolve and the model saw stray prose instead of a marker it knows.
+  const { ChatView } = ext.__test;
+  const calls = { sent: [], uploaded: [], posted: [] };
+  const sessions = {
+    projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [],
+    create: async () => "k1", inject: async () => {}, setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, setSlotAgent: async () => {},
+    upload: async (name) => { calls.uploaded.push(name); return "/data/uploads/" + calls.uploaded.length + "_" + name; },
+    send: async (key, text, agent, meta) => { calls.sent.push({ key, text, agent, meta }); },
+  };
+  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+  chat.post = (m) => calls.posted.push(m);
+  const t = chat.newTab(true);
+  await chat.send(t, { text: "compare these", files: [{ name: "shot.png", mime: "image/png", data: "AAAA" }, { name: "app.log", mime: "text/plain", data: "AAAA" }] });
+  assert.equal(calls.sent.length, 1);
+  assert.equal(calls.sent[0].text, "compare these\n[attached_file 1] /data/uploads/1_shot.png\n[attached_file 2] /data/uploads/2_app.log");
+  assert.deepEqual(calls.sent[0].meta, { files: ["/data/uploads/1_shot.png", "/data/uploads/2_app.log"] });
+  const shown = calls.posted.find((m) => m.type === "user");
+  assert.equal(shown.text, "compare these", "the transcript shows the typed text; the chips name the files");
+  assert.deepEqual(shown.files, ["shot.png", "app.log"]);
+  // No text at all: a stand-in sentence, markers, meta.
+  await chat.send(t, { text: "", files: [{ name: "a.pdf", mime: "application/pdf", data: "AAAA" }] });
+  assert.equal(calls.sent[1].text, "[attached_file 1] /data/uploads/3_a.pdf");
+  assert.deepEqual(calls.sent[1].meta, { files: ["/data/uploads/3_a.pdf"] });
+  // No attachments: no meta on the wire.
+  await chat.send(t, { text: "hi" });
+  assert.equal(calls.sent[2].meta, undefined);
+});
+
+test("steering front matter: Kiro's inclusion modes, patterns in every spelling, no front matter = always", () => {
+  const { parseSteering } = ext.__test;
+  assert.deepEqual(parseSteering("# Rules\nbe nice").inclusion, "always");
+  assert.equal(parseSteering("\n---\ninclusion: manual\n---\nx").inclusion, "always", "front matter must start on line 1, as Kiro reads it");
+  const fm = parseSteering('---\ninclusion: fileMatch\nfileMatchPattern: "**/*.test.ts"\n---\n# Tests\nuse vitest');
+  assert.deepEqual([fm.inclusion, fm.patterns, fm.body], ["fileMatch", ["**/*.test.ts"], "# Tests\nuse vitest"]);
+  assert.deepEqual(parseSteering("---\ninclusion: fileMatch\nfileMatchPattern: ['src/**/*.py', \"*.md\"]\n---\n").patterns, ["src/**/*.py", "*.md"]);
+  assert.deepEqual(parseSteering("---\ninclusion: fileMatch\nfileMatchPattern: a.ts, b/*.ts\n---\n").patterns, ["a.ts", "b/*.ts"]);
+  assert.equal(parseSteering("---\ninclusion: fileMatch\n---\n").inclusion, "manual", "fileMatch without a pattern can only be included by name");
+  assert.equal(parseSteering("---\ninclusion: Manual\n---\n").inclusion, "manual");
+  assert.equal(parseSteering("---\ninclusion: auto\ndescription: deploy steps\n---\n").description, "deploy steps");
+  assert.equal(parseSteering("---\ninclusion: weird\n---\n").inclusion, "manual", "an unknown mode is not always");
+  assert.equal(parseSteering("---\r\ninclusion: manual\r\n---\r\nbody").body, "body", "CRLF");
+});
+
+test("steering fileMatch: Kiro globs against the relative path and the basename", () => {
+  const { globToRegExp, steeringMatches } = ext.__test;
+  assert.ok(globToRegExp("**/*.py").test("src/a/b.py") && globToRegExp("**/*.py").test("b.py"));
+  assert.ok(globToRegExp("src/**/*.tsx").test("src/components/x/y.tsx") && !globToRegExp("src/**/*.tsx").test("lib/y.tsx"));
+  assert.ok(globToRegExp("README*").test("README.md") && !globToRegExp("README*").test("docs/README.md"));
+  assert.ok(globToRegExp("*.{js,mjs}").test("a.mjs") && !globToRegExp("*.{js,mjs}").test("a.ts"));
+  assert.ok(globToRegExp("a?c.txt").test("abc.txt") && !globToRegExp("a?c.txt").test("ac.txt"));
+  const doc = { inclusion: "fileMatch", patterns: ["**/*.py"] };
+  assert.equal(steeringMatches(doc, ["/w/src/x.py"], "/w"), true);
+  assert.equal(steeringMatches(doc, ["/w/src/x.ts"], "/w"), false);
+  assert.equal(steeringMatches({ inclusion: "fileMatch", patterns: ["src/api/**/*.ts"] }, ["/w/src/api/v1/u.ts"], "/w/"), true, "root with a trailing slash, nested dirs");
+  assert.equal(steeringMatches({ inclusion: "fileMatch", patterns: ["src/api/**/*.ts"] }, ["/elsewhere/src/api/u.ts"], "/w"), false, "a file outside the workspace keeps its absolute path");
+  assert.equal(steeringMatches({ inclusion: "always", patterns: [] }, ["/w/a.py"], "/w"), false, "always files are the agent's, not a match");
+  assert.equal(steeringMatches({ inclusion: "manual", patterns: ["**/*"] }, ["/w/a.py"], "/w"), false);
+});
+
+test("steering mentions and agent resources: `#name` names a file; an agent with its own resources may leave steering out", () => {
+  const { steeringMentions, agentLoadsSteering } = ext.__test;
+  const docs = [{ name: "deploy-steps" }, { name: "api.rules" }, { name: "Style" }];
+  assert.deepEqual(steeringMentions("please #deploy-steps and #API.RULES now, see #nope and a#b", docs).map((d) => d.name), ["deploy-steps", "api.rules"]);
+  assert.deepEqual(steeringMentions("#style.md", docs).map((d) => d.name), ["Style"], "the .md suffix is tolerated");
+  assert.deepEqual(steeringMentions("#deploy-steps #deploy-steps", docs).length, 1);
+  assert.equal(agentLoadsSteering(null), null, "unknown agent: unknown (kiro-cli's default loads steering)");
+  assert.equal(agentLoadsSteering({ name: "x" }), true, "no resources key: inherits kiro-cli's defaults");
+  assert.equal(agentLoadsSteering({ resources: ["file://README.md", "file://.kiro/steering/**/*.md"] }), true);
+  assert.equal(agentLoadsSteering({ resources: ["file://README.md", "skill://.kiro/skills/*/SKILL.md"] }), false);
+});
+
+test("chat webview: steering indicator, `#name` hint, and a resizable input box with a remembered height", () => {
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  assert.ok(html.includes('id="p-steer"') && /case 'steering':/.test(html) && /function renderSteering\(\)/.test(html), "steering indicator fed by the extension");
+  assert.ok(/steeringPick/.test(html) && /steeringOpen/.test(html), "a manual file is included on pick, an always file opened");
+  assert.ok(/#steering-name to include/.test(html), "the box says how to include a manual file");
+  assert.ok(html.includes('id="grip"') && /function autoGrow\(\)/.test(html) && /case 'composerHeight':/.test(html) && /type:'composerHeight'/.test(html), "grip + auto-grow + persisted height");
+  assert.ok(/textarea\{[^}]*max-height:45vh/.test(html) && /textarea\.manual\{max-height:none\}/.test(html), "auto height capped, manual height free");
+});
+
+test("a host that reserves Kiro's mode ids: the refusal falls back to the prompt-guided workflow on the pick, once per window", async () => {
+  // KiroCrew 0.8.0.9 refuses a session whose agent is `spec`/`plan`/… ("reserved for a built-in agent"),
+  // which is exactly the name kiro-spec-plan's handles carry. The tab must not die on it.
+  const { ChatView, isReservedModeRefusal } = ext.__test;
+  assert.equal(isReservedModeRefusal("Rename this crewmate's template: “spec” is reserved for a built-in agent, so …"), true);
+  assert.equal(isReservedModeRefusal("'spec' is reserved by the KAS agent engine"), true);
+  assert.equal(isReservedModeRefusal("HTTP 500 /chat"), false);
+  const calls = { sent: [], injected: [], slotAgent: [], posted: [] };
+  let refuse = true;
+  const sessions = {
+    projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }, { name: "o3r" }],
+    create: async () => "k1", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {},
+    inject: async (key, content, source) => { calls.injected.push(source); }, setSlotAgent: async (key, a) => { calls.slotAgent.push(a); },
+    send: async (key, text, agent) => { calls.sent.push(agent); if (refuse && agent === "spec") throw new Error("Rename this crewmate's template: “spec” is reserved for a built-in agent, so the crewmate's own prompt and tools would not run under it."); },
+  };
+  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+  chat.post = (m) => calls.posted.push(m);
+  const t = chat.newTab(true); t.settings.mode = "spec"; t.settings.agent = "o3r";
+  await chat.send(t, { text: "build the thing" });
+  assert.deepEqual(calls.sent, ["spec", "o3r"], "sent to Kiro's agent, refused, re-sent on the pick");
+  assert.deepEqual(calls.slotAgent, ["o3r"], "the slot is retargeted to the pick");
+  assert.ok(calls.injected.includes("kirocrew-ide workflow"), "the prompt-guided Spec frame is injected for the retry");
+  assert.match(calls.posted.find((m) => m.type === "error").text, /refuses Kiro's mode agent "spec"/);
+  // The next tab skips the doomed attempt.
+  const t2 = chat.newTab(true); t2.settings.mode = "spec"; t2.settings.agent = "o3r";
+  await chat.send(t2, { text: "again" });
+  assert.equal(calls.sent[calls.sent.length - 1], "o3r");
+  assert.equal(calls.sent.filter((a) => a === "spec").length, 1, "no second attempt on the reserved id in this window");
+  // An unrelated error still surfaces.
+  refuse = false;
+  sessions.send = async () => { throw new Error("HTTP 502 /chat"); };
+  await assert.rejects(chat.send(chat.newTab(true), { text: "x" }), /502/);
+});
+
+test("the refusal that arrives as the turn's streamed error row (the send was accepted) also falls back, once", async () => {
+  // On this host `/chat?ws=1` answers 200 and the turn runs asynchronously; the
+  // KasReservedAgentIdError lands as an `error` row in the slot's history and a
+  // chat_message frame. Seen 2026-10-23 in kirocrew-ide-chat-20261023042311.
+  const { ChatView, isErrorRow } = ext.__test;
+  assert.equal(isErrorRow({ role: "error", content: "x" }), true);
+  assert.equal(isErrorRow({ role: "assistant", cls: "msg msg-err", content: "x" }), true);
+  assert.equal(isErrorRow({ role: "assistant", content: "❌ failed" }), true);
+  assert.equal(isErrorRow({ role: "assistant", content: "fine" }), false);
+  const refusal = "Rename this crewmate's template: “spec” is reserved for a built-in agent, so the crewmate's own prompt and tools would not run under it.";
+  const calls = { sent: [], injected: [], slotAgent: [], posted: [] };
+  const sessions = {
+    projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }, { name: "o3r" }],
+    create: async () => "k9", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {},
+    inject: async (key, content, source) => { calls.injected.push(source); }, setSlotAgent: async (key, a) => { calls.slotAgent.push(a); },
+    send: async (key, text, agent, meta) => { calls.sent.push([agent, text, meta]); },
+  };
+  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+  chat.post = (m) => calls.posted.push(m);
+  const t = chat.newTab(true); t.settings.mode = "spec"; t.settings.agent = "o3r";
+  await chat.send(t, { text: "check the drafted requirements file", files: [] });
+  assert.equal(calls.sent.length, 1, "the send was accepted");
+  assert.equal(calls.sent[0][0], "spec");
+  // The host streams the refusal as the turn's error row.
+  chat.onFrame({ type: "chat_message", data: { slot: "k9", role: "error", content: refusal } });
+  await new Promise((r) => setTimeout(r, 0)); await new Promise((r) => setTimeout(r, 0));
+  assert.equal(calls.sent.length, 2, "re-sent on the pick");
+  assert.deepEqual(calls.sent[1].slice(0, 2), ["o3r", "check the drafted requirements file"], "the same text, on the picked agent");
+  assert.deepEqual(calls.slotAgent, ["o3r"]);
+  assert.ok(calls.injected.includes("kirocrew-ide workflow"));
+  assert.ok(!calls.posted.some((m) => m.type === "row" && /reserved for a built-in/.test(m.row && m.row.content)), "the host's refusal row is replaced by our one-line note");
+  assert.match(calls.posted.find((m) => m.type === "error").text, /refuses Kiro's mode agent "spec"/);
+  // A second copy of the same row (history replay) does nothing more.
+  chat.onFrame({ type: "chat_message", data: { slot: "k9", role: "error", content: refusal } });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(calls.sent.length, 2, "the fallback runs once per turn");
+  assert.equal(chat.modeAgentsRefused, true);
+});
+
+test("# context picks are clipped to the host's 40000-char entry cap (a 51 KB requirements.md used to be refused)", async () => {
+  // Two functions named readText existed; the budget-less spec-model one was hoisted over
+  // the clipping one, so every #File / #Spec / steering pick went to the host whole.
+  const { readText, readWholeText, CONTEXT_BUDGET, HOST_CONTEXT_MAX, Sessions, clip } = ext.__test;
+  const big = "r".repeat(51600);
+  const savedFs = stub.workspace.fs;
+  stub.workspace.fs = { readFile: async () => new TextEncoder().encode(big) };
+  try {
+    const clipped = await readText({ path: "/w/.kiro/specs/connect/requirements.md" }, CONTEXT_BUDGET);
+    assert.ok(clipped.length <= CONTEXT_BUDGET + 60 && /truncated, \d+ more chars/.test(clipped), "readText honours the budget: " + clipped.length);
+    assert.equal((await readWholeText({ path: "/w/x.md" })).length, 51600, "the spec model still reads whole files");
+  } finally { stub.workspace.fs = savedFs; }
+  // And inject() itself never sends more than the host accepts, whatever the caller built.
+  const posted = [];
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => { posted.push(JSON.parse(init.body)); return { ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({ ok: true }), text: async () => "{}" }; };
+  try {
+    const s = Object.create(Sessions.prototype);
+    await s.inject("k", "[label]\n" + big, "kirocrew-ide #file");
+    assert.ok(posted[0].content.length <= HOST_CONTEXT_MAX, "sent " + posted[0].content.length);
+    assert.equal(clip("abc", 10), "abc");
+  } finally { globalThis.fetch = savedFetch; }
+});
+
+test("chat webview: errors are a red/pink box — ours and the host's msg-err / ❌ rows", () => {
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  assert.ok(/\.error,\.row\.err\{[^}]*background:color-mix\(in srgb,var\(--vscode-errorForeground,#e5484d\) 10%/.test(html), "tinted background from the error colour");
+  assert.ok(/\.error,\.row\.err\{[^}]*border:1px solid color-mix/.test(html) && /\.error,\.row\.err\{[^}]*border-radius:6px/.test(html), "bordered, small radius");
+  assert.ok(/msg-err/.test(html) && /\[❌⏱\]/.test(html), "host failure rows are detected by class or prefix");
+});
+
 test("themeFor follows the dashboard only while the workbench theme is stock", () => {
   const { themeFor } = ext.__test;
   assert.equal(themeFor("dark", undefined), "Default Dark Modern", "unset -> the dashboard's polarity");
@@ -318,7 +507,20 @@ test("chat webview: compact spacing, message font size scoped to the transcript"
   assert.ok(/\.log\{[^}]*font-size:var\(--kide-msg-size\)/.test(html), "applied on the transcript pane only");
   assert.ok(!/#compose\{[^}]*--kide-msg-size/.test(html) && !/#tabs\{[^}]*--kide-msg-size/.test(html), "UI keeps the workbench size");
   assert.ok(html.includes('id="p-font"'), "Aa picker in the bar");
-  assert.ok(/\.log\{[^}]*padding:4px 5px/.test(html) && /#compose\{[^}]*padding:5px 5px 4px/.test(html), "compact paddings");
+  assert.ok(/\.log\.on\{[^}]*padding:8px 8px 4px/.test(html) && /#compose\{[^}]*padding:5px 5px 4px/.test(html), "compact paddings");
+});
+
+test("chat webview: KiroCrew's transcript shape — user bubble on the right, bare assistant text, small radii, four hopping foxes while working", () => {
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  assert.ok(/\.log\.on\{[^}]*flex-direction:column/.test(html), "rows stack in a flex column");
+  assert.ok(/\.user\{[^}]*align-self:flex-end/.test(html) && /\.user\{[^}]*width:fit-content/.test(html), "user turn is a right-aligned bubble");
+  assert.ok(/\.user\{[^}]*border-radius:6px/.test(html), "bubble radius stays small (squared look)");
+  assert.ok(!/\.options button\{[^}]*border-radius:12px/.test(html), "no pill buttons");
+  assert.ok(/\.md code\{[^}]*font-size:\.9em/.test(html) && /\.md pre\{[^}]*padding:10px 12px/.test(html), "code styling as the dashboard's msg-content");
+  assert.ok(/\.work img:nth-child\(4\)\{animation-delay/.test(html), "four staggered foxes");
+  assert.ok(/@keyframes kide-hop/.test(html) && /prefers-reduced-motion/.test(html), "hop keyframe with a reduced-motion fallback");
+  assert.ok(/for\(let i=0;i<4;i\+\+\)/.test(html) && /function setWork\(st\)/.test(html), "the indicator is built per pane and driven by setWork");
 });
 
 test("chat webview: every inline script parses (it is JavaScript inside a template literal), and a hint pick only asks", async () => {

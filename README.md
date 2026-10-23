@@ -136,9 +136,15 @@ other theme and it stays yours.
   `<host> IDE` chip sits in the top bar.
 - **Several workspaces on one host.** The `IDE` segment is a dropdown — the
   workspace manager: every folder open on the engine (the one on screen
-  marked, a × to close it) and **Open a folder…**, a picker right in the menu
-  (recent workspaces, then the engine-side directory listing) so another
-  project opens without leaving fullscreen. One engine serves them all; each
+  marked, a × to close it) and **Open a folder…**, which opens **KiroCrew's
+  own folder picker** (the Recent / Browse picker the chat composer and the
+  Spec Builder use, fed by the dashboard's recent-projects and browse APIs),
+  anchored under the tag and painted over the fullscreen IDE, so another
+  project opens without leaving fullscreen. The App page's folder field opens
+  the same picker. The dashboard does not export that component, so the mod
+  reaches it through the chunk the dashboard preloads (`spa/hostpicker.mjs`,
+  no build hash hardcoded); a dashboard without it gets the mod's own
+  combobox (recent workspaces, then the engine-side directory listing). One engine serves them all; each
   workspace is its own workbench document, created when first shown and kept
   warm, so switching never reloads anything. The App page mirrors this: Start
   reads **Open** while the engine runs and adds the folder, and a tab row sits
@@ -155,7 +161,13 @@ other theme and it stays yours.
   it reconnects in a few seconds, with the workbench's own hot exit and
   terminal persistence covering the gap. The limit is the **Sleep inactive
   workspaces after** select at the bottom of the workspace menu (never, 5,
-  15, 30, 60 min), a host-wide setting (`idle_unload_minutes`).
+  15, 30, 60 min), a host-wide setting (`idle_unload_minutes`). A freshly
+  created document (first show, or a wake) that has not connected to the
+  engine within 20 s is reloaded once by the layer: the host counts the
+  WebSocket bridges that reached the engine (`status.proxy.websockets`), and
+  a document whose budget passes with that count unchanged is the blank page
+  the desktop client could show after a wake. One reload, never a loop; a
+  second miss is left to the workbench's own connection-error dialog.
 - **Task completeness per workspace.** A tiny donut and percentage sit at
   the workbench's top right, just left of its own layout controls (measured
   from the live title bar so they never overlap), in docked and fullscreen
@@ -178,12 +190,23 @@ other theme and it stays yours.
   the cut edge, like KiroCrew's crew row. Rest the pointer on the chip and
   the name glides to its end (and back when you leave); a wheel or trackpad
   anywhere on the chip scrolls it by hand; the full path is in the tooltip
-  and the menu.
+  and the menu. The bar's text colours are derived for readability rather
+  than copied from the theme: the command-centre foreground is used only
+  when it reaches 3:1 on the pill, else black or white by luminance; the
+  accent for the lit `IDE` word and the count badge keep their theme colour
+  only when it reads, so a light theme with a pale foreground (Tempest) no
+  longer paints the folder name in near-invisible grey.
 - **Profiles follow you.** The web workbench keeps the profile list in the
   browser, per origin, so a profile imported in the desktop app used to be
   missing in a browser tab (or after the app's storage moved) while its data
   sat on the host. The mod now seeds every client's list from the engine's
-  own record of the profiles that exist on disk.
+  own record of the profiles that exist on disk. The Profiles editor's **Use
+  for New Windows** choice is honoured too: a folder opened from the mod with
+  no profile of its own boots into that profile (the web workbench alone only
+  reads the URL and the folder's association, never that setting; the mod reads
+  it from the browser's user-data store and rewrites the URL before the
+  workbench starts, with one early reload the first time after you toggle it).
+  A profile you picked for a folder with *Switch Profile* still wins.
 - **KiroCrew Chat** in the IDE's secondary side bar (the built-in AI chat is
   turned off): tabs, one KiroCrew session per tab, per-project **History**
   (every session whose project is the open folder — created here or in the
@@ -197,6 +220,24 @@ other theme and it stays yours.
   what a live session actually runs with is shown on its tab but never
   inherited by the next tab, and a model id the host's catalog has retired is
   dropped (with a note) instead of pinned on a new session.
+- **Steering, Kiro's way.** Every chat started here runs on kiro-cli with the
+  open folder as its working directory, so the workspace's `.kiro/steering`
+  and `~/.kiro/steering` load exactly as Kiro CLI loads them: a file with no
+  front matter or `inclusion: always` is in every turn, while `fileMatch` and
+  `manual` files are left out by the agent itself (verified against kiro-cli
+  2.33). The bridge adds the other two modes the way Kiro's IDE does
+  ([inclusion modes](https://kiro.dev/docs/steering/)): a `fileMatch` file
+  whose `fileMatchPattern` matches a file in the turn's context (a `#` file or
+  open-files pick, the editors on screen) and a `manual` or `auto` file the
+  message names with `#file-name` ride along as context, each shown as a
+  `#steering: name` chip on the turn. A compass indicator in the composer
+  counts the always-included files and lists every steering file with its
+  mode (click a manual one to include it now, an always one to open it); a
+  session's first turn prints a *Steered by …* receipt naming the always files
+  per tier, and warns when the chosen agent's `resources` leave steering out.
+- **The input box is yours to size.** It grows with what you type (to about
+  45% of the pane); drag the grip on its top edge for a height of your own,
+  remembered per workspace; double-click the grip to go back to automatic.
 - **KiroCrew** activity-bar views: *Specs* (`.kiro/specs/<name>/`, phase
   commands, ▶ Start task per row, ⏵⏵ Run all tasks per spec, Kiro's queued /
   in-progress / done marks), *Steering*, *Skills*, *Agent Hooks* — each showing
@@ -210,6 +251,20 @@ other theme and it stays yours.
   tail while it streams, **Thought process** once it goes quiet, the full text
   a click away; a tool call or the answer closes the block and later reasoning
   opens a new one.
+- The transcript takes KiroCrew's own shape: your turn is a fit-width bubble
+  on the right (small radius, the workbench's input colours), the agent's
+  answer is bare text, tool lines are quiet mono rows, code blocks have the
+  dashboard's padding and a hairline. While the agent works and no answer is
+  streaming yet (reasoning, tool calls, the wait for the first token) four
+  small FloofyCrew foxes hop in turn under the last row, where KiroCrew shows
+  its ghosts; they go still under *prefers-reduced-motion*.
+- Attachments travel exactly as the dashboard composer sends them: each file
+  is uploaded to the host and referenced by an `[attached_file N] <path>`
+  marker with the path list in the send's `meta.files`, so the host inlines an
+  image as a real image block, leaves other files on disk for the agent's
+  tools, and its own transcript shows the same attachment cards for a session
+  started here. (Earlier builds pasted `Attached file: <path>` prose, a shape
+  the host never writes itself.)
 - Sessions run in the gateway. Close the laptop, drop the tunnel, come back
   from the dashboard or your phone: same session, same transcript.
 
@@ -217,7 +272,7 @@ other theme and it stays yours.
 
 | Part | Seam | What |
 |---|---|---|
-| `hook/` (python-hook, early) | gateway | engine supervisor + control API (`status` with per-workspace spec-task counts, `start` `stop` `workspaces/open` `workspaces/close` `engines` `engines/install` `browse`), the same-origin proxy at `/kirocrew-ide`, bridge-extension provisioning |
+| `hook/` (python-hook, early) | gateway | engine supervisor + control API (`status` with per-workspace spec-task counts and engine health, `start` `stop` `relaunch` `workspaces/open` `workspaces/close` `engines` `engines/install` `extensions/install` `browse`), the same-origin proxy at `/kirocrew-ide`, bridge-extension provisioning |
 | `app/` (app) | App Kit | the **KiroCrew IDE** App page. `app/ui/art/icon.svg` is the App's face in the Apps sidebar and the store (manifest `iconPath`): the fox wearing a `</>` badge |
 | `extension/` | the engine | the KiroCrew web extension (chat, sessions, approvals, specs), provisioned per start |
 | `ui/page.mjs` (ui) | FloofyCrew App | engine status and settings; points at the App. `ui/icon.svg` is the mod's face in FloofyCrew's Mod pages and Installed mods (the same fox as the App page's loading splash) |
@@ -232,6 +287,42 @@ directory after your confirmation — the mod's only network use
 Alternatives: `openvscode-server` or `code-server` on PATH, or
 `engine.command` in the mod config.
 
+**Extensions.** The engine's store is [Open VSX](https://open-vsx.org), where
+many Marketplace extensions were never published (the Microsoft Marketplace
+serves only Microsoft's own builds). So the Extensions view searches **both
+stores at once**: the mod runs a small merged gallery on the host's loopback
+(both stores speak the same gallery protocol; each query fans out to Open VSX
+and the Marketplace, results are interleaved by each store's own rank with
+duplicates collapsed to the Marketplace copy). Two clients are pointed at it,
+because they read different things: the engine's `product.json` (the server's
+own gallery client, used for installs and update downloads; original kept
+beside for restore) and the **workbench page** the proxy serves, whose
+`productConfiguration` the hook fills in — the Extensions view searches from
+the browser, with a product configuration baked into the web bundle (Open
+VSX) that openvscode-server 1.109 never overrides from `product.json` (it
+serves that object empty). The browser tries the loopback URL itself, fails
+(it is the gateway's loopback, not yours) and forwards the request over the
+workbench connection to the engine, which reaches it; the view's other
+gallery routes (`…/latest` per installed extension, install stats) are served
+too. Install, update and readme assets come from whichever store an entry
+came from; a store that is down just drops out of the merge. `engine.gallery`
+in the mod config: `merged` (default), `openvsx` (the engine's own store,
+product.json restored) or `marketplace`. The gallery is per gateway process
+and listens on `127.0.0.1` only, on a stable port (first free of 35486–35495,
+or `engine.gallery_port`), closed and rebound on a mod reload; `open-vsx.org`
+joins the declared hosts. `status.gallery.recent` lists the last requests it
+answered (a query with its text and hit count), so an empty search is a
+one-line diagnosis: no entry means the view never reached the gallery. For a
+link you already have, the Extensions view title also has **Install from
+Marketplace link…** (and the command palette): paste the
+`marketplace.visualstudio.com/items?itemName=publisher.name` link (or just
+`publisher.name`), and the hook downloads that extension's VSIX and installs
+it with the engine's own CLI, with a **Reload Window** button when done.
+`marketplace.visualstudio.com` is a declared host. Extensions
+that hard-depend on Microsoft-proprietary services (Pylance, C# Dev Kit, Live
+Share, Remote) do not work in a non-Microsoft build whichever way they are
+installed.
+
 The engine binds `127.0.0.1` only and, by default, runs without a connection
 token (see `engine.token`); the dashboard's own session is what guards the
 proxy.
@@ -243,6 +334,15 @@ four agents to `~/.kiro/agents`, and the chat's Agent picker then lists them
 under "Kiro modes". Without it the same four names appear under "Workflows
 (prompt-guided)" — a prompt frame injected on your default agent, not Kiro's
 procedure — headed by a row that says so and hands you the install command.
+
+Hosts from KiroCrew 0.8.0.9 on reserve KAS's bundled mode ids (`spec`,
+`quick-spec`, `bug-fix`, `plan`, …) and refuse a session whose agent carries one
+("Rename this crewmate's template: 'spec' is reserved for a built-in agent …"),
+which is exactly the name kiro-spec-plan's handles use. The bridge catches that
+refusal on the first send, says so once in the transcript, and re-sends the
+turn as the prompt-guided workflow on your picked agent, skipping the doomed
+attempt for the rest of the window. A kiro-spec-plan that activates the modes
+another way will be picked up as before.
 
 **Running tasks** works the way Kiro's IDE does. On a `tasks.md` the
 editor's primary action is **Run all tasks** (or **Resume tasks** once some
@@ -281,10 +381,13 @@ mod, not an App" proof: [DESIGN.md](DESIGN.md).
 |---|---|
 | `default_folder` | folder the picker starts in / Start opens when none is given |
 | `idle_unload_minutes` | minutes an off-screen workspace document stays warm before it is unloaded (default 15, `0` never); set from the workspace menu's footer, route `POST settings/idle-unload {"minutes"}` |
+| `engine.heap_mb` | V8 heap ceiling (MB) handed to the engine and every extension host through `NODE_OPTIONS --max-old-space-size` (default 8192; `0` leaves node's own ~4 GB). A ceiling, not a reservation. |
 | `engine.command` | full engine command template (`{port}` `{token}` `{folder}` `{auth}` `{basepath}` `{extensions}`) |
 | `engine.version` | pin the auto-installed openvscode-server version (default: latest release) |
 | `engine.port` | pin the engine's loopback port (default: first free of 35476–35485) |
 | `engine.token` | `true` runs the engine with a connection token; breaks embedding (its cookie is `SameSite=Lax`) |
+| `engine.gallery` | `merged` (default: Open VSX + Microsoft Marketplace in one Extensions view), `openvsx` (engine's own store), `marketplace` |
+| `engine.gallery_port` | pin the merged gallery's loopback port (default: first free of 35486–35495) |
 
 IDE-side settings (VS Code settings, `kirocrew.*`): `agent` (default agent
 for chats and spec phases), `specAgent` (agent that executes tasks),
@@ -299,6 +402,28 @@ is added while the gateway composes its router, hence the one restart after
 installing. Should the early shim be unavailable, the mod falls back to the
 engine's own loopback port and the App tells you the `ssh -L` line.
 
+**A stuck engine.** An extension host that dies (on 2026-10-20 one reached
+node's default heap limit and was SIGABRT'd) can leave the engine answering
+HTTP while servicing no new workbench connection: `status.running` stays true,
+the page loads and stays blank through every client reload. The hook now
+watches for exactly that on the proxy's own WebSocket bridges: a workbench
+connected 25 s ago, sent its frames, and the engine has answered nothing on
+that bridge or any other since (a bridge the engine answers or closes itself
+is a live engine; one the client never spoke on proves nothing). `status.health.stuck`
+turns true, the layer replaces the bouncing fox with the reason and a
+**Relaunch engine** button (the App page shows the same banner), and `POST
+relaunch` stops and starts the engine with the same workspaces; every document
+reconnects on its own. The heap ceiling (`engine.heap_mb`, 8 GB by default)
+makes the death itself rarer.
+
+The proxy's WebSocket bridge connects the engine side first and only then
+accepts the browser's upgrade: an engine that refuses, is gone, or does not
+answer within 10 s is a plain 502 before any upgrade, so the workbench shows
+its connection error and retries instead of sitting on a blank page. Every
+bridge's outcome is in `GET debug/proxylog` (`ws`, `ws-closed after Ns`,
+`ws-upstream-failed: …`), and `status.proxy.websockets` carries the running
+counts (`opened`, `failed`, `live`).
+
 ## Tests
 
 ```
@@ -308,6 +433,7 @@ tests/e2e/probe_extension.py <url>     # headless: the extension activates in th
 tests/e2e/probe_profile.py <url> <profile> <udd>   # headless: bridge + seeded order in a non-default profile
 tests/e2e/probe_hosts.py               # headless, self-contained: the layer (host switcher, modes, workspaces) in stub realms
 tests/e2e/probe_chat_webview.py        # headless, self-contained: the chat webview's transcript (the thinking block) driven with the extension's own messages
+tests/e2e/probe_gallery.py <url> <gallery> <text>   # headless: the Extensions view searches through the merged gallery (browser route aborted = remote browser; --direct keeps it)
 tests/e2e/chat_roundtrip.py <url>      # headless: a message round-trips through a gateway session
 ```
 

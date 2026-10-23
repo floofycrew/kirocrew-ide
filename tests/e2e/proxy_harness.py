@@ -101,6 +101,14 @@ def main():
     app.router.add_get("/api/ws", fake_ws)
     app.router.add_route("*", hook.PROXY_BASE, hook._proxy)
     app.router.add_route("*", hook.PROXY_BASE + "/{path:.*}", hook._proxy)
+    # KIDE_HARNESS_GALLERY=1: run the merged gallery (live stores) and let the
+    # proxy write it into the page, as the hook does on the gateway — the only
+    # way to see the Extensions view search through it from a real workbench.
+    if os.environ.get("KIDE_HARNESS_GALLERY"):
+        service = hook.gallery.Gallery("merged", hook.gallery.default_fetch, lambda m: print("harness gallery:", m, flush=True))
+        service.start()
+        hook._gallery["service"] = service
+        print("harness gallery on %s" % service.service_url, flush=True)
     web.run_app(app, host="127.0.0.1", port=port, print=lambda *a: print("harness ready on %d" % port, flush=True))
 
 

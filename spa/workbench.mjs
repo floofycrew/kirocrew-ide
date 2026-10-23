@@ -101,6 +101,70 @@ function partLeft(frame, selector, ownBox) {
   }
 }
 
+/**
+ * Parse any CSS colour the frame's window can render into [r, g, b, a] (0–255,
+ * alpha 0–1), by letting the browser normalise it; null when it cannot.
+ */
+export function parseColor(win, value) {
+  if (!value) return null;
+  try {
+    const el = win.document.createElement("span");
+    el.style.color = value;
+    if (!el.style.color) return null;
+    win.document.body.appendChild(el);
+    const rgb = win.getComputedStyle(el).color;
+    el.remove();
+    const m = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+%?))?\s*\)/.exec(rgb);
+    if (!m) return null;
+    let a = m[4] === undefined ? 1 : parseFloat(m[4]);
+    if (m[4] && m[4].endsWith("%")) a /= 100;
+    return [+m[1], +m[2], +m[3], a];
+  } catch {
+    return null;
+  }
+}
+
+/** WCAG relative luminance of an [r, g, b] in 0–255. */
+export function luminance([r, g, b]) {
+  const lin = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+/** WCAG contrast ratio between two [r, g, b] colours. */
+export function contrast(a, b) {
+  const la = luminance(a), lb = luminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+/**
+ * The foreground to paint on `bg`: `themed` when it reaches 3:1 against it
+ * (the WCAG floor for UI text this size), otherwise black or white by the
+ * background's luminance. A translucent background is read as painted over
+ * the title bar, which is what the eye sees. Returns a CSS colour string;
+ * `themed` itself when nothing can be measured.
+ */
+export function readableForeground(win, bg, themed, under, floor = 3) {
+  const back = parseColor(win, bg);
+  if (!back) return themed || "inherit";
+  let rgb = back.slice(0, 3);
+  if (back[3] < 1) {
+    const base = parseColor(win, under) || (luminance(rgb) > 0.5 ? [255, 255, 255, 1] : [30, 30, 30, 1]);
+    rgb = rgb.map((c, i) => Math.round(c * back[3] + base[i] * (1 - back[3])));
+  }
+  const fore = parseColor(win, themed);
+  if (fore && fore[3] > 0.5 && contrast(fore.slice(0, 3), rgb) >= floor) return themed;
+  return luminance(rgb) > 0.4 ? "#000" : "#fff";
+}
+
+/** {badgeBg, badgeFg}: the accent with white text when that reads (3:1), else the bar's own foreground with a tint of itself behind. */
+export function badgeColors(win, accent, fg) {
+  const acc = parseColor(win, accent);
+  if (!acc) return { badgeBg: accent, badgeFg: "#fff" }; // unmeasurable: the theme's word stands
+  if (contrast(acc.slice(0, 3), [255, 255, 255]) >= 3) return { badgeBg: accent, badgeFg: "#fff" };
+  if (contrast(acc.slice(0, 3), [0, 0, 0]) >= 4.5 && fg === "#000") return { badgeBg: accent, badgeFg: "#000" };
+  return { badgeBg: fg === "#fff" ? "rgba(255,255,255,.22)" : "rgba(0,0,0,.14)", badgeFg: fg };
+}
+
 export function readWorkbenchTheme(frame) {
   try {
     const doc = frame && frame.contentDocument;
@@ -120,9 +184,31 @@ export function readWorkbenchTheme(frame) {
     };
     const bg = pick("--vscode-commandCenter-background", "--vscode-titleBar-activeBackground");
     if (!bg) return null;
+    // The pill's text: the theme's command-centre foreground when it actually
+    // reads on the pill's background, else black or white by the background's
+    // luminance. Light themes with a dark title bar (Tempest, several "mist"
+    // themes) ship a pale grey foreground for a dark command centre while the
+    // pill ends up painted on a light surface, and the folder name in it was
+    // unreadable. Measured in the frame's own window, so rgb() strings resolve.
+    const themedFg = pick("--vscode-commandCenter-foreground", "--vscode-titleBar-activeForeground");
+    const fg = readableForeground(doc.defaultView, bg, themedFg, pick("--vscode-titleBar-activeBackground"));
     return {
       bg,
-      fg: pick("--vscode-commandCenter-foreground", "--vscode-titleBar-activeForeground") || "inherit",
+      fg,
+      // A muted shade for secondary text, derived from the chosen foreground so
+      // it stays on the right side of the background whichever the theme is.
+      muted: fg === "#000" ? "rgba(0,0,0,.62)" : fg === "#fff" ? "rgba(255,255,255,.72)" : fg,
+      // The count badge: the accent only when white reads on it; else the
+      // foreground on a translucent pill of itself (a pale accent on a light
+      // title bar made the white "2" vanish).
+      ...badgeColors(doc.defaultView, pick("--vscode-focusBorder", "--vscode-button-background") || "#7c5cff", fg),
+      // The current chip ("IDE") paints its text in the accent over the hover
+      // colour: the accent when it reads there (bold text, so a 2.5:1 floor —
+      // the usual purple-on-dark-grey stays), else black or white.
+      accentText: readableForeground(doc.defaultView,
+        pick("--vscode-commandCenter-activeBackground", "--vscode-toolbar-hoverBackground") || bg,
+        pick("--vscode-focusBorder", "--vscode-button-background") || "#7c5cff",
+        pick("--vscode-titleBar-activeBackground"), 2.5),
       border: pick("--vscode-commandCenter-border", "--vscode-titleBar-border") || "transparent",
       hover: pick("--vscode-commandCenter-activeBackground", "--vscode-toolbar-hoverBackground") || bg,
       titleBar: pick("--vscode-titleBar-activeBackground") || bg,

@@ -41,6 +41,15 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
+
+try:
+    from . import gallery  # the Loader imports this file as the `hook` package
+except ImportError:  # the unit tests load it as a bare module from its path
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("kirocrew_ide_gallery", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gallery.py"))
+    gallery = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(gallery)
 
 STATE_FILE = "server.json"
 ENGINE_LOG = "engine.log"
@@ -799,11 +808,17 @@ def _status(_request):
         "embedUrl": _embed_url(state),
         "workspaces": _workspace_rows(state),
         "idleUnloadMinutes": _idle_unload_minutes(),
+        "health": _engine_health(state) if state else {"stuck": False, "reason": None, "silentBridges": 0, "aliveAt": None, "lastConnection": None, "lastServe": None},
+        "heapMb": _engine_heap_mb(),
+        "gallery": _gallery_status(),
         "proxy": {
             "registered": _proxy_registered(),
             "base": PROXY_BASE,
             "error": _proxy_state["error"],
             "inUse": bool(state and state.get("proxied")),
+            # Counters the layer's wake guard reads: a document it just created
+            # must raise `opened` within its budget, or it is reloaded once.
+            "websockets": dict(_ws_stats),
         },
     }
 
@@ -887,6 +902,7 @@ def _start(request):
     extensions_dir = _provision_extension()
     extensions = "--extensions-dir " + shlex.quote(extensions_dir) if extensions_dir else ""
     _seed_machine_settings()
+    _apply_gallery()  # product.json is read at engine start: aim it before launching
     # Format BEFORE splitting: `{auth}`/`{basepath}`/`{extensions}` expand to two
     # argv words (or none). The folder is shell-quoted so a path with spaces survives.
     command = shlex.split(
@@ -898,7 +914,7 @@ def _start(request):
         log.write(("\n--- start %s ---\n" % time.strftime("%FT%T")).encode())
         proc = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT,
-            cwd=folder, start_new_session=True,
+            cwd=folder, start_new_session=True, env=_engine_env(),
         )
 
     deadline = time.time() + 15
@@ -925,6 +941,45 @@ def _start(request):
             "workspaces": _workspace_rows(state)}
 
 
+#: V8 heap ceiling (MB) for the engine and every node child it spawns — above
+#: all the EXTENSION HOSTS. Node's default is ~4 GB; on 2026-10-20 the host for
+#: a large folder (a home directory: CloudFormation LSP, spell checker, Java,
+#: AWS Toolkit) reached it and died ("Reached heap limit", SIGABRT), after which the
+#: engine kept answering HTTP but serviced no new workbench connection — the
+#: blank page that survived client reloads. A ceiling, not a reservation: memory
+#: is only used when a host needs it. `engine.heap_mb` in the mod config (0 = node's default).
+ENGINE_HEAP_MB_DEFAULT = 8192
+
+
+def _engine_heap_mb():
+    raw = _ctx.config.get("engine.heap_mb") if _ctx else None
+    if raw is None:
+        return ENGINE_HEAP_MB_DEFAULT
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return ENGINE_HEAP_MB_DEFAULT
+
+
+def _engine_env():
+    """The engine's environment: ours plus the heap ceiling in NODE_OPTIONS.
+
+    The server passes its environment to the extension hosts unchanged (it
+    only remaps VSCODE_NODE_OPTIONS for terminals), so NODE_OPTIONS on the
+    engine process is the one place that reaches every host. An existing
+    `--max-old-space-size` in the inherited NODE_OPTIONS is replaced, anything
+    else in it is kept.
+    """
+    env = dict(os.environ)
+    heap = _engine_heap_mb()
+    if not heap:
+        return env
+    words = [w for w in shlex.split(env.get("NODE_OPTIONS", "")) if not w.startswith("--max-old-space-size")]
+    words.append("--max-old-space-size=%d" % heap)
+    env["NODE_OPTIONS"] = " ".join(words)
+    return env
+
+
 def _stop(_request):
     state = _read_state()
     if not state:
@@ -949,6 +1004,278 @@ def _stop(_request):
     _ctx.state.pop("server", None)
     _ctx.log.info("engine stopped (pid=%s)", pid)
     return {"running": False}
+
+
+def _relaunch(_request):
+    """POST relaunch — stop the engine and start it again with the same workspaces.
+
+    The App page's remedy for a stuck engine (status.health.stuck), and the
+    cure that worked by hand on 2026-10-20. Every open workbench document
+    reconnects on its own once the new engine listens.
+    """
+    state = _read_state()
+    if not state:
+        return (409, {"error": "not running"})
+    folders = _workspaces(state)
+    first = folders[0] if folders else state.get("folder")
+    _ctx.log.info("relaunching engine pid=%s on request (%d workspace(s))", state.get("pid"), len(folders))
+    _stop(None)
+    result = _start(_FolderRequest(first))
+    if isinstance(result, tuple):
+        return result
+    fresh = result.get("server")
+    if fresh:
+        for folder in folders[1:]:
+            if os.path.isdir(folder):
+                _add_workspace(fresh, folder)
+        result["workspaces"] = _workspace_rows(fresh)
+    # The old engine's bridges and serves say nothing about the new one.
+    _html_serves.clear()
+    _bridges.clear()
+    _engine_alive_at["t"] = None
+    result["note"] = "relaunched"
+    return result
+
+
+# ------------------------------------------------- merged gallery (Open VSX + Marketplace)
+
+#: See hook/gallery.py. The service lives for the gateway process: it starts on
+#: activate (or the first engine start) and the auto-installed engine's
+#: product.json is pointed at it. The PORT IS STABLE across Loader reloads
+#: (first free of GALLERY_PORT_BASE.., or `engine.gallery_port`; deactivate
+#: closes the listener so the reload binds the same one): the running engine's
+#: server-side gallery client read product.json at ITS start and would keep
+#: calling a dead port otherwise, and every reload used to leave the old
+#: listener behind in the gateway process (four were found on 2026-10-22).
+#: Only the auto-installed engine is touched: a PATH engine's product.json is
+#: not ours to edit (set engine.gallery to "openvsx" to leave even ours alone).
+_gallery = {"service": None, "error": None}
+_gallery_lock = threading.Lock()
+GALLERY_PORT_BASE = PORT_BASE + PORT_SCAN  # just above the engine's own range
+
+
+def _gallery_mode():
+    raw = (_ctx.config.get("engine.gallery") if _ctx else None) or "merged"
+    raw = str(raw).strip().lower()
+    return raw if raw in gallery.MODES else "merged"
+
+
+def _gallery_port():
+    """The port the gallery binds: pinned, else the first free of its range, else any."""
+    pinned = _ctx.config.get("engine.gallery_port") if _ctx else None
+    if pinned:
+        port = int(pinned)
+        if not _port_free(port):
+            raise RuntimeError("configured engine.gallery_port %d is in use" % port)
+        return port
+    for port in range(GALLERY_PORT_BASE, GALLERY_PORT_BASE + PORT_SCAN):
+        if _port_free(port):
+            return port
+    return 0
+
+
+def _close_leaked_galleries():
+    """Shut gallery listeners that earlier module instances left serving.
+
+    Before deactivate closed the gallery, every Loader reload left the previous
+    instance's server thread alive in the gateway process (its module gone, the
+    socket not). The thread is the only handle left: it is named, and its target
+    is the server's own serve_forever, so the server is reachable from it.
+    """
+    for thread in threading.enumerate():
+        if thread.name != "kirocrew-ide-gallery" or not thread.is_alive():
+            continue
+        server = getattr(getattr(thread, "_target", None), "__self__", None)
+        if server is None or not hasattr(server, "shutdown"):
+            continue
+        try:
+            port = server.server_address[1]
+            server.shutdown()
+            server.server_close()
+            _ctx.log.info("gallery: closed a listener left on port %d by an earlier reload", port)
+        except Exception as error:  # noqa: BLE001
+            _ctx.log.warning("gallery: could not close a leaked listener: %s", error)
+
+
+def _gallery_fetch(url, data, headers):
+    """Upstream gallery calls go through the manifest-checked opener (hosts fixed, https only)."""
+    _ctx.http.check(url)
+    request = urllib.request.Request(url, data=data, headers=dict(headers, **{"User-Agent": "kirocrew-ide-mod"}))
+    with urllib.request.urlopen(request, timeout=gallery.UPSTREAM_TIMEOUT) as reply:
+        return reply.read()
+
+
+def _engine_product_json():
+    binary = _installed_engine()
+    if not binary:
+        return None
+    path = os.path.join(os.path.dirname(os.path.dirname(binary)), "product.json")
+    return path if os.path.isfile(path) else None
+
+
+def _apply_gallery():
+    """Start the merged gallery (once) and point the auto-installed engine's product.json at it."""
+    mode = _gallery_mode()
+    product = _engine_product_json()
+    with _gallery_lock:
+        try:
+            if mode == "openvsx":
+                if _gallery["service"]:
+                    _gallery["service"].stop()
+                    _gallery["service"] = None
+                if product:
+                    gallery.restore_product_json(product, _ctx.log.info)
+                _gallery["error"] = None
+                return None
+            service = _gallery["service"]
+            if service and service.mode != mode:
+                service.stop()
+                service = None
+            if not service:
+                _close_leaked_galleries()
+                service = gallery.Gallery(mode, _gallery_fetch, _ctx.log.warning)
+                service.start(_gallery_port())
+                _gallery["service"] = service
+                _ctx.log.info("merged gallery (%s) listening on %s", mode, service.service_url)
+            if product:
+                gallery.point_product_json(product, service.product_gallery(), _ctx.log.info)
+            _gallery["error"] = None
+            return service.service_url
+        except Exception as error:  # noqa: BLE001 — the engine still has its own store
+            _gallery["error"] = str(error)
+            _ctx.log.warning("merged gallery unavailable: %s", error)
+            return None
+
+
+def _gallery_status():
+    service = _gallery["service"]
+    return {"mode": _gallery_mode(), "url": service.service_url if service else None,
+            "stores": [s["id"] for s in service.stores] if service else [], "error": _gallery["error"],
+            "productJson": _engine_product_json(),
+            # The last requests the gallery answered (method, path, status, a
+            # query's text and hit count): empty after a search means the view
+            # never reached it — the page's productConfiguration is then the
+            # first thing to check, not the merge.
+            "recent": list(service.recent) if service else []}
+
+
+# ------------------------------------------------- extensions from the Marketplace
+
+#: The engine's own store is Open VSX (its product.json), where many Marketplace
+#: extensions were never published. The App page's "Install from Marketplace URL"
+#: box takes a marketplace.visualstudio.com item link (or a bare publisher.name),
+#: downloads that extension's VSIX from the Marketplace's public asset endpoint
+#: and installs it with the engine's own CLI into the mod's extensions dir — the
+#: same thing the workbench's "Install from VSIX…" does, without the detour
+#: through the user's machine. The user asks for each one by hand; nothing here
+#: queries the Marketplace on its own.
+MARKETPLACE_HOST = "marketplace.visualstudio.com"
+MARKETPLACE_QUERY = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery"
+MARKETPLACE_VSIX = ("https://marketplace.visualstudio.com/_apis/public/gallery/publishers/"
+                    "{publisher}/vsextensions/{name}/{version}/vspackage")
+_EXT_ID_RE = re.compile(r"^([A-Za-z0-9][\w-]*)\.([A-Za-z0-9][\w-]*)$")
+_ext_install = {"state": "idle"}  # idle | resolving | downloading | installing | done | error
+_ext_install_lock = threading.Lock()
+
+
+def _parse_marketplace_ref(text):
+    """`publisher.name` from a Marketplace item URL or a bare id; None when it is neither."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    match = _EXT_ID_RE.match(text)
+    if match:
+        return match.group(1), match.group(2)
+    try:
+        parsed = urllib.parse.urlparse(text)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != MARKETPLACE_HOST:
+        return None
+    item = urllib.parse.parse_qs(parsed.query).get("itemName", [""])[0]
+    match = _EXT_ID_RE.match(item)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def _marketplace_lookup(publisher, name):
+    """The extension's display name and latest version from the Marketplace, or raises."""
+    body = json.dumps({"filters": [{"criteria": [{"filterType": 7, "value": "%s.%s" % (publisher, name)}]}],
+                       "flags": 914}).encode("utf-8")
+    _ctx.http.check(MARKETPLACE_QUERY)
+    request = urllib.request.Request(MARKETPLACE_QUERY, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Accept": "application/json;api-version=3.0-preview.1",
+        "User-Agent": "kirocrew-ide-mod"})
+    with urllib.request.urlopen(request, timeout=30) as reply:
+        results = json.load(reply).get("results") or []
+    extensions = (results[0].get("extensions") if results else None) or []
+    if not extensions:
+        raise RuntimeError("%s.%s is not on the Marketplace" % (publisher, name))
+    ext = extensions[0]
+    versions = [v for v in ext.get("versions") or [] if not v.get("targetPlatform")] or ext.get("versions") or []
+    if not versions:
+        raise RuntimeError("%s.%s has no downloadable version" % (publisher, name))
+    return ext.get("displayName") or name, versions[0]["version"]
+
+
+def _install_marketplace_worker(publisher, name):
+    try:
+        display, version = _marketplace_lookup(publisher, name)
+        _ext_install.update(state="downloading", display=display, version=version, bytes=0)
+        url = MARKETPLACE_VSIX.format(publisher=publisher, name=name, version=version)
+        root = os.path.join(str(_ctx.data_dir), "vsix")
+        os.makedirs(root, exist_ok=True)
+        vsix = os.path.join(root, "%s.%s-%s.vsix" % (publisher, name, version))
+        with _open_checked(url, timeout=60) as reply, open(vsix, "wb") as out:
+            # The endpoint answers gzip-wrapped; a VSIX is a zip, so an unzipped body is kept as is.
+            data = reply.read()
+            if reply.headers.get("Content-Encoding", "").lower() == "gzip" or data[:2] == b"\x1f\x8b":
+                import gzip
+                data = gzip.decompress(data)
+            out.write(data)
+            _ext_install["bytes"] = len(data)
+        if not zipfile.is_zipfile(vsix):
+            raise RuntimeError("the download is not a VSIX (zip) file")
+        _ext_install.update(state="installing")
+        binary = _installed_engine()
+        if not binary and shutil.which("openvscode-server"):
+            binary = shutil.which("openvscode-server")
+        if not binary:
+            raise RuntimeError("no openvscode-server engine to install into")
+        ext_dir = os.path.join(str(_ctx.data_dir), EXTENSIONS_DIR)
+        os.makedirs(ext_dir, exist_ok=True)
+        proc = subprocess.run([binary, "--extensions-dir", ext_dir, "--install-extension", vsix, "--force"],
+                              capture_output=True, text=True, timeout=300, env=_engine_env())
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "install failed").strip()[-600:])
+        _ext_install.update(state="done", id="%s.%s" % (publisher, name), vsix=vsix,
+                            note="installed; reload the workbench window to activate it")
+        _ctx.log.info("marketplace extension installed: %s.%s %s", publisher, name, version)
+    except Exception as error:  # noqa: BLE001 — reported through the state
+        _ext_install.update(state="error", error=str(error) or type(error).__name__)
+        _ctx.log.warning("marketplace extension install failed: %s.%s: %s", publisher, name, error)
+
+
+def _extensions_install(request):
+    """POST extensions/install {"ref": "<marketplace item URL or publisher.name>"} — one at a time."""
+    body = {}
+    try:
+        body = request.json() or {}
+    except Exception:
+        pass
+    ref = _parse_marketplace_ref(body.get("ref"))
+    if not ref:
+        return (400, {"error": "give a marketplace.visualstudio.com item link (…?itemName=publisher.name) or publisher.name"})
+    with _ext_install_lock:
+        if _ext_install.get("state") in ("resolving", "downloading", "installing"):
+            return (409, {"error": "an extension install is already running", "install": dict(_ext_install)})
+        _ext_install.clear()
+        _ext_install.update(state="resolving", id="%s.%s" % ref)
+        threading.Thread(target=_install_marketplace_worker, args=ref, daemon=True).start()
+    return {"started": True, "install": dict(_ext_install), "note": "poll GET extensions/install for progress"}
+
+
+def _extensions_install_status(_request):
+    return {"install": dict(_ext_install)}
 
 
 def _engines(_request):
@@ -1156,6 +1483,41 @@ def _inject_webview_endpoint(html, scheme, host):
     endpoint = "%s://%s%s/stable-{{commit}}/static/out/vs/workbench/contrib/webview/browser/pre/" % (
         scheme, host, PROXY_BASE)
     return html.replace(_SETTINGS_ANCHOR, marker + ":&quot;" + endpoint + "&quot;," + _SETTINGS_ANCHOR, 1)
+
+
+_WEB_CONFIG_RE = re.compile(r'(<meta id="vscode-workbench-web-configuration"[^>]*?data-settings=")([^"]*)(")')
+
+
+def _inject_gallery(html):
+    """Point the BROWSER's gallery client at the merged gallery.
+
+    The Extensions view searches from the browser, and the browser's product
+    configuration is baked into the web bundle at build time (Open VSX): the
+    engine's product.json never reaches it, because openvscode-server 1.109
+    serves ``productConfiguration: {}`` in the page. The workbench deep-merges
+    that object over the baked product, so the page is the one place to say
+    otherwise. Without this the merged gallery served only the engine's own
+    (server-side) client and a Marketplace-only search in the view stayed
+    empty — seen 2026-10-22 with "ikki". Idempotent; a page without the meta,
+    or no gallery running, passes through unchanged.
+    """
+    service = _gallery["service"]
+    if not service:
+        return html
+    match = _WEB_CONFIG_RE.search(html)
+    if not match:
+        return html
+    try:
+        config = json.loads(match.group(2).replace("&quot;", '"'))
+    except ValueError:
+        return html
+    product = config.get("productConfiguration") or {}
+    product["extensionsGallery"] = service.product_gallery()
+    product["linkProtectionTrustedDomains"] = gallery.TRUSTED_DOMAINS
+    config["productConfiguration"] = product
+    # The engine's own encoding: JSON with the quotes entity-escaped, nothing else.
+    encoded = json.dumps(config, separators=(",", ":")).replace('"', "&quot;")
+    return html[:match.start(2)] + encoded + html[match.end(2):]
 
 
 #: Dashboard colour scheme -> the workbench's stock theme of the same polarity.
@@ -1431,6 +1793,106 @@ def _inject_profile_seed(html, profiles=None):
     return html.replace("</head>", (PROFILE_SEED_SCRIPT % payload) + "</head>", 1)
 
 
+#: The profile a workspace opens in. The web workbench decides it from the URL
+#: (?payload=[["profile","<name>"]], its own switch-profile reload), else from
+#: the folder's association, else it is the Default profile — and nothing
+#: else. The Profiles editor's "Use for New Windows" toggle writes the SETTING
+#: `window.newWindowProfile` (the desktop's main process reads it when it
+#: opens a window), which the web boot never consults; so a profile marked as
+#: the default for new windows was ignored by every folder opened from the
+#: mod. This seed reads that setting the way the workbench stores it in a web
+#: client — the Default profile's `/User/settings.json` in the browser's own
+#: IndexedDB user-data store (vscode-web-db / vscode-userdata-store; there is
+#: no settings.json on the server) — and, for a folder with no explicit profile,
+#: rewrites the URL to the payload form the workbench already understands,
+#: synchronously, before the (deferred) workbench module reads location.href.
+#: IndexedDB is asynchronous, so the setting is cached in localStorage
+#: ("kirocrew-ide.newWindowProfile") on every load: the first load after the
+#: toggle (or after the cache went stale) finishes its read and, when the answer
+#: differs from the profile the page is booting into, replaces the location once
+#: — one early reload, then never again for that setting. A name no profile in
+#: the browser's list carries (two clients can disagree) is left alone; the
+#: workbench falls back to Default as before.
+NEW_WINDOW_PROFILE_KEY = "kirocrew-ide.newWindowProfile"
+NEW_WINDOW_PROFILE_SCRIPT = """<script id="kirocrew-ide-new-window-profile">
+(function () {
+  var KEY = "%s";
+  try {
+    var url = new URL(location.href);
+    var params = url.searchParams;
+    var folder = params.get("folder") || params.get("workspace");
+    if (!folder) return;
+    var payload = [];
+    try { payload = JSON.parse(params.get("payload") || "[]") || []; } catch (e) { payload = []; }
+    if (!Array.isArray(payload)) payload = [];
+    var explicit = payload.some(function (pair) { return Array.isArray(pair) && pair[0] === "profile"; });
+    if (explicit) return;
+    var profiles = [], assoc = {};
+    try { profiles = JSON.parse(localStorage.getItem("userDataProfiles") || "[]") || []; } catch (e) { profiles = []; }
+    try { assoc = JSON.parse(localStorage.getItem("profileAssociations") || "{}") || {}; } catch (e) { assoc = {}; }
+    var want = folder.replace(/\\/+$/, "");
+    var associated = Object.keys((assoc && assoc.workspaces) || {}).some(function (key) {
+      var path = key, at = key.indexOf("://");
+      if (at >= 0) { var rest = key.slice(at + 3), slash = rest.indexOf("/"); path = slash >= 0 ? rest.slice(slash) : ""; }
+      try { path = decodeURIComponent(path); } catch (e) { /* keep raw */ }
+      return path.replace(/\\/+$/, "") === want;
+    });
+    if (associated) return;  // the user chose a profile for this folder: that wins
+    var known = function (name) { return !!name && profiles.some(function (p) { return p && p.name === name; }); };
+    var withProfile = function (name) {
+      var u = new URL(location.href);
+      u.searchParams.set("payload", JSON.stringify(payload.concat([["profile", name]])));
+      return u.toString();
+    };
+    var cached = localStorage.getItem(KEY) || "";
+    var booting = "";  // the profile this document will boot into after this script
+    if (known(cached)) { history.replaceState(history.state, "", withProfile(cached)); booting = cached; }
+    // Refresh the cache from the Default profile's settings in the browser's user-data store.
+    var open = indexedDB.open("vscode-web-db");
+    open.onsuccess = function () {
+      var db = open.result;
+      try {
+        if (!db.objectStoreNames.contains("vscode-userdata-store")) { db.close(); return; }
+        var store = db.transaction("vscode-userdata-store", "readonly").objectStore("vscode-userdata-store");
+        var keys = store.getAllKeys();
+        keys.onsuccess = function () {
+          var key = (keys.result || []).filter(function (k) { return typeof k === "string" && /^\\/User\\/settings\\.json$/.test(k); })[0];
+          if (!key) { settle(""); return; }
+          var get = store.get(key);
+          get.onsuccess = function () {
+            var raw = get.result, text = "";
+            try { text = typeof raw === "string" ? raw : new TextDecoder().decode(raw); } catch (e) { text = ""; }
+            // settings.json is JSONC: pick the one key out without parsing the whole file.
+            var m = /"window\\.newWindowProfile"\\s*:\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|null)/.exec(text);
+            settle(m && m[1] ? m[1] : "");
+          };
+          get.onerror = function () { settle(null); };
+        };
+        keys.onerror = function () { settle(null); };
+      } catch (e) { settle(null); }
+      function settle(name) {
+        try { db.close(); } catch (e) { /* closed */ }
+        if (name === null) return;  // could not read: keep the cache as it was
+        if (name) localStorage.setItem(KEY, name); else localStorage.removeItem(KEY);
+        var target = known(name) ? name : "";
+        if (target === booting) return;
+        // The setting disagrees with what this page booted into: boot again, once, the right way.
+        location.replace(target ? withProfile(target) : (function () { var u = new URL(location.href); if (payload.length) u.searchParams.set("payload", JSON.stringify(payload)); else u.searchParams.delete("payload"); return u.toString(); })());
+      }
+    };
+    open.onerror = function () { /* no store yet (first visit): nothing to read */ };
+  } catch (e) { /* never break the workbench over the profile choice */ }
+})();
+</script>""" % NEW_WINDOW_PROFILE_KEY
+
+
+def _inject_new_window_profile(html):
+    """Honour the Profiles editor's "Use for New Windows" choice for folders opened here. Idempotent."""
+    if 'id="kirocrew-ide-new-window-profile"' in html or "</head>" not in html:
+        return html
+    return html.replace("</head>", NEW_WINDOW_PROFILE_SCRIPT + "</head>", 1)
+
+
 #: The webview host page, served same-origin once _inject_webview_endpoint is in
 #: effect. Its parent-origin validation only knows the hashed-subdomain scheme.
 _PRE_INDEX_SUFFIX = "/static/out/vs/workbench/contrib/webview/browser/pre/index.html"
@@ -1499,15 +1961,215 @@ def _inject_preindex_bypass(html):
 #: that renders blank in a real browser. Read via GET debug/proxylog.
 _proxy_log = collections.deque(maxlen=300)
 
+#: WebSocket bridge counters since this module loaded (status.proxy.websockets):
+#: `opened` upgrades that reached the engine, `failed` ones the engine refused
+#: or never answered, `live` bridges open right now.
+_ws_stats = {"opened": 0, "failed": 0, "live": 0}
+
 
 def _log_proxied(method, path, status, note=""):
     _proxy_log.append({"ts": round(time.time(), 3), "method": method, "path": path[:200],
                        "status": status, "note": note})
 
 
+#: Stuck-engine detection. An engine whose extension host died (OOM → SIGABRT,
+#: 2026-10-20) kept answering HTTP — `status.running` stayed true, the workbench
+#: HTML and assets were served — but serviced no new WebSocket: its log gained no
+#: "New connection established" for any later load, and the page stayed blank
+#: through every client reload. The signal is therefore: a workbench document
+#: was served (the proxy sees the HTML) and, STUCK_AFTER_S later, the engine's
+#: own log still records no connection newer than that serve. Read from the
+#: engine log on each status poll (tail only), never from the socket: a healthy
+#: engine and a stuck one look identical at handshake time.
+STUCK_AFTER_S = 25.0
+_ENGINE_CONN_RE = re.compile(rb"^\[(\d\d):(\d\d):(\d\d)\] \[[^\]]*\]\[[^\]]*\]\[ManagementConnection\] New connection established\.", re.M)
+_ENGINE_TAIL_BYTES = 256 * 1024
+#: Wall-clock stamps of workbench HTML serves since the engine started (newest last).
+_html_serves = collections.deque(maxlen=50)
+#: One record per WebSocket bridge the proxy carried (newest last): when it opened,
+#: frames each way, and how it ended. THIS is what the stuck verdict reads. The
+#: first cut read the engine log for "New connection established" and raised
+#: false alarms: a workbench that reconnects after a relaunch is logged as
+#: "Unknown reconnection token" (alive, answering, not matched), a background tab
+#: or a wake-reload can fetch the HTML and never connect, and the log is only
+#: written when something happens. The bridge sees the truth directly: a live
+#: engine answers a client's first frames within a second; the 2026-10-20 engine
+#: accepted the handshake and then sent nothing, ever.
+_bridges = collections.deque(maxlen=64)
+#: Last moment the engine proved alive on any bridge (a frame to a client, or
+#: closing a socket itself); None since this module loaded / the last relaunch.
+_engine_alive_at = {"t": None}
+
+
+def _last_engine_connection(log_path, now=None):
+    """Epoch seconds of the newest 'New connection established' in the engine log's tail, or None.
+
+    The engine stamps lines with a local wall-clock HH:MM:SS only; the date is
+    taken from the file's mtime (the line is within the tail of what was last
+    written), with a midnight wrap when the stamp is later than the mtime's time.
+    """
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as fh:
+            fh.seek(max(0, size - _ENGINE_TAIL_BYTES))
+            tail = fh.read()
+        mtime = os.path.getmtime(log_path)
+    except OSError:
+        return None
+    # The log is appended across engine restarts (`_start` writes a "--- start"
+    # marker): only the current engine's section counts, or a connection the
+    # previous engine accepted would pass for one of this engine's.
+    marker = tail.rfind(b"\n--- start ")
+    if marker >= 0:
+        tail = tail[marker:]
+    matches = _ENGINE_CONN_RE.findall(tail)
+    if not matches:
+        return None
+    h, m, s = (int(x) for x in matches[-1])
+    day = time.localtime(mtime)
+    stamp = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, h, m, s, 0, 0, -1))
+    if stamp > mtime + 5:  # the line was written before midnight, the mtime after
+        stamp -= 86400
+    return stamp
+
+
+def _engine_health(state, now=None):
+    """{'stuck', 'reason', 'silentBridges', 'aliveAt', 'lastConnection', 'lastServe'}.
+
+    Stuck when some bridge opened since the engine started is STUCK_AFTER_S old,
+    still open, has carried frames FROM the client and none back, and the engine
+    has shown no life on any bridge (a frame down, or closing a socket itself)
+    for STUCK_AFTER_S. A bridge the engine closed is a live engine's answer; a
+    bridge whose client never spoke proves nothing. Bridges from before the
+    engine started are ignored (a relaunch clears the condition by itself).
+    `lastConnection` (engine log) and `lastServe` ride along as diagnostics only.
+    """
+    now = time.time() if now is None else now
+    started = float(state.get("startedAt") or 0) if state else 0
+    serves = [t for t in _html_serves if t >= started]
+    last_serve = serves[-1] if serves else None
+    alive_at = _engine_alive_at["t"]
+    if alive_at is not None and alive_at < started:
+        alive_at = None
+    silent = [b for b in _bridges
+              if b["opened"] >= started and not b["closed"] and now - b["opened"] >= STUCK_AFTER_S
+              and b["up"] > 0 and b["down"] == 0]
+    stuck = bool(silent) and (alive_at is None or now - alive_at >= STUCK_AFTER_S)
+    reason = None
+    if stuck:
+        oldest = min(b["opened"] for b in silent)
+        reason = ("the workbench connected %ds ago and the engine has not answered it since; "
+                  "its extension host may have died (see engine.log). Relaunch the engine." % int(now - oldest))
+    last_conn = _last_engine_connection(os.path.join(str(_ctx.data_dir), ENGINE_LOG)) if _ctx else None
+    return {"stuck": stuck, "reason": reason, "silentBridges": len(silent), "aliveAt": alive_at,
+            "lastConnection": last_conn, "lastServe": last_serve}
+
+
 def _debug_proxylog(_request):
     return {"entries": list(_proxy_log), "count": len(_proxy_log),
             "hint": "newest last; note=ws marks websocket upgrades, letterpress the served watermark"}
+
+
+#: How long the engine gets to accept a WebSocket upgrade before the browser is
+#: told the proxy could not reach it (a loopback connect is milliseconds).
+WS_UPSTREAM_TIMEOUT_S = 10.0
+
+#: Request headers that belong to THIS hop's upgrade handshake; aiohttp's client
+#: writes its own for the upstream one.
+_WS_HANDSHAKE_HEADERS = frozenset(("sec-websocket-key", "sec-websocket-version",
+                                   "sec-websocket-extensions", "upgrade", "connection"))
+
+
+async def _proxy_websocket(request, target, headers):
+    """Bridge one browser WebSocket to the engine, failing LOUDLY.
+
+    Order matters: the engine side is connected FIRST, and only then is the
+    browser's upgrade accepted. The previous shape accepted the browser first
+    and swallowed every error, so an upstream connect that failed or hung
+    became a socket that opened and silently closed — the workbench then sat
+    on a blank page with no error and no reconnect, and the proxy log recorded
+    the upgrade as a 101 success. Now an unreachable engine answers 502 before
+    any upgrade (the workbench's own connection-failure path shows its error
+    and retries), and the log carries what actually happened:
+    `ws` on success with the session's duration on close, `ws-upstream-failed`
+    with the error otherwise.
+    """
+    import aiohttp
+    from aiohttp import web
+
+    ws_target = "ws://" + target.split("://", 1)[1]
+    upstream_headers = {k: v for k, v in headers.items() if k.lower() not in _WS_HANDSHAKE_HEADERS}
+    session = aiohttp.ClientSession()
+    try:
+        upstream = await asyncio.wait_for(
+            session.ws_connect(ws_target, headers=upstream_headers, max_msg_size=0, autoping=True),
+            timeout=WS_UPSTREAM_TIMEOUT_S,
+        )
+    except Exception as error:  # noqa: BLE001 — reported, not swallowed
+        await session.close()
+        _ws_stats["failed"] += 1
+        _log_proxied(request.method, request.path, 502, note="ws-upstream-failed: %s" % (error or type(error).__name__))
+        _ctx.log.warning("websocket upstream %s failed: %r", ws_target.split("?")[0], error)
+        return web.Response(status=502, content_type="text/plain",
+                            text="KiroCrew IDE proxy: the engine did not accept the connection (%s)" % (error or type(error).__name__))
+
+    client_ws = web.WebSocketResponse(protocols=("vscode",), max_msg_size=0)
+    started = time.time()
+    _ws_stats["opened"] += 1
+    _ws_stats["live"] += 1
+    bridge = {"opened": started, "up": 0, "down": 0, "closed": None, "closedBy": None}
+    _bridges.append(bridge)
+    _log_proxied(request.method, request.path, 101, note="ws")
+    try:
+        await client_ws.prepare(request)
+
+        async def pump(source, sink, direction):
+            async for message in source:
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    await sink.send_str(message.data)
+                elif message.type == aiohttp.WSMsgType.BINARY:
+                    await sink.send_bytes(message.data)
+                else:
+                    break
+                bridge[direction] += 1
+                if direction == "down":
+                    _engine_alive_at["t"] = time.time()
+            # The source ended: whoever stopped talking closed this bridge.
+            if bridge["closedBy"] is None:
+                bridge["closedBy"] = "engine" if direction == "down" else "client"
+                if direction == "down":
+                    _engine_alive_at["t"] = time.time()
+
+        pumps = [asyncio.create_task(pump(upstream, client_ws, "down")), asyncio.create_task(pump(client_ws, upstream, "up"))]
+        _, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+        # The surviving pump is cancelled and awaited: left alone it would later
+        # raise into nobody's hands ("Task exception was never retrieved" with
+        # ClientConnectionResetError, the recurring crash.log entry).
+        for task in pending:
+            task.cancel()
+        for task in pumps:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 — a dropped socket is normal
+                pass
+    except Exception:  # noqa: BLE001 — a dropped socket is normal
+        pass
+    finally:
+        try:
+            await upstream.close()
+        except Exception:  # noqa: BLE001
+            pass
+        await session.close()
+        if not client_ws.closed:
+            try:
+                await client_ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _ws_stats["live"] = max(0, _ws_stats["live"] - 1)
+        bridge["closed"] = time.time()
+        _log_proxied(request.method, request.path, 101, note="ws-closed after %.1fs by %s (%d up, %d down)"
+                     % (bridge["closed"] - started, bridge["closedBy"] or "proxy", bridge["up"], bridge["down"]))
+    return client_ws
 
 
 async def _proxy(request):
@@ -1557,12 +2219,16 @@ async def _proxy(request):
         if status == 200 and "html" in ctype:
             scheme = request.headers.get("X-Forwarded-Proto") or request.scheme
             body = _inject_webview_endpoint(body, scheme, request.headers.get("Host") or request.host)
+            body = _inject_gallery(body)  # the browser's gallery client reads the page, not product.json
             body = _inject_profile_seed(body)  # before the order seed: it reads the merged list
+            body = _inject_new_window_profile(body)  # after the list seed (it needs the names), before the order seed (it reads the payload)
             body = _inject_activity_order(body)
             # The App passes the dashboard's scheme on the frame URL (fresh at
             # every load); the file it also posts to is the fallback.
             body = _inject_theme_default(body, request.query.get("kideScheme") or _read_scheme())
         _log_proxied(request.method, request.path, status, note="workbench-html")
+        if status == 200:
+            _html_serves.append(time.time())  # the stuck-engine check's "a document loaded" mark
         return web.Response(status=status, text=body, content_type=ctype.split(";")[0].strip() or "text/html",
                             headers={"Cache-Control": "no-cache"})
 
@@ -1588,40 +2254,7 @@ async def _proxy(request):
 
     # WebSocket (the workbench's extension-host channel)
     if request.headers.get("Upgrade", "").lower() == "websocket":
-        _log_proxied(request.method, request.path, 101, note="ws")
-        client_ws = web.WebSocketResponse(protocols=("vscode",), max_msg_size=0)
-        await client_ws.prepare(request)
-        ws_target = "ws://" + target.split("://", 1)[1]
-        session = aiohttp.ClientSession()
-        try:
-            async with session.ws_connect(
-                ws_target,
-                headers={k: v for k, v in headers.items()
-                         if k.lower() not in ("sec-websocket-key", "sec-websocket-version",
-                                              "sec-websocket-extensions", "upgrade", "connection")},
-                max_msg_size=0, autoping=True,
-            ) as upstream:
-                async def pump(source, sink):
-                    async for message in source:
-                        if message.type == aiohttp.WSMsgType.TEXT:
-                            await sink.send_str(message.data)
-                        elif message.type == aiohttp.WSMsgType.BINARY:
-                            await sink.send_bytes(message.data)
-                        else:
-                            break
-
-                await asyncio.wait(
-                    [asyncio.create_task(pump(upstream, client_ws)),
-                     asyncio.create_task(pump(client_ws, upstream))],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-        except Exception:  # noqa: BLE001 — a dropped socket is normal
-            pass
-        finally:
-            await session.close()
-            if not client_ws.closed:
-                await client_ws.close()
-        return client_ws
+        return await _proxy_websocket(request, target, headers)
 
     # Plain HTTP, streamed both ways
     session = aiohttp.ClientSession(auto_decompress=False)
@@ -1803,11 +2436,14 @@ def activate(ctx):
     ctx.routes.add("GET", "status", _status)
     ctx.routes.add("POST", "start", _start)
     ctx.routes.add("POST", "stop", _stop)
+    ctx.routes.add("POST", "relaunch", _relaunch)
     ctx.routes.add("POST", "workspaces/open", _workspaces_open)
     ctx.routes.add("POST", "workspaces/close", _workspaces_close)
     ctx.routes.add("POST", "settings/idle-unload", _set_idle_unload)
     ctx.routes.add("GET", "engines", _engines)
     ctx.routes.add("POST", "engines/install", _engines_install)
+    ctx.routes.add("POST", "extensions/install", _extensions_install)
+    ctx.routes.add("GET", "extensions/install", _extensions_install_status)
     ctx.routes.add("GET", "browse", _browse)
     ctx.routes.add("GET", "gitdiff", _gitdiff)
     ctx.routes.add("GET", "theme", _theme_get)
@@ -1839,6 +2475,11 @@ def activate(ctx):
         # too; the extension folder itself is left alone.
         if _reregister_extension():
             ctx.log.info("bridge extension re-registered for the adopted engine")
+    # The gallery's port is per gateway process; a running engine read the old
+    # one from product.json at ITS start. Re-point the file now (the Extensions
+    # view reads serviceUrl from the server's product on each window load), and
+    # let the status say whether a relaunch is still needed.
+    _apply_gallery()
     ctx.log.info("KiroCrew IDE hook active (engine=%s)", _engine()[0])
 
 
@@ -1855,5 +2496,15 @@ class _FolderRequest:
 def deactivate(ctx):
     # Deliberately leaves a running engine alone: a Loader reload or host
     # update must not close the user's editor. `POST stop` is the off switch.
+    # The gallery listener IS closed: it belongs to this module instance, and
+    # the reloaded one rebinds the same port (product.json stays valid).
     global _ctx
+    with _gallery_lock:
+        service = _gallery["service"]
+        _gallery["service"] = None
+    if service:
+        try:
+            service.stop()
+        except Exception:  # noqa: BLE001
+            pass
     _ctx = None

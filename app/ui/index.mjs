@@ -37,6 +37,7 @@
 
 import React from "react";
 import { createPortal } from "react-dom";
+import { loadHostPicker } from "/api/apps/floofycrew/spa/kirocrew-ide/hostpicker.mjs";
 
 const h = React.createElement;
 const API = "/api/apps/floofycrew/mods/kirocrew-ide/api/";
@@ -85,6 +86,7 @@ const styles = {
   button: { padding: "4px 12px", borderRadius: 6, cursor: "pointer", border, background: "transparent", color: "inherit" },
   primary: { padding: "4px 12px", borderRadius: 6, cursor: "pointer", border: "1px solid var(--accent, #7c5cff)", background: "var(--accent, #7c5cff)", color: "#fff" },
   picker: { position: "relative", flex: 1, minWidth: 260 },
+  stuck: { display: "flex", gap: 10, alignItems: "center", justifyContent: "space-between", padding: "6px 10px", borderRadius: 4, border: "1px solid var(--warning, #d29922)", background: "rgba(210,153,34,.12)", font: "12px system-ui" },
   input: { width: "100%", boxSizing: "border-box", padding: "4px 8px", borderRadius: 6, border, background: "transparent", color: "inherit" },
   menu: {
     // Portaled to document.body: `position: fixed`, placed from the field's rectangle (see FolderPicker).
@@ -162,8 +164,46 @@ function progressTitle(progress) {
   return "Spec tasks: " + head + progress.specs.map((s) => "\n  " + s.name + ": " + s.done + "/" + s.total).join("");
 }
 
-/** The folder combobox: recent workspaces + a browsable directory list. */
-function FolderPicker({ value, onChange, disabled, inputRef }) {
+/**
+ * The folder field. With the dashboard's own ProjectPicker reachable (its
+ * preloaded chunk; see spa/hostpicker.mjs) the field opens THAT — the same
+ * Recent / Browse picker the chat composer and the Spec Builder use, so the
+ * IDE's folder choice looks and behaves like the rest of the dashboard. A
+ * dashboard without it gets the mod's own combobox below.
+ */
+function FolderPicker(props) {
+  // Boxed: a bare component function handed to setState would be taken for an updater.
+  const [host, setHost] = React.useState({ Picker: undefined }); // undefined = resolving, null = not available
+  React.useEffect(() => { let live = true; loadHostPicker().then((c) => { if (live) setHost({ Picker: c }); }); return () => { live = false; }; }, []);
+  if (host.Picker) return h(HostFolderPicker, { ...props, Picker: host.Picker });
+  return h(OwnFolderPicker, props);
+}
+
+/** The host's picker anchored to our field: typing still works, a click (or focus) opens the picker. */
+function HostFolderPicker({ value, onChange, disabled, inputRef, Picker }) {
+  const [open, setOpen] = React.useState(false);
+  const anchorRef = React.useRef(null);
+  return h("div", { style: styles.picker, ref: anchorRef, "data-testid": "kirocrew-ide-folder", "data-picker": "host" },
+    h("input", {
+      ref: inputRef,
+      style: styles.input,
+      placeholder: "workspace folder — click to browse, or type a path",
+      value: value || "",
+      disabled,
+      onFocus: () => setOpen(true),
+      onClick: () => setOpen(true),
+      onChange: (event) => onChange(event.target.value),
+      onKeyDown: (event) => { if (event.key === "Escape" || event.key === "Enter") setOpen(false); },
+      "aria-expanded": open,
+      "aria-haspopup": "dialog",
+      role: "combobox",
+    }),
+    !disabled && h(Picker, { open, onOpenChange: setOpen, anchorRef, onSelect: (path) => { onChange(path); setOpen(false); } }),
+  );
+}
+
+/** The mod's own combobox: recent workspaces + a browsable directory list (the hook's `browse` route). */
+function OwnFolderPicker({ value, onChange, disabled, inputRef }) {
   const [open, setOpen] = React.useState(false);
   const [listing, setListing] = React.useState(null); // last GET browse body
   const [error, setError] = React.useState("");
@@ -346,6 +386,19 @@ export default function KirocrewIdeApp() {
     await refresh();
   };
 
+  // The remedy for a stuck engine (status.health.stuck: a document loaded, the engine
+  // accepted no connection since): the same workspaces on a fresh engine. The layer
+  // drops its documents when status reports the engine gone and rebuilds them on return.
+  const relaunch = async () => {
+    setBusy("relaunching engine…");
+    const reply = await call("relaunch", { method: "POST", body: "{}" });
+    if (!reply.ok) setError((reply.body && reply.body.error) || "relaunch failed");
+    setBusy("");
+    const api = ideLayer();
+    if (api && typeof api.refresh === "function") await api.refresh();
+    await refresh();
+  };
+
   const install = async () => {
     setBusy("installing engine…");
     await call("engines/install", { method: "POST", body: "{}" });
@@ -427,6 +480,11 @@ export default function KirocrewIdeApp() {
       running && h("button", { style: styles.button, onClick: stop, disabled: !!busy }, "Stop"),
       h("button", { style: styles.button, onClick: refresh }, "Refresh"),
     ),
+    // The engine answers HTTP but services no workbench connection (its extension host died):
+    // the page would stay blank through every reload, so say so and offer the one cure.
+    running && status.health && status.health.stuck && h("div", { style: styles.stuck, role: "alert", "data-testid": "kirocrew-ide-stuck" },
+      h("span", null, "The IDE engine looks stuck: " + status.health.reason),
+      h("button", { style: styles.primary, onClick: relaunch, disabled: !!busy, "data-testid": "kirocrew-ide-relaunch" }, "Relaunch engine")),
     // Only the unusual case gets a line: the normal same-origin serve is silent.
     running && !(status.proxy && status.proxy.inUse) && h("div", { style: { font: "11px system-ui", opacity: 0.55 } },
       "engine on 127.0.0.1:" + status.server.port + " — same-origin proxy unavailable" +

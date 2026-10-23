@@ -1,6 +1,6 @@
 {
   "name": "kirocrew-ide",
-  "version": "0.18.1",
+  "version": "0.23.3",
   "displayName": "KiroCrew IDE",
   "description": "The full VS Code workbench inside KiroCrew, backed by a loopback engine the kirocrew-ide FloofyCrew mod supervises in the gateway. Installed by that mod; uninstalling the mod removes this app. Unofficial.",
   "author": "Oscar Tseng",

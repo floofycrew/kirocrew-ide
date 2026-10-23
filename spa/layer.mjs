@@ -43,6 +43,7 @@
 import { HostModelStore, clickLocalChip, entriesFor, isEmbedded, localEntries, switchTo } from "./hostmodel.mjs";
 import { dashboardScheme, injectLetterpressStyle, readWorkbenchTheme, withScheme, workbenchCentreLeft, workbenchRightLeft } from "./workbench.mjs";
 import { donutMarkup, progressLabel, summarize } from "./progress.mjs";
+import { HOST_PICKER_RAISE_CSS, loadHostPicker, mountHostPicker } from "./hostpicker.mjs";
 
 export const API = "/api/apps/floofycrew/mods/kirocrew-ide/api/";
 export const APP_ROUTE = "/apps/kirocrew-ide";
@@ -62,6 +63,15 @@ const DOCK_POLL_MS = 500;
 const IDLE_CHECK_MS = 30000;
 const IDLE_CHOICES = [0, 5, 15, 30, 60];
 const IDLE_DEFAULT_MIN = 15;
+// Wake guard: a document the layer has just created (first show, or waking a
+// slept one) must get its WebSocket through to the engine within this budget.
+// The host counts the bridges that reached the engine (`status.proxy.websockets
+// .opened`); a document whose budget passes with the count where it stood is
+// reloaded ONCE — the 2026-10-20 blank page was exactly such a document, in the
+// desktop client, after waking from idle sleep: HTML served, no connection ever
+// made, and a client restart (a fresh load) cured it. One reload, not a loop:
+// a second miss is left for the workbench's own error path to report.
+const WAKE_BUDGET_MS = 20000;
 // Where the task indicator sits when the workbench's title-bar right part (the layout
 // controls) cannot be measured yet: clear of those four buttons on any window width.
 const PROGRESS_RIGHT_FALLBACK = 150;
@@ -109,14 +119,14 @@ const CSS = `
 #${LAYER_ID} .kide-row[data-kind="here"] .kide-detail { opacity: .8; color: var(--kide-accent, #b9a6ff); }
 #${LAYER_ID} .kide-sep { height: 1px; margin: 4px 6px; background: var(--kide-menu-border, var(--kide-border, rgba(128,128,128,.35))); opacity: .6; }
 #${LAYER_ID} .kide-chip { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
-#${LAYER_ID} .kide-chip[aria-current="true"] { font-weight: 700; border-color: transparent; background: var(--kide-accent-bg, rgba(124,92,255,.22)); color: var(--kide-accent, #b9a6ff); }
+#${LAYER_ID} .kide-chip[aria-current="true"] { font-weight: 700; border-color: transparent; background: var(--kide-accent-bg, rgba(124,92,255,.22)); color: var(--kide-accent-text, var(--kide-accent, #b9a6ff)); }
 #${LAYER_ID} .kide-chip { min-width: 0; flex: 0 1 auto; }
 /* Shrink order under a tight budget: the folder name gives way long before the host name does. */
 #${LAYER_ID} .kide-ws { flex-shrink: 20; }
 /* The folder name is the bar's one flexible piece. When the bar's budget (see fitBar) cuts it short it
    is not ellipsised but faded at the clipped edge, like KiroCrew's own crew row, and it scrolls
    sideways (wheel / trackpad) with the scrollbar hidden; the fade is the affordance. */
-#${LAYER_ID} .kide-chip .kide-ws-name { font-weight: 400; opacity: .85; overflow-x: auto; overflow-y: hidden; text-overflow: clip; white-space: nowrap; min-width: 3ch; scrollbar-width: none; flex: 0 1 auto; }
+#${LAYER_ID} .kide-chip .kide-ws-name { font-weight: 400; color: var(--kide-muted, inherit); overflow-x: auto; overflow-y: hidden; text-overflow: clip; white-space: nowrap; min-width: 3ch; scrollbar-width: none; flex: 0 1 auto; }
 #${LAYER_ID} .kide-chip .kide-ws-name::-webkit-scrollbar { display: none; }
 #${LAYER_ID} .kide-chip .kide-ws-name[data-clipped="end"] { mask-image: linear-gradient(90deg, #000 calc(100% - 18px), transparent); -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 18px), transparent); }
 #${LAYER_ID} .kide-chip .kide-ws-name[data-clipped="start"] { mask-image: linear-gradient(90deg, transparent, #000 18px); -webkit-mask-image: linear-gradient(90deg, transparent, #000 18px); }
@@ -125,7 +135,7 @@ const CSS = `
 #${LAYER_ID} .kide-idle label { display: flex; align-items: center; justify-content: space-between; gap: 8px; cursor: default; }
 #${LAYER_ID} .kide-idle select { font: 11px system-ui; color: inherit; background: var(--kide-bg, rgba(128,128,128,.15)); border: 1px solid var(--kide-menu-border, var(--kide-border, rgba(128,128,128,.35))); border-radius: 4px; padding: 1px 4px; }
 #${LAYER_ID} .kide-row[data-asleep="true"] .kide-text { opacity: .6; }
-#${LAYER_ID} .kide-chip .kide-count { min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px; font-size: 9px; line-height: 14px; text-align: center; background: var(--kide-accent, #7c5cff); color: #fff; }
+#${LAYER_ID} .kide-chip .kide-count { min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px; font-size: 9px; line-height: 14px; text-align: center; font-weight: 700; background: var(--kide-badge-bg, var(--kide-accent, #7c5cff)); color: var(--kide-badge-fg, #fff); }
 #${LAYER_ID} .kide-ws { position: relative; min-width: 0; display: inline-flex; }
 #${LAYER_ID} .kide-ws .kide-menu { min-width: 280px; max-width: 420px; }
 #${LAYER_ID} .kide-row[data-kind="workspace"][aria-checked="true"] { font-weight: 700; border-left: 2px solid var(--kide-accent, #7c5cff); border-radius: 0 4px 4px 0; }
@@ -149,6 +159,10 @@ const CSS = `
 #${LAYER_ID} .kide-badge { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; font-size: 10px; line-height: 16px; text-align: center; font-weight: 700; background: var(--kide-accent, #7c5cff); color: #fff; }
 #${LAYER_ID} .kide-loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; font: 14px system-ui; color: var(--kide-fg, #ccc); pointer-events: none; }
 #${LAYER_ID}[data-ready="true"] .kide-loading { display: none; }
+#${LAYER_ID} .kide-stuck { position: absolute; left: 50%; top: 40%; transform: translate(-50%, -50%); z-index: 2; max-width: 520px; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px 20px; border-radius: 4px; border: 1px solid var(--kide-menu-border, var(--kide-border, rgba(128,128,128,.35))); background: var(--kide-menu-bg, var(--kide-titlebar, #2b2b2b)); color: var(--kide-menu-fg, var(--kide-fg, #ccc)); font: 13px system-ui; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+#${LAYER_ID} .kide-stuck[hidden] { display: none; }
+#${LAYER_ID} .kide-stuck-btn { padding: 4px 12px; border: 1px solid var(--kide-accent, #7c5cff); background: var(--kide-accent, #7c5cff); color: #fff; }
+#${LAYER_ID}[data-stuck="true"] .kide-loading { display: none; }
 #${LAYER_ID} .kide-fox { width: 96px; height: 96px; animation: kide-fox 1.4s cubic-bezier(.45,.05,.55,.95) infinite; transform-origin: 50% 100%; }
 #${LAYER_ID} .kide-shadow { width: 64px; height: 8px; border-radius: 50%; background: currentColor; margin-top: -4px; animation: kide-shadow 1.4s cubic-bezier(.45,.05,.55,.95) infinite; }
 @keyframes kide-fox { 0%,100% { transform: translateY(0) scale(1, 1); } 30% { transform: translateY(-14px) scale(0.94, 1.06); } 50% { transform: translateY(-18px) scale(1, 1); } 70% { transform: translateY(0) scale(1.08, 0.9); } 80% { transform: translateY(0) scale(0.98, 1.03); } }
@@ -251,6 +265,8 @@ export class IdeLayer {
     this.wsMenuOpen = false;     // the IDE tag's workspace dropdown
     this.progressOpen = false;   // the task indicator's breakdown popover
     this.rightEdge = null;       // {edge, width}: the workbench's layout controls, last measured
+    this.wakes = new Map();      // iframe -> {opened, at, reloaded}: the wake guard's record per fresh document
+    this.wakeReloads = 0;        // how many documents the guard has reloaded (probes, diagnostics)
     this.opener = null;          // state of the "Open a folder…" form while it is up
     this.theme = null;
     this.hostModel = null;
@@ -287,7 +303,9 @@ export class IdeLayer {
       }
       if (this.wsMenuOpen) {
         const ws = this.root.querySelector(".kide-ws");
-        if (!(ws && ws.contains(event.target))) this.setWsMenuOpen(false);
+        // The host picker's box portals to document.body: a click in it belongs to the menu.
+        const inHostPicker = this.hostPicker && this.hostPicker.isOpen() && event.target.closest && event.target.closest("body > div:has(#pp-recent-list), body > div:has(#pp-browse-list)");
+        if (!(ws && ws.contains(event.target)) && !inHostPicker) this.setWsMenuOpen(false);
       }
       if (this.progressOpen) {
         const prog = this.root.querySelector(".kide-progress");
@@ -296,6 +314,20 @@ export class IdeLayer {
     };
     this.doc.addEventListener("mousedown", onDocClick);
     this.disposers.push(() => this.doc.removeEventListener("mousedown", onDocClick));
+    // A click INTO the workbench iframe never reaches this document's mousedown
+    // listeners (the event stays in the frame), so an open menu or picker would
+    // outlive it; the window losing focus to the frame is the signal instead.
+    const onBlur = () => {
+      this.win.setTimeout(() => {
+        const active = this.doc.activeElement;
+        if (!(active && active.tagName === "IFRAME" && this.frames.size && [...this.frames.values()].includes(active))) return;
+        if (this.menuOpen) this.setMenuOpen(false);
+        if (this.wsMenuOpen) this.setWsMenuOpen(false);
+        if (this.progressOpen) this.setProgressOpen(false);
+      }, 0);
+    };
+    this.win.addEventListener("blur", onBlur);
+    this.disposers.push(() => this.win.removeEventListener("blur", onBlur));
     // Re-insert the switcher chip whenever the host re-renders its bar.
     let scheduled = false;
     const observer = new MutationObserver(() => {
@@ -320,6 +352,26 @@ export class IdeLayer {
     const fit = () => { this.fitBar(); this.fitProgress(); };
     this.win.addEventListener("resize", fit);
     this.disposers.push(() => this.win.removeEventListener("resize", fit));
+    // The dashboard's own folder picker for "Open a folder…", when this dashboard carries it.
+    this.hostPicker = null;       // mounted controller, or null (the menu's own browser then)
+    loadHostPicker(this.doc).then((Component) => {
+      if (!Component || this.disposed) return;
+      const picker = mountHostPicker(Component, {
+        win: this.win, doc: this.doc,
+        onSelect: (path) => this.openWorkspace(path).then(() => this.setWsMenuOpen(false)).catch((err) => { this.ctx.log.warn("open failed", err); }),
+        onClose: () => { if (this.opener && this.opener.host) { this.opener = null; this.render(); } },
+      });
+      if (!picker) return;
+      this.hostPicker = picker;
+      this.disposers.push(() => picker.dispose());
+      if (!this.doc.getElementById(STYLE_ID + "-hostpicker")) {
+        const style = this.doc.createElement("style");
+        style.id = STYLE_ID + "-hostpicker";
+        style.textContent = HOST_PICKER_RAISE_CSS;
+        this.doc.head.appendChild(style);
+        this.disposers.push(() => style.remove());
+      }
+    });
     this.refresh();
     this.win.__kirocrewIde = Object.freeze({
       show: () => this.show(), hide: () => this.hide(), toggle: () => (this.shown ? this.hide() : this.show()),
@@ -328,11 +380,18 @@ export class IdeLayer {
       workspaces: () => this.workspaces(), activate: (folder) => this.activateWorkspace(folder),
       open: (folder) => this.openWorkspace(folder), close: (folder) => this.closeWorkspace(folder),
       sleepIdle: (now) => this.sleepIdle(now), setIdleUnload: (minutes) => this.setIdleUnload(minutes),
+      checkWakes: (now) => this.checkWakes(now), wakeReloads: () => this.wakeReloads,
+      stuck: () => this.stuck(), relaunch: () => this.relaunch(),
+      // The dashboard's own folder picker for "Open a folder…" (default on when the dashboard carries it);
+      // `false` falls back to the menu's built-in path box and directory list.
+      useHostPicker: (on) => { this.useHostPicker = on !== false; return !!(this.hostPicker && this.useHostPicker); },
+      hasHostPicker: () => !!this.hostPicker,
       progress: (folder) => summarize(folder ? this.workspace(folder) : this.currentWorkspace()),
     });
   }
 
   dispose() {
+    this.disposed = true;
     for (const off of this.disposers.splice(0)) off();
     this.dockEl = null;
     this.setMode("hidden");
@@ -340,6 +399,7 @@ export class IdeLayer {
     this.root = null;
     this.frame = null;
     this.frames.clear();
+    this.wakes.clear();
     this.activeFolder = null;
     const chip = this.doc.getElementById(CHIP_ID);
     if (chip) chip.remove();
@@ -504,6 +564,8 @@ export class IdeLayer {
       this.setMode("docked");
     }
     this.reconcileWorkspaces();
+    if (running) this.checkWakes();
+    this.renderStuck();
     this.placeChip();
     this.render();
     this.notify();
@@ -549,8 +611,10 @@ export class IdeLayer {
         '<button type="button" class="kide-progress-btn" data-testid="kirocrew-ide-progress-trigger" aria-haspopup="dialog" aria-expanded="false"></button>' +
         '<div class="kide-menu" data-testid="kirocrew-ide-progress-menu" role="dialog" aria-label="Spec task progress" hidden></div>' +
         "</div>" +
-        '<div class="kide-loading" data-testid="kirocrew-ide-loading" aria-live="polite"><img class="kide-fox" src="' + FOX + '" alt="" draggable="false"><div class="kide-shadow"></div><span>Loading the IDE…</span></div>';
+        '<div class="kide-loading" data-testid="kirocrew-ide-loading" aria-live="polite"><img class="kide-fox" src="' + FOX + '" alt="" draggable="false"><div class="kide-shadow"></div><span>Loading the IDE…</span></div>' +
+        '<div class="kide-stuck" data-testid="kirocrew-ide-stuck" role="alert" hidden><span class="kide-stuck-text"></span><button type="button" class="kide-btn kide-stuck-btn" data-testid="kirocrew-ide-relaunch">Relaunch engine</button></div>';
       this.doc.body.appendChild(root);
+      root.querySelector('[data-testid="kirocrew-ide-relaunch"]').addEventListener("click", (event) => { event.stopPropagation(); this.relaunch(); });
       root.querySelector('[data-testid="kirocrew-ide-progress-trigger"]').addEventListener("click", (event) => {
         event.stopPropagation();
         this.setProgressOpen(!this.progressOpen);
@@ -648,6 +712,7 @@ export class IdeLayer {
       root.appendChild(frame);
       this.frames.set(row.folder, frame);
       this.asleep.delete(row.folder); // shown again: awake (a fresh document, reconnecting)
+      this.armWake(frame);
     }
     for (const [folder, other] of this.frames) other.setAttribute("data-active", folder === row.folder ? "true" : "false");
     this.stampHidden();
@@ -662,9 +727,102 @@ export class IdeLayer {
     if (frame === this.frame && this.root) this.root.setAttribute("data-ready", "true");
   }
 
+  /** The host's count of WebSocket bridges that reached the engine, or null when status does not carry it (direct-port mode, older hook). */
+  wsOpened() {
+    const ws = this.status && this.status.proxy && this.status.proxy.websockets;
+    return ws && typeof ws.opened === "number" ? ws.opened : null;
+  }
+
+  /** Start the wake guard for a document just created: remember the count it must raise. */
+  armWake(frame) {
+    const opened = this.wsOpened();
+    if (opened === null) return;
+    this.wakes.set(frame, { opened, at: Date.now(), reloaded: false });
+    frame.setAttribute("data-wake", "pending");
+  }
+
+  /**
+   * Called on every status poll: a fresh document whose budget has passed with
+   * the host's bridge count unchanged never reached the engine; reload it once.
+   * A count that rose clears the guard (some document connected — with several
+   * waking at once that is the best a host-wide counter can tell, and a stuck
+   * sibling is caught by its own next wake).
+   */
+  checkWakes(now = Date.now()) {
+    const opened = this.wsOpened();
+    if (opened === null) return [];
+    const reloaded = [];
+    for (const [frame, wake] of [...this.wakes]) {
+      if (!frame.isConnected) { this.wakes.delete(frame); continue; }
+      if (opened > wake.opened) { this.wakes.delete(frame); frame.setAttribute("data-wake", "connected"); continue; }
+      if (now - wake.at < WAKE_BUDGET_MS) continue;
+      if (wake.reloaded) { this.wakes.delete(frame); frame.setAttribute("data-wake", "failed"); continue; }
+      wake.reloaded = true;
+      wake.at = now;
+      wake.opened = opened;
+      this.wakeReloads += 1;
+      frame.setAttribute("data-wake", "reloaded");
+      frame.setAttribute("data-ready", "false");
+      if (frame === this.frame && this.root) this.root.setAttribute("data-ready", "false");
+      this.ctx.log.warn("KiroCrew IDE: document for " + frame.dataset.folder + " never reached the engine within " + WAKE_BUDGET_MS / 1000 + "s; reloading it once");
+      // Re-assign src rather than contentWindow.location.reload(): works whatever the frame's document state is.
+      try { frame.src = frame.dataset.src; } catch { /* detached */ }
+      reloaded.push(frame.dataset.folder);
+    }
+    return reloaded;
+  }
+
+  /** The host's verdict on the engine (status.health): stuck = it serves HTML but accepts no workbench connection. */
+  stuck() {
+    const health = this.status && this.status.health;
+    return !!(this.status && this.status.running && health && health.stuck);
+  }
+
+  /**
+   * Over a document the engine will never service, the fox would bounce
+   * forever (or the page sit blank): show the host's reason and the one cure
+   * instead. Hidden again the moment status stops reporting the condition.
+   */
+  renderStuck() {
+    if (!this.root) return;
+    const box = this.root.querySelector(".kide-stuck");
+    if (!box) return;
+    const stuck = this.stuck() && this.mode !== "hidden";
+    this.root.setAttribute("data-stuck", stuck ? "true" : "false");
+    box.hidden = !stuck;
+    if (stuck) box.querySelector(".kide-stuck-text").textContent = "The IDE engine looks stuck: " + (this.status.health.reason || "it accepts no connection.");
+    box.querySelector(".kide-stuck-btn").disabled = !!this.relaunching;
+  }
+
+  /** Stop and start the engine with the same workspaces; every document is rebuilt against the new one. */
+  async relaunch() {
+    if (this.relaunching) return null;
+    this.relaunching = true;
+    this.renderStuck();
+    let reply;
+    try {
+      reply = await this.post("relaunch", {});
+    } finally {
+      this.relaunching = false;
+    }
+    if (reply && reply.ok) {
+      // The old engine's documents are dead: rebuild them against the new one.
+      const active = this.activeFolder;
+      for (const frame of this.frames.values()) frame.remove();
+      this.frames.clear();
+      this.wakes.clear();
+      this.activeFolder = active;
+      this.frame = null;
+      this.frameSrc = null;
+    }
+    await this.refresh();
+    return reply;
+  }
+
   dropFrames() {
     for (const frame of this.frames.values()) frame.remove();
     this.frames.clear();
+    this.wakes.clear();
     this.asleep.clear();
     this.frame = null;
     this.frameSrc = null;
@@ -693,11 +851,31 @@ export class IdeLayer {
     this.setMode("fullscreen");
     if (!this.workspaces().length) {
       // Engine up with nothing open: the only useful thing on screen is the opener.
-      this.opener = { path: "", listing: null, error: null, busy: false };
       this.setWsMenuOpen(true);
-      this.browse("~");
+      this.startOpener();
     }
     return true;
+  }
+
+  /**
+   * Begin "Open a folder…": the dashboard's own picker when it is mounted
+   * (anchored under the IDE tag, over the fullscreen layer), otherwise the
+   * menu's built-in path box and directory list.
+   */
+  startOpener() {
+    if (this.hostPicker && this.useHostPicker !== false) {
+      this.opener = { host: true, path: "", listing: null, error: null, busy: false };
+      this.render();
+      const tag = this.root && this.root.querySelector('[data-testid="kirocrew-ide-tag"]');
+      const rect = tag ? tag.getBoundingClientRect() : { top: 0, bottom: 30, left: 84, right: 484, width: 400, height: 30 };
+      this.hostPicker.open(rect);
+      return;
+    }
+    this.opener = { path: "", listing: null, error: null, busy: false };
+    this.render();
+    this.browse("~");
+    const input = this.root && this.root.querySelector(".kide-open input");
+    if (input) input.focus();
   }
 
   /**
@@ -902,6 +1080,10 @@ export class IdeLayer {
     s.setProperty("--kide-titlebar", next.titleBar);
     s.setProperty("--kide-bg", next.bg);
     s.setProperty("--kide-fg", next.fg);
+    s.setProperty("--kide-muted", next.muted || next.fg);
+    s.setProperty("--kide-badge-bg", next.badgeBg || next.accent);
+    s.setProperty("--kide-badge-fg", next.badgeFg || "#fff");
+    s.setProperty("--kide-accent-text", next.accentText || next.accent);
     s.setProperty("--kide-border", next.border);
     s.setProperty("--kide-hover", next.hover);
     s.setProperty("--kide-accent", next.accent);
@@ -947,7 +1129,7 @@ export class IdeLayer {
     const next = !!open;
     if (next) { this.setMenuOpen(false); this.setProgressOpen(false); }
     this.wsMenuOpen = next;
-    if (!next) this.opener = null;
+    if (!next) { this.opener = null; if (this.hostPicker) this.hostPicker.close(); }
     const menu = this.root.querySelector(".kide-ws .kide-menu");
     const tag = this.root.querySelector('[data-testid="kirocrew-ide-tag"]');
     if (menu) menu.hidden = !next;
@@ -1166,15 +1348,9 @@ export class IdeLayer {
       open.setAttribute("data-kind", "open");
       open.setAttribute("data-testid", "kirocrew-ide-open-folder");
       open.textContent = "Open a folder…";
-      open.addEventListener("click", () => {
-        this.opener = { path: "", listing: null, error: null, busy: false };
-        this.render();
-        this.browse("~");
-        const input = menu.querySelector(".kide-open input");
-        if (input) input.focus();
-      });
+      open.addEventListener("click", () => this.startOpener());
       add(open);
-    } else {
+    } else if (!this.opener.host) {
       const box = this.renderOpener();
       if (box.parentNode !== menu) menu.appendChild(box);
     }

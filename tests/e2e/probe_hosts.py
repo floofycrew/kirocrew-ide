@@ -54,6 +54,39 @@ IMPORT_MAP = (
 REACT_SHIM = "const m = window.React; export default m; export const { useState, useEffect, useRef, useCallback, useMemo, createElement, Fragment } = m;\n"
 REACT_DOM_SHIM = "const m = window.ReactDOM; export default m; export const { createPortal } = m;\n"
 REACT_DOM_CLIENT_SHIM = "export const createRoot = window.ReactDOM.createRoot; export default { createRoot };\n"
+# The dashboard publishes its shared module registry (what /vendor/*.mjs re-export) on
+# `window.__kirocrew_modules`; the layer mounts the host picker through it.
+HOST_MODULES = '<script>window.__kirocrew_modules = { react: window.React, "react-dom": window.ReactDOM };</script>'
+# A stand-in for the dashboard's ProjectPicker chunk, preloaded the way the real dashboard
+# does (`<link rel="modulepreload" href="/assets/ProjectPicker-<hash>.js">`) and shaped like
+# it: props {open, onOpenChange, anchorRef|anchorRect, onSelect}, portaled to document.body
+# at z-[9999] with the `#pp-browse-list` listbox, Recent and Browse content from the host API.
+HOST_PICKER_LINK = '<link rel="modulepreload" href="/assets/ProjectPicker-stub1.js">'
+HOST_PICKER_STUB = """
+const React = window.__kirocrew_modules.react, ReactDOM = window.__kirocrew_modules["react-dom"];
+const h = React.createElement;
+function ProjectPicker({ open, onOpenChange, anchorRef, anchorRect, onSelect }) {
+  const [recent, setRecent] = React.useState([]);
+  const [listing, setListing] = React.useState(null);
+  const boxRef = React.useRef(null);
+  React.useEffect(() => { if (!open) return; fetch("/api/recent-projects").then(r => r.json()).then(b => setRecent(b.dirs || [])); fetch("/api/browse-dirs").then(r => r.json()).then(setListing); }, [open]);
+  React.useEffect(() => {
+    if (!open) return;
+    const t = setTimeout(() => {
+      const onDown = (e) => { const a = anchorRef && anchorRef.current; if ((boxRef.current && boxRef.current.contains(e.target)) || (a && a.contains(e.target))) return; onOpenChange(false); };
+      document.addEventListener("mousedown", onDown); boxRef.current.__off = () => document.removeEventListener("mousedown", onDown);
+    }, 0);
+    return () => { clearTimeout(t); if (boxRef.current && boxRef.current.__off) boxRef.current.__off(); };
+  }, [open]);
+  const rect = anchorRef && anchorRef.current ? anchorRef.current.getBoundingClientRect() : anchorRect;
+  if (!open || !rect) return null;
+  window.__hostPickerOpens = (window.__hostPickerOpens || 0) + 1;
+  return ReactDOM.createPortal(h("div", { ref: boxRef, "data-testid": "host-project-picker", style: { position: "fixed", zIndex: 9999, top: rect.bottom + 4, left: Math.max(8, rect.right - 400), width: 400, background: "#223", color: "#eee", border: "1px solid #555" } },
+    h("div", { id: "pp-recent-list", role: "listbox" }, recent.map((p) => h("button", { key: p, role: "option", "data-recent": p, onMouseDown: (e) => { e.preventDefault(); onSelect(p); } }, p))),
+    h("div", { id: "pp-browse-list", role: "listbox" }, (listing ? listing.dirs : []).map((d) => h("button", { key: d.path, role: "option", "data-dir": d.path, onMouseDown: (e) => { e.preventDefault(); onSelect(d.path); } }, d.name)))), document.body);
+}
+export { ProjectPicker as t };
+"""
 
 
 def find_react_umd() -> pathlib.Path | None:
@@ -92,7 +125,7 @@ MOUNT = f"""
 # the page competes within it and never reaches past a body-level fixed layer.
 STYLE = "<style>body{margin:0;background:#111;color:#eee;font:13px system-ui}#topbar{height:36px;display:flex;align-items:center;padding:0 8px;background:#222;gap:8px}#app{position:relative;z-index:0}</style>"
 
-PANE_HTML = f"""<!doctype html><html data-mode="dark"><head>{IMPORT_MAP}{STYLE}</head>
+PANE_HTML = f"""<!doctype html><html data-mode="dark"><head>{IMPORT_MAP}{HOST_MODULES}{HOST_PICKER_LINK}{STYLE}</head>
 <body><div id="topbar">pane topbar</div><div id="app"></div>{MOUNT}</body></html>"""
 
 # Mirrors upstream Switcher: the crew on screen is a LEADING chip beside the
@@ -136,6 +169,14 @@ class Engine:
     workspaces = ["/tmp/demo"]
     idle = 15          # idleUnloadMinutes, as the hook reports it
     idle_posts = []    # what settings/idle-unload received
+    # The proxy's bridge counter (`status.proxy.websockets.opened`): a workbench document that loads
+    # "connects", bumping it — unless `connects` is off, which models the blank-page case (HTML served,
+    # no connection ever reaches the engine) the layer's wake guard must catch.
+    ws_opened = 0
+    connects = True
+    # status.health as the hook reports it; `stuck` is the engine-serves-HTML-but-accepts-no-connection verdict.
+    stuck = False
+    relaunches = 0
     # Spec-task progress as the hook reports it (`_spec_progress`): /tmp/demo has two specs, the others none.
     progress = {"/tmp/demo": {"total": 14, "done": 7, "inProgress": 1, "queued": 1, "optional": 2, "specs": [
         {"name": "alpha", "dir": ".kiro/specs/alpha", "tasks": ".kiro/specs/alpha/tasks.md", "total": 11, "done": 5, "inProgress": 1, "queued": 1, "optional": 2},
@@ -192,6 +233,10 @@ def make_handler(node_modules: pathlib.Path):
                 folder = json.loads(raw or b"{}").get("folder")
                 Engine.workspaces = [f for f in Engine.workspaces if f != folder]
                 return self._send(json.dumps({"running": True, "workspaces": Engine.rows()}).encode(), "application/json")
+            if p == API + "relaunch":
+                Engine.relaunches += 1
+                Engine.stuck = False
+                return self._send(json.dumps({"running": True, "workspaces": Engine.rows(), "note": "relaunched"}).encode(), "application/json")
             if p == API + "settings/idle-unload":
                 minutes = int(json.loads(raw or b"{}").get("minutes"))
                 Engine.idle = minutes
@@ -208,6 +253,8 @@ def make_handler(node_modules: pathlib.Path):
             if p == "/local.html":
                 return self._send(LOCAL_HTML.encode(), "text/html")
             if p == "/workbench.html":
+                if Engine.connects:
+                    Engine.ws_opened += 1
                 # Like the real engine: the theme variables live on `.monaco-workbench`, NOT on <body>; the title
                 # bar's right part spans 20% of the width with its toolbar pushed to the far end (margin-left: auto).
                 return self._send(b"<!doctype html><html><body style='background:#1e1e1e;color:#ccc'><style>.monaco-workbench{--vscode-titleBar-activeBackground:#2b2b2b;--vscode-commandCenter-background:#3a3a3a;--vscode-commandCenter-foreground:#ddd;--vscode-menu-background:#303030;--vscode-menu-foreground:#f0f0f0;--vscode-menu-selectionBackground:#04395e;--vscode-charts-green:#89d185;--vscode-charts-blue:#3794ff}</style><div class='monaco-workbench' style='position:relative;height:100vh'>workbench stand-in <span id=w>1</span><div class='part titlebar'><div class='titlebar-center' style='position:absolute;top:0;left:40%;width:30%;height:22px'><span style='display:inline-block;width:40px;height:22px'>&larr; &rarr;</span></div><div class='titlebar-right' style='position:absolute;top:0;right:0;width:20%;height:35px;display:flex;align-items:center'><div class='action-toolbar-container' style='margin-left:auto;width:112px;height:22px;margin-right:8px;background:#444'>&#9638; &#9707; &#9639; &#9704;</div></div></div></div></body></html>", "text/html")
@@ -217,6 +264,12 @@ def make_handler(node_modules: pathlib.Path):
                 return self._file(MOD / "spa" / p[len(SPA):])
             if p.startswith("/vendor/") and p[len("/vendor/"):] in shims:
                 return self._send(shims[p[len("/vendor/"):]].encode(), "text/javascript")
+            if p == "/assets/ProjectPicker-stub1.js":
+                return self._send(HOST_PICKER_STUB.encode(), "text/javascript")
+            if p == "/api/recent-projects":
+                return self._send(json.dumps({"dirs": ["/tmp/recent", "/tmp/demo"]}).encode(), "application/json")
+            if p == "/api/browse-dirs":
+                return self._send(json.dumps({"path": "/tmp", "parent": "/", "dirs": [{"name": "demo", "path": "/tmp/demo"}, {"name": "other", "path": "/tmp/other"}, {"name": "hostpicked", "path": "/tmp/hostpicked"}]}).encode(), "application/json")
             if p.startswith("/umd/") and p[len("/umd/"):] in umd:
                 return self._file(umd[p[len("/umd/"):]])
             if p == API + "browse":
@@ -226,7 +279,9 @@ def make_handler(node_modules: pathlib.Path):
                 if Engine.running:
                     body = {"running": True, "engine": "stand-in", "host": "dev-dsk-a", "embedUrl": Engine.rows()[0]["embedUrl"] if Engine.rows() else "/workbench.html",
                             "workspaces": Engine.rows(), "idleUnloadMinutes": Engine.idle,
-                            "server": {"engine": "stand-in", "port": 1, "folder": Engine.workspaces[0] if Engine.workspaces else None}, "proxy": {"inUse": True, "base": "/kirocrew-ide/"}}
+                            "health": {"stuck": Engine.stuck, "reason": "the workbench loaded 40s ago but the engine has accepted no connection since; its extension host may have died (see engine.log). Relaunch the engine." if Engine.stuck else None},
+                            "server": {"engine": "stand-in", "port": 1, "folder": Engine.workspaces[0] if Engine.workspaces else None},
+                            "proxy": {"inUse": True, "base": "/kirocrew-ide/", "websockets": {"opened": Engine.ws_opened, "failed": 0, "live": len(Engine.workspaces)}}}
                 else:
                     body = {"running": False, "engine": "stand-in", "host": "dev-dsk-a", "server": None, "embedUrl": None, "proxy": {"inUse": False}}
                 return self._send(json.dumps(body).encode(), "application/json")
@@ -447,6 +502,46 @@ def main() -> int:
         check(ws_rows(pane) == [["/tmp/demo", "true"]], f"ws: the menu lists the open workspace, checked ({ws_rows(pane)})")
         check(pane.query_selector(OPEN_FOLDER) is not None, "ws: the menu ends with 'Open a folder…'")
         check(not menu_open(pane), "ws: opening the workspace menu keeps the host menu closed")
+        # --- the dashboard's own folder picker (this realm preloads its chunk, as the real dashboard does) ---
+        HOST_PICKER = '[data-testid="host-project-picker"]'
+        pane.wait_for_function("() => window.__kirocrewIde.hasHostPicker()", timeout=10000)
+        pane.click(OPEN_FOLDER)
+        pane.wait_for_selector(HOST_PICKER, timeout=10000)
+        # The stub picker fetches its recents after it opens: wait for the rows, as a user would see them arrive.
+        pane.wait_for_selector(HOST_PICKER + " [data-recent]", timeout=10000)
+        hp = pane.evaluate(f"""() => {{
+          const box = document.querySelector('{HOST_PICKER}'); const r = box.getBoundingClientRect();
+          const tag = document.querySelector('{TAG}').getBoundingClientRect();
+          const layer = document.querySelector('{LAYER}');
+          const over = document.elementFromPoint(r.left + 20, r.top + 10);
+          return {{ z: getComputedStyle(box).zIndex, layerZ: getComputedStyle(layer).zIndex, underTag: r.top >= tag.bottom, onTop: !!over && box.contains(over),
+                    recent: [...box.querySelectorAll('[data-recent]')].map(e => e.dataset.recent), noOwnOpener: !document.querySelector('{OPENER}') }};
+        }}""")
+        check(hp["noOwnOpener"], "hostpicker: 'Open a folder…' opens the dashboard's picker, not the menu's own path box")
+        check(hp["underTag"] and hp["onTop"] and int(hp["z"]) > int(hp["layerZ"]), f"hostpicker: the picker's box sits under the IDE tag and paints over the fullscreen layer ({hp})")
+        check(hp["recent"] == ["/tmp/recent", "/tmp/demo"], f"hostpicker: it is the host's picker, fed by the host's recent-projects API ({hp['recent']})")
+        page.screenshot(path=str(shots / "layer-hostpicker.png"))
+        # A click inside the picker's body-level box is not an outside click for the workspace menu.
+        pane.click(HOST_PICKER + ' [data-dir="/tmp/hostpicked"]')
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}') && document.querySelector('{FRAME}').dataset.folder === '/tmp/hostpicked'", timeout=10000)
+        pane.wait_for_function(f"() => !document.querySelector('{HOST_PICKER}') && document.querySelector('{WS_MENU}').hidden", timeout=5000)
+        check([f[0] for f in frames(pane)] == ["/tmp/demo", "/tmp/hostpicked"], f"hostpicker: picking a folder opens it as a workspace and closes picker + menu ({frames(pane)})")
+        # Escape in the picker closes it and the menu, opening nothing.
+        pane.click(TAG); pane.wait_for_selector(WS_ROWS); pane.click(OPEN_FOLDER); pane.wait_for_selector(HOST_PICKER, timeout=10000)
+        pane.evaluate(f"() => document.querySelector('{HOST_PICKER}').dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}))")
+        pane.wait_for_timeout(100)
+        check(pane.query_selector(HOST_PICKER) is not None and not pane.evaluate(f"() => document.querySelector('{WS_MENU}').hidden"), "hostpicker: a click inside the picker keeps the workspace menu open")
+        page.mouse.click(600, 500)  # lands in the workbench iframe: no mousedown reaches the document, the window blur does
+        pane.wait_for_function(f"() => !document.querySelector('{HOST_PICKER}') && document.querySelector('{WS_MENU}').hidden", timeout=5000)
+        check(True, "hostpicker: a click into the workbench closes the picker with the menu")
+        pane.evaluate(f"() => window.__kirocrewIde.close('/tmp/hostpicked')")
+        pane.wait_for_function(f"() => document.querySelectorAll('{ANY_FRAME}').length === 1", timeout=10000)
+        pane.evaluate(f"() => window.__kirocrewIde.activate('/tmp/demo')")
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}').dataset.folder === '/tmp/demo'", timeout=5000)
+        # --- the menu's own opener: the fallback for a dashboard without the picker ---
+        pane.evaluate("() => window.__kirocrewIde.useHostPicker(false)")
+        pane.click(TAG)
+        pane.wait_for_selector(WS_ROWS)
         pane.click(OPEN_FOLDER)
         pane.wait_for_selector(OPENER + " input")
         pane.wait_for_selector(OPENER + ' [data-dir="/tmp/recent"]', timeout=5000)
@@ -576,6 +671,79 @@ def main() -> int:
         pane.evaluate(f"() => {api}.activate('/tmp/demo')")
         pane.wait_for_function(f"() => document.querySelector('{FRAME}').dataset.folder === '/tmp/demo'", timeout=5000)
 
+        # --- wake guard: a fresh document that never reaches the engine is reloaded once ---
+        wake_of = lambda folder: pane.evaluate(f"(f) => {{ const n = [...document.querySelectorAll('{ANY_FRAME}')].find(x => x.dataset.folder === f); return n ? n.dataset.wake : null; }}", folder)
+        pane.evaluate(f"() => {api}.refresh()")
+        pane.wait_for_function(f"() => {api}.state().status.proxy.websockets.opened > 0", timeout=5000)
+        check(pane.evaluate(f"() => {api}.checkWakes(Date.now() + 30000)") == [], "wake: documents that connected are never reloaded")
+        check(wake_of("/tmp/demo") == "connected" and wake_of("/tmp/recent") == "connected", f"wake: a connected document is marked so ({wake_of('/tmp/demo')}, {wake_of('/tmp/recent')})")
+        # A: the waking document loads but never connects (the blank-page shape); the one reload cures it.
+        Engine.connects = False
+        pane.evaluate(f"() => {api}.sleepIdle(Date.now() + 16 * 60000)")
+        pane.evaluate(f"() => {api}.activate('/tmp/recent')")
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}') && document.querySelector('{FRAME}').dataset.folder === '/tmp/recent' && document.querySelector('{FRAME}').dataset.wake === 'pending'", timeout=5000)
+        pane.wait_for_selector(f'{FRAME}[data-ready="true"]', timeout=30000)
+        pane.evaluate(f"() => {api}.refresh()")
+        pane.wait_for_timeout(300)
+        check(pane.evaluate(f"() => {api}.checkWakes(Date.now() + 10000)") == [], "wake: within the budget nothing is reloaded")
+        Engine.connects = True
+        reloaded = pane.evaluate(f"() => {api}.checkWakes(Date.now() + 21000)")
+        check(reloaded == ["/tmp/recent"], f"wake: past the budget with the engine's count unchanged, the document is reloaded ({reloaded})")
+        check(wake_of("/tmp/recent") == "reloaded" and pane.evaluate(f"() => document.querySelector('{FRAME}').dataset.ready") == "false", "wake: the reloaded document shows the loading cover again")
+        pane.wait_for_selector(f'{FRAME}[data-ready="true"]', timeout=30000)
+        pane.evaluate(f"() => {api}.refresh()")
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}').dataset.wake === 'connected'", timeout=5000)
+        check(pane.evaluate(f"() => {api}.wakeReloads()") == 1, "wake: the reload that connected is counted once")
+        check(frames(pane)[0][0] == "/tmp/demo" and len(frames(pane)) == 2, f"wake: the other document was left alone ({frames(pane)})")
+        # B: still nothing after the reload — give up (no reload loop), the workbench's own error path takes over.
+        Engine.connects = False
+        pane.evaluate(f"() => {api}.activate('/tmp/demo')")
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}').dataset.folder === '/tmp/demo'", timeout=5000)
+        pane.evaluate(f"() => {api}.sleepIdle(Date.now() + 16 * 60000)")
+        pane.evaluate(f"() => {api}.activate('/tmp/recent')")
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}') && document.querySelector('{FRAME}').dataset.folder === '/tmp/recent' && document.querySelector('{FRAME}').dataset.wake === 'pending'", timeout=5000)
+        pane.wait_for_selector(f'{FRAME}[data-ready="true"]', timeout=30000)
+        pane.evaluate(f"() => {api}.refresh()")
+        pane.wait_for_timeout(300)
+        check(pane.evaluate(f"() => {api}.checkWakes(Date.now() + 21000)") == ["/tmp/recent"], "wake: second scenario reloads once")
+        pane.wait_for_selector(f'{FRAME}[data-ready="true"]', timeout=30000)
+        pane.evaluate(f"() => {api}.refresh()")
+        pane.wait_for_timeout(300)
+        check(pane.evaluate(f"() => {api}.checkWakes(Date.now() + 42000)") == [] and wake_of("/tmp/recent") == "failed", f"wake: a document that misses twice is not reloaded again ({wake_of('/tmp/recent')})")
+        check(pane.evaluate(f"() => {api}.wakeReloads()") == 2, "wake: two reloads in all, never a loop")
+        Engine.connects = True
+        pane.evaluate(f"() => {api}.activate('/tmp/demo')")
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}').dataset.folder === '/tmp/demo'", timeout=5000)
+
+        # --- stuck engine: the host's verdict shows a banner with the one cure; Relaunch rebuilds the documents ---
+        STUCK = '[data-testid="kirocrew-ide-stuck"]'
+        check(pane.evaluate(f"() => document.querySelector('#kirocrew-ide-layer {STUCK}').hidden") is True, "stuck: no banner while the engine is healthy")
+        pane.evaluate(f"() => {{ document.querySelector('{FRAME}').__mark = 'old-engine'; }}")
+        Engine.stuck = True
+        pane.evaluate(f"() => {api}.refresh()")
+        pane.wait_for_function(f"() => {api}.stuck() === true", timeout=5000)
+        pane.wait_for_function(f"() => !document.querySelector('#kirocrew-ide-layer {STUCK}').hidden", timeout=5000)
+        banner = pane.evaluate(f"() => {{ const b = document.querySelector('#kirocrew-ide-layer {STUCK}'); const r = b.getBoundingClientRect(); return [b.textContent, r.width > 0 && r.height > 0, getComputedStyle(document.querySelector('#kirocrew-ide-layer .kide-loading')).display]; }}")
+        check("looks stuck" in banner[0] and "Relaunch engine" in banner[0] and banner[1], f"stuck: the banner names the condition and the cure ({banner[0][:60]}…)")
+        check(banner[2] == "none", "stuck: the bouncing fox is not shown over a document the engine will never service")
+        page.screenshot(path=str(shots / "layer-stuck-engine.png"))
+        pane.click(f'#kirocrew-ide-layer [data-testid="kirocrew-ide-relaunch"]')
+        pane.wait_for_function(f"() => {api}.stuck() === false", timeout=10000)
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}') && document.querySelector('{FRAME}').dataset.folder === '/tmp/demo'", timeout=10000)
+        check(Engine.relaunches == 1, f"stuck: Relaunch posts to the host once ({Engine.relaunches})")
+        check(pane.evaluate(f"() => document.querySelector('#kirocrew-ide-layer {STUCK}').hidden") is True, "stuck: the banner leaves once status clears the condition")
+        after = frames(pane)
+        check(bool(after) and after[0][0] == "/tmp/demo" and after[0][2] is None and len(after) == 1, f"stuck: only the active document is rebuilt against the new engine; the others wait for their next show ({after})")
+        pane.wait_for_selector(f'{FRAME}[data-ready="true"]', timeout=30000)
+        # Back to the two-warm-documents picture the later checks assume.
+        pane.evaluate(f"() => {api}.activate('/tmp/recent')")
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}') && document.querySelector('{FRAME}').dataset.folder === '/tmp/recent'", timeout=5000)
+        pane.wait_for_selector(f'{FRAME}[data-ready="true"]', timeout=30000)
+        pane.evaluate(f"() => {api}.activate('/tmp/demo')")
+        pane.wait_for_function(f"() => document.querySelector('{FRAME}').dataset.folder === '/tmp/demo'", timeout=5000)
+        # The rebuilt demo document is the "original" from here on: later no-reload checks compare against its mark.
+        pane.evaluate(f"(m) => {{ document.querySelector('{FRAME}').__mark = m; }}", frame_id)
+
         # --- the bar stays clear of the workbench's title-bar centre; a long folder name fades and scrolls ---
         fit = pane.evaluate(f"""() => {{
           const bar = document.querySelector('#kirocrew-ide-layer .kide-bar');
@@ -656,31 +824,29 @@ def main() -> int:
         check(docked_ind["barHidden"] and docked_ind["inLayer"] and docked_ind["right"] <= docked_ind["toolLeft"] - 4 and 4 <= docked_ind["top"] <= 12, f"progress: docked, the indicator shows at the workbench's top right, clear of its controls ({docked_ind})")
         tab_prog = pane.evaluate(f"() => {{ const t = document.querySelector('{STRIP} [data-folder=\"/tmp/demo\"] [data-testid=\"kirocrew-ide-tab-progress\"]'); return t && [t.textContent, !!t.querySelector('svg'), t.title.split('\\n').length, t.title.includes('alpha: 5/11')]; }}")
         check(tab_prog == ["50%", True, 3, True], f"progress: the App page's tab carries the workspace's donut + % with the breakdown in its tooltip ({tab_prog})")
-        # The folder menu over the docked IDE: it opens at document.body, fixed under the field,
-        # and a point inside it that overlaps the workbench hit-tests to the menu, not the layer.
+        # The App page's folder field opens the dashboard's own picker on a dashboard that carries it
+        # (this realm): the field is its anchor, a pick fills the field, and the box paints over the docked IDE.
+        pane.wait_for_selector('[data-testid="kirocrew-ide-folder"][data-picker="host"]', timeout=10000)
         pane.click('[data-testid="kirocrew-ide-folder"] input')
-        pane.wait_for_selector('[data-testid="kirocrew-ide-folder-menu"] [role=option]')
-        over = pane.evaluate("""() => {
-          const menu = document.querySelector('[data-testid="kirocrew-ide-folder-menu"]');
+        pane.wait_for_selector(HOST_PICKER + ' [role=option]', timeout=10000)
+        over = pane.evaluate(f"""() => {{
+          const box = document.querySelector('{HOST_PICKER}');
           const field = document.querySelector('[data-testid="kirocrew-ide-folder"]');
           const layer = document.getElementById('kirocrew-ide-layer');
-          const m = menu.getBoundingClientRect(), f = field.getBoundingClientRect(), l = layer.getBoundingClientRect();
+          const m = box.getBoundingClientRect(), f = field.getBoundingClientRect(), l = layer.getBoundingClientRect();
           const overlapTop = Math.max(m.top, l.top), overlapBottom = Math.min(m.bottom, l.bottom);
-          if (overlapBottom - overlapTop < 4) return { overlap: false };
-          const x = m.left + Math.min(m.width, l.right - m.left) / 2, y = (overlapTop + overlapBottom) / 2;
-          const hit = document.elementFromPoint(x, y);
-          return { overlap: true, portal: menu.parentElement === document.body, fixed: getComputedStyle(menu).position === 'fixed',
-                   aligned: Math.abs(m.left - f.left) < 1 && Math.abs(m.top - f.bottom - 4) < 1 && Math.abs(m.width - f.width) < 1,
-                   hitInMenu: !!hit && menu.contains(hit), hitTag: hit && (hit.id || hit.tagName) };
-        }""")
-        check(over.get("overlap") and over.get("portal") and over.get("fixed") and over.get("aligned") and over.get("hitInMenu"), f"ws: the folder menu is portaled, fixed under the field, and paints over the docked IDE ({over})")
+          const hit = overlapBottom - overlapTop >= 4 ? document.elementFromPoint(m.left + 20, (overlapTop + overlapBottom) / 2) : null;
+          return {{ portal: box.parentElement === document.body, underField: m.top >= f.bottom, overlap: overlapBottom - overlapTop >= 4, hitInBox: !!hit && box.contains(hit), ownMenu: !!document.querySelector('[data-testid="kirocrew-ide-folder-menu"]') }};
+        }}""")
+        check(over["portal"] and over["underField"] and not over["ownMenu"], f"hostpicker: the App field opens the dashboard's picker under itself, not the mod's own menu ({over})")
+        check(not over["overlap"] or over["hitInBox"], f"hostpicker: where the box overlaps the docked IDE it paints over it ({over})")
         page.screenshot(path=str(shots / "app-folder-menu-docked.png"))
-        pane.click('[data-testid="kirocrew-ide-folder-menu"] [role=option]')
-        pane.wait_for_timeout(100)
-        check(pane.query_selector('[data-testid="kirocrew-ide-folder-menu"]') is not None or pane.input_value('[data-testid="kirocrew-ide-folder"] input') != "", "ws: a click inside the portaled menu acts on the picker instead of closing it as an outside click")
-        pane.press('[data-testid="kirocrew-ide-folder"] input', "Escape")
-        pane.wait_for_function("() => !document.querySelector('[data-testid=\"kirocrew-ide-folder-menu\"]')", timeout=5000)
+        pane.click(HOST_PICKER + ' [data-recent="/tmp/recent"]')
+        pane.wait_for_function("() => document.querySelector('[data-testid=\"kirocrew-ide-folder\"] input').value === '/tmp/recent'", timeout=5000)
+        pane.wait_for_function(f"() => !document.querySelector('{HOST_PICKER}')", timeout=5000)
+        check(True, "hostpicker: a pick fills the App field and closes the picker")
         pane.fill('[data-testid="kirocrew-ide-folder"] input', "/tmp/other")
+        pane.press('[data-testid="kirocrew-ide-folder"] input', "Escape")
         pane.click('[data-testid="kirocrew-ide-start"]')
         pane.wait_for_function(f"() => document.querySelectorAll('{STRIP} [role=tab]').length === 2", timeout=10000)
         pane.wait_for_function(f"() => document.querySelector('{FRAME}') && document.querySelector('{FRAME}').dataset.folder === '/tmp/other'", timeout=10000)
@@ -707,10 +873,11 @@ def main() -> int:
         check("engine" not in tabs["text"] and "pick a folder" not in tabs["text"], "ws: the tab row carries no count/help sentence")
         check(pane.query_selector("text=/same-origin at/") is None, "ws: no 'served same-origin' line on the page")
         pane.click('[data-testid="kirocrew-ide-new-tab"]')
-        pane.wait_for_selector('[data-testid="kirocrew-ide-folder-menu"]', timeout=5000)
-        check(pane.evaluate("() => document.activeElement === document.querySelector('[data-testid=\"kirocrew-ide-folder\"] input')"), "ws: + focuses the folder field and opens its menu")
+        pane.wait_for_selector(HOST_PICKER, timeout=5000)
+        check(pane.evaluate("() => document.activeElement === document.querySelector('[data-testid=\"kirocrew-ide-folder\"] input')"), "ws: + focuses the folder field and opens its picker")
         page.screenshot(path=str(shots / "app-workspace-tabs.png"))
         pane.press('[data-testid="kirocrew-ide-folder"] input', "Escape")
+        pane.wait_for_function(f"() => !document.querySelector('{HOST_PICKER}')", timeout=5000)
         Engine.workspaces = ["/tmp/demo"]
 
         # --- local dashboard with KiroCrew's chip row on the page ---
@@ -732,6 +899,24 @@ def main() -> int:
         wait_mode(page2, "fullscreen")
         check(page2.evaluate(BAR_JOINED), "local: the bar's tag is the same joined 'IDE' sub-tag as the one in KiroCrew's bar")
         page2.screenshot(path=str(shots / "layer-local.png"))
+        # This realm preloads no ProjectPicker chunk (a dashboard without it): the App field falls back to the mod's own menu.
+        check(page2.evaluate("() => window.__kirocrewIde.hasHostPicker()") is False, "local: no host picker where the dashboard carries none")
+        page2.evaluate(API_EXIT)
+        wait_mode(page2, "docked")
+        page2.click('[data-testid="kirocrew-ide-folder"] input')
+        page2.wait_for_selector('[data-testid="kirocrew-ide-folder-menu"] [role=option]', timeout=10000)
+        own = page2.evaluate("""() => {
+          const menu = document.querySelector('[data-testid="kirocrew-ide-folder-menu"]');
+          const field = document.querySelector('[data-testid="kirocrew-ide-folder"]');
+          const m = menu.getBoundingClientRect(), f = field.getBoundingClientRect();
+          return { portal: menu.parentElement === document.body, fixed: getComputedStyle(menu).position === 'fixed', host: field.dataset.picker === 'host',
+                   aligned: Math.abs(m.left - f.left) < 1 && Math.abs(m.top - f.bottom - 4) < 1 && Math.abs(m.width - f.width) < 1 };
+        }""")
+        check(own["portal"] and own["fixed"] and own["aligned"] and not own["host"], f"local: the mod's own folder menu is portaled and fixed under the field ({own})")
+        page2.press('[data-testid="kirocrew-ide-folder"] input', "Escape")
+        page2.wait_for_function("() => !document.querySelector('[data-testid=\"kirocrew-ide-folder-menu\"]')", timeout=5000)
+        page2.click(CHIP)
+        wait_mode(page2, "fullscreen")
         open_menu(page2)
         rows2 = rows_of(page2)
         check([r[0] for r in rows2] == ["crew", "here", "crew"], f"local: menu = Local, desk (here), sandbox ({[r[0] for r in rows2]})")

@@ -37,7 +37,9 @@ test("reads command-centre colours first, title-bar colours as fallback", () => 
     "--vscode-commandCenter-background": "#333", "--vscode-commandCenter-foreground": "#eee",
     "--vscode-commandCenter-border": "#555", "--vscode-titleBar-activeBackground": "#111",
   }));
-  assert.deepEqual(t, { bg: "#333", fg: "#eee", border: "#555", hover: "#333", titleBar: "#111", accent: "#7c5cff", menuBg: "#333", menuFg: "inherit", menuBorder: "#555", menuHover: "rgba(128,128,128,.18)", menuHoverFg: "inherit", done: "#3fb950", active: "#4a9eff" });
+  // This stub frame has no document to measure colours in, so the readability pass keeps the
+  // theme's own foreground and badge (the measured cases are in theme_contrast.test.mjs).
+  assert.deepEqual(t, { bg: "#333", fg: "#eee", muted: "#eee", badgeBg: "#7c5cff", badgeFg: "#fff", accentText: "#7c5cff", border: "#555", hover: "#333", titleBar: "#111", accent: "#7c5cff", menuBg: "#333", menuFg: "inherit", menuBorder: "#555", menuHover: "rgba(128,128,128,.18)", menuHoverFg: "inherit", done: "#3fb950", active: "#4a9eff" });
   const fallback = readWorkbenchTheme(frameWith({ "--vscode-titleBar-activeBackground": "#202", "--vscode-titleBar-activeForeground": "#fff" }));
   assert.equal(fallback.bg, "#202");
   assert.equal(fallback.fg, "#fff");

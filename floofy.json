@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.18.1",
+  "version": "0.23.3",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -16,7 +16,7 @@
     "productivity"
   ],
   "kirocrew": {
-    "version": ">=0.7.0 <0.9.0",
+    "version": ">=0.7.0 <0.10.0",
     "editions": [
       "internal",
       "external"
@@ -33,7 +33,9 @@
     "hosts": [
       "api.github.com",
       "github.com",
+      "marketplace.visualstudio.com",
       "objects.githubusercontent.com",
+      "open-vsx.org",
       "release-assets.githubusercontent.com"
     ],
     "credentials": false
@@ -85,11 +87,11 @@
     },
     {
       "path": "README.md",
-      "sha256": "f73287d47eb70ebd9f80a51e23a3ad335c1d9bfac1387a0287ff89b112ba7af6"
+      "sha256": "62fac2ff3face312aaefd3d7c9391669e7e6d8aa0adceb98b42b524bd6643e8e"
     },
     {
       "path": "app/app.json",
-      "sha256": "2fcba45b89fff129c5eb3b5b2cc9e095dff8ff47217e23c8d9a2170a5b0ec8fa"
+      "sha256": "39c50ec2dcc56d46d9b066654ccda2ad852b2715e6f6d739a3046ba945180394"
     },
     {
       "path": "app/ui/art/fox.svg",
@@ -101,11 +103,11 @@
     },
     {
       "path": "app/ui/index.mjs",
-      "sha256": "0628c0e8fe14b76cfb18354d5742eb097ec8db9e03f7b49bbc9b2e9bada666b3"
+      "sha256": "ef26736557ca2e2945dd87df3ea5d37b166a74e421844191ef3266b31480c684"
     },
     {
       "path": "extension/extension.js",
-      "sha256": "472774b2a177611660495ac68d56c9d2e8ab319f936760931db6d82a34bffa3c"
+      "sha256": "bf83097ae02d6ca8ea572d3749a95cb142c5dc816ac32b6c01a7540121050ae0"
     },
     {
       "path": "extension/media/fox.svg",
@@ -117,19 +119,23 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "5cf251abed2cc390e2f7461270572a37a8f473626f4c5dd691d5df71e79523d5"
+      "sha256": "c85781eaf3657661a3f8cd275b9290d65b9cc60312581751786aa5993fa11b79"
     },
     {
       "path": "hook/__init__.py",
-      "sha256": "855945906a9b6e4514a66eb39e27dc655ff198a9c6e544c3daf39e0b5352c657"
+      "sha256": "d7e23e4a9992df09ad8ea15d2ffc12ec78eea9e503dd718b1d9ff529b5df8b75"
     },
     {
       "path": "spa/hostmodel.mjs",
       "sha256": "96b59c309ed679713555fa36eaa512203e0b75dd6e3f6d85f1e5a8baa000c2ba"
     },
     {
+      "path": "spa/hostpicker.mjs",
+      "sha256": "ed2d9fc90790cff671b77db03012b9805480fd4e69086fcc7696947d1525d09a"
+    },
+    {
       "path": "spa/layer.mjs",
-      "sha256": "cb0ad0f8f605d2e11f4e18a0607f153e319e42727489808856823e5aadd9f258"
+      "sha256": "1a5269a59baf34960227698838a497413725e444598eb621f6746edf53ee742a"
     },
     {
       "path": "spa/progress.mjs",
@@ -137,7 +143,7 @@
     },
     {
       "path": "spa/workbench.mjs",
-      "sha256": "010dafa9dfc3f5603c4c744fd60151063f3806f2b02c2fa787a8de659fd8bd0d"
+      "sha256": "0bc5dbb47cc01b1b6a9e78084cd2553c9b804b4f9912d8f893a487ce05aa6539"
     },
     {
       "path": "tests/activity_order_test.py",
@@ -149,7 +155,7 @@
     },
     {
       "path": "tests/app_theme.test.mjs",
-      "sha256": "c6e03ef8ea9de0d7c5fe2fe909f71c732965f94fe16f9f698642893000b2ebe0"
+      "sha256": "ad737b7edb6d50fa58b2cfe907ad01f50d2a51aff5f4b36e32ed8f89d6df9471"
     },
     {
       "path": "tests/browse_test.py",
@@ -165,7 +171,11 @@
     },
     {
       "path": "tests/e2e/probe_chat_webview.py",
-      "sha256": "6b4396d2909ddb968a68b28d2ff91ca29704f9068029d9e5530f2d3d9690805b"
+      "sha256": "6fcca8c1ef1c9e49794f85b624a8afb744ffd5f37235963f0686e78e995a9d9b"
+    },
+    {
+      "path": "tests/e2e/probe_gallery.py",
+      "sha256": "83d67fc877f9b831a50967db250c8efffdfe471032765baa05480302bef4bf08"
     },
     {
       "path": "tests/e2e/probe_composer.py",
@@ -177,7 +187,7 @@
     },
     {
       "path": "tests/e2e/probe_hosts.py",
-      "sha256": "495940cbf29638217834365a6fc9a3b13c58608ddd187e9fdabd0e4c8b590c1a"
+      "sha256": "9e9be0324d17889382b509fe095d0158dfe85cc7d53c7c5eb9825fc683e5cc22"
     },
     {
       "path": "tests/e2e/probe_markdown.py",
@@ -197,11 +207,15 @@
     },
     {
       "path": "tests/e2e/proxy_harness.py",
-      "sha256": "38af593800e86caf36ff4e8d83560bd33db32e0fb69cd5169b10b0578eba3d3f"
+      "sha256": "67ec7381db5ee908a0c74912ebcc4fce06cec6f1ea440a3e2e2fb685ab0f34a7"
     },
     {
       "path": "tests/e2e/render_chat_html.mjs",
       "sha256": "51fc9833aaf0f685ae4ef9c2f0c19e65a7ca84a696d947244d54ec4a3e020bb3"
+    },
+    {
+      "path": "tests/engine_health_test.py",
+      "sha256": "f90a09b5b834343dac363ae0164ea6eed0cdfffcb0605fea1d31e5cad3f79963"
     },
     {
       "path": "tests/early_contract_test.py",
@@ -213,7 +227,7 @@
     },
     {
       "path": "tests/extension_unit.test.mjs",
-      "sha256": "8427163f0e3b5688623f8def496a32fec61e830113b59d42c5ca98dbf68a70d3"
+      "sha256": "f4eb1d63058b0b9967230e0c9034a10cf4a88e41aecb1c202537a9981733c71e"
     },
     {
       "path": "tests/gitdiff_test.py",
@@ -222,6 +236,10 @@
     {
       "path": "tests/hostmodel.test.mjs",
       "sha256": "5985b30a7ff10d09e135d7dcccb281dd8290cc08a7f37230ca1a52234268ac26"
+    },
+    {
+      "path": "tests/hostpicker.test.mjs",
+      "sha256": "fbcdc7390fefc82e71b9d18b31db735b118adc81fb76c64596b90cc3f1120cd5"
     },
     {
       "path": "tests/import_check.py",
@@ -242,6 +260,10 @@
     {
       "path": "tests/machine_settings_test.py",
       "sha256": "bb3a0fc37c42658a6c48ffc8f6c81d0b32a274253cb33d3511cb391d681b0eb1"
+    },
+    {
+      "path": "tests/marketplace_install_test.py",
+      "sha256": "e4b7acd6eb96024950d786fab00f4b554f5718798e0a9dce90df799530151eaf"
     },
     {
       "path": "tests/mod_icon_test.py",
@@ -284,6 +306,10 @@
       "sha256": "6f42453bb0756b2e7fe6244e61050559d40ad50e16b840b7bb6c66fe33b2ad7a"
     },
     {
+      "path": "tests/theme_contrast.test.mjs",
+      "sha256": "6662ac192cd6c49914188c83ab76e75fd859498e46a9a20e176c489f9fa8ae35"
+    },
+    {
       "path": "tests/trampoline_test.py",
       "sha256": "fb2d2c2c24cc877d0083349ab09aa46575b261c04b24a2eaf4a95c820fb80b8f"
     },
@@ -296,12 +322,28 @@
       "sha256": "3a65e9885b2e3f683c29dffa0c6bbd2f4280d9225cc9542da6e1a57e81bafdaa"
     },
     {
+      "path": "tests/ws_proxy_test.py",
+      "sha256": "c25517eafd43483b9328c4b03fc9c1c32fdf44cfbf79cef5e28b5e80b7fe385c"
+    },
+    {
       "path": "ui/icon.svg",
       "sha256": "da1ab5c356a82b0d7157773d24015bcb0e816b3a9d2916a062b45c06e885e8af"
     },
     {
       "path": "ui/page.mjs",
       "sha256": "a411f07bfee31355a9603edd8910a6df18a69f58006abc09240f8f2e1f1624b3"
+    },
+    {
+      "path": "tests/new_window_profile_test.py",
+      "sha256": "ddf936d94878c8ec8e8ba60046acdac5954938ca1aaf583111b6344aa4b0d9c9"
+    },
+    {
+      "path": "hook/gallery.py",
+      "sha256": "b9e383e9b0edc181326a4bef8d4f28caa830f90900b35a5ed06619349f2b1bcb"
+    },
+    {
+      "path": "tests/gallery_test.py",
+      "sha256": "eaf03f97f1994665d99f8fc4ebaf409a9d91cd7892b99b66120430cf0b608c3d"
     }
   ]
 }
