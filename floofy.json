@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.23.3",
+  "version": "0.25.0",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -83,7 +83,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "c982ae15a8739323821b13f404697a74865322d5643dcb30eb6bf3dc8499f62c"
+      "sha256": "954f50e56ffd6c3518761b0de9e007dd96583cb7723025afdf10339e2c0b33b7"
     },
     {
       "path": "app/app.json",
@@ -103,7 +103,7 @@
     },
     {
       "path": "extension/extension.js",
-      "sha256": "bf83097ae02d6ca8ea572d3749a95cb142c5dc816ac32b6c01a7540121050ae0"
+      "sha256": "44129b550c1575b95344d5d01a1150c30256f90224d2f505698ec7fed093a5e9"
     },
     {
       "path": "extension/media/fox.svg",
@@ -115,11 +115,11 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "c85781eaf3657661a3f8cd275b9290d65b9cc60312581751786aa5993fa11b79"
+      "sha256": "f45a677c409023b940ea28524508e1daab11a198047c6a6e347324d47ecf2fb6"
     },
     {
       "path": "hook/__init__.py",
-      "sha256": "d7e23e4a9992df09ad8ea15d2ffc12ec78eea9e503dd718b1d9ff529b5df8b75"
+      "sha256": "4726e21093bdcff024cc1354324e9e8aa408c49da9d712b51f2efa037af8c079"
     },
     {
       "path": "hook/gallery.py",
@@ -135,7 +135,7 @@
     },
     {
       "path": "spa/layer.mjs",
-      "sha256": "1a5269a59baf34960227698838a497413725e444598eb621f6746edf53ee742a"
+      "sha256": "70342bf9b1b617a59bf7d671255a7600f6e214b9239e31f21c3c7a1dcbae4648"
     },
     {
       "path": "spa/progress.mjs",
@@ -171,7 +171,7 @@
     },
     {
       "path": "tests/e2e/probe_chat_webview.py",
-      "sha256": "6fcca8c1ef1c9e49794f85b624a8afb744ffd5f37235963f0686e78e995a9d9b"
+      "sha256": "703693a1cd9d791739ac73e9899521dc9b06a2316531d390655043ce5646d8b3"
     },
     {
       "path": "tests/e2e/probe_composer.py",
@@ -187,7 +187,7 @@
     },
     {
       "path": "tests/e2e/probe_hosts.py",
-      "sha256": "9e9be0324d17889382b509fe095d0158dfe85cc7d53c7c5eb9825fc683e5cc22"
+      "sha256": "c0addafe94a447db23e9ad484a76f4bc5e7278c868037811056f6048ab7725ee"
     },
     {
       "path": "tests/e2e/probe_markdown.py",
@@ -227,7 +227,7 @@
     },
     {
       "path": "tests/extension_unit.test.mjs",
-      "sha256": "f4eb1d63058b0b9967230e0c9034a10cf4a88e41aecb1c202537a9981733c71e"
+      "sha256": "94583393589557e5861a1c2387b0546b7a97c880d41b16135c474f7d2d1d97b1"
     },
     {
       "path": "tests/gallery_test.py",
@@ -280,6 +280,10 @@
     {
       "path": "tests/new_window_profile_test.py",
       "sha256": "ddf936d94878c8ec8e8ba60046acdac5954938ca1aaf583111b6344aa4b0d9c9"
+    },
+    {
+      "path": "tests/profile_associations_test.py",
+      "sha256": "ab3431d9fb0ed020585cefaef49738fde95223453c3684ab570e372b59d0b062"
     },
     {
       "path": "tests/profile_seed_test.py",

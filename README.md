@@ -206,7 +206,21 @@ other theme and it stays yours.
   reads the URL and the folder's association, never that setting; the mod reads
   it from the browser's user-data store and rewrites the URL before the
   workbench starts, with one early reload the first time after you toggle it).
-  A profile you picked for a folder with *Switch Profile* still wins.
+  A profile you picked for a folder with *Switch Profile* still wins — and
+  that choice follows you too. The web workbench keeps *which profile a folder
+  opens in* in the browser as well, and never tells the server (the engine's
+  mirror of it is always empty), so a folder you had given a profile in the
+  desktop app used to open in Default from a browser tab. The layer, which
+  shares the dashboard origin with every workbench document, now reports the
+  browser's folder → profile map to the host (once at start, and after every
+  change a workbench makes to it), the host keeps it by folder path, and every
+  served document seeds the record into the browser before the workbench boots
+  — only for folders that browser has no entry of its own for, so a choice
+  made in this browser (switching a folder back to Default included) is never
+  overwritten. The same seed heals a second, quieter loss: the workbench keys
+  those entries by the engine's `127.0.0.1:<port>`, so a relaunch that landed
+  on the next free port orphaned every earlier choice; an entry held under an
+  old port is copied to the current one.
 - **KiroCrew Chat** in the IDE's secondary side bar (the built-in AI chat is
   turned off): tabs, one KiroCrew session per tab, per-project **History**
   (every session whose project is the open folder — created here or in the
@@ -225,7 +239,19 @@ other theme and it stays yours.
   and `~/.kiro/steering` load exactly as Kiro CLI loads them: a file with no
   front matter or `inclusion: always` is in every turn, while `fileMatch` and
   `manual` files are left out by the agent itself (verified against kiro-cli
-  2.33). The bridge adds the other two modes the way Kiro's IDE does
+  2.33). Subdirectories count: the agent's `steering/**/*.md` resource walks
+  them (verified on kiro-cli 2.34, `steering/a/b/c.md` loads like
+  `steering/c.md`), and the bridge's own inventory walks them too, naming a
+  nested file by its path under the steering dir (`#amazon-builder/git`, or
+  the bare `#git` when no other file has that name). Who loads the `always`
+  tier depends on the host's agent engine, so the receipt says which: on KAS
+  (`acp_backend: kas`, the default) both tiers load for **every** agent, Kiro's
+  built-in Spec mode included, whatever the agent's `resources` say (verified on
+  kiro-cli 2.34 `--v3`: an agent with no `resources` key and one whose
+  `resources` omit steering both got the files, `manual` ones excluded); on the
+  legacy engine steering comes only through the agent's `resources`, and the
+  receipt warns when they leave it out. A Spec tab whose mode agent the host
+  refuses re-posts the receipt for the agent it falls back to. The bridge adds the other two modes the way Kiro's IDE does
   ([inclusion modes](https://kiro.dev/docs/steering/)): a `fileMatch` file
   whose `fileMatchPattern` matches a file in the turn's context (a `#` file or
   open-files pick, the editors on screen) and a `manual` or `auto` file the
@@ -254,7 +280,16 @@ other theme and it stays yours.
 - The transcript takes KiroCrew's own shape: your turn is a fit-width bubble
   on the right (small radius, the workbench's input colours), the agent's
   answer is bare text, tool lines are quiet mono rows, code blocks have the
-  dashboard's padding and a hairline. While the agent works and no answer is
+  dashboard's padding and a hairline. **Your last prompt stays in view:** once
+  the transcript scrolls past a user turn, that turn is pinned at the top right
+  as a one-line card in the bubble's colours (KiroCrew's pinned prompt): three
+  lines on hover, the whole prompt on its ⌄, and a click on the text scrolls
+  back to where the turn starts. The card slides away as the next turn reaches
+  it and that turn takes its place. **Tool calls open on click:** a 🔧 row's
+  header toggles a body with the call's Input (a shell call shows its command,
+  a one-field call its value, anything else pretty JSON) and Output (the
+  result once the tool returned; a pulsing dot and "running…" until then),
+  paths linked into editor tabs, both clipped at 20 KB with a marker. While the agent works and no answer is
   streaming yet (reasoning, tool calls, the wait for the first token) four
   small FloofyCrew foxes hop in turn under the last row, where KiroCrew shows
   its ghosts; they go still under *prefers-reduced-motion*.

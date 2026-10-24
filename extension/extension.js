@@ -735,6 +735,12 @@ class ChatView {
     await this.sessions.setSlotAgent(t.key, s.agent || "").catch(() => undefined);
     const frame = workflowContext(s.mode, this.sessions.projectPath());
     if (frame) await this.sessions.inject(t.key, frame, "kirocrew-ide workflow").catch(() => undefined);
+    // The receipt already posted named the refused mode agent; say what steers the agent that runs.
+    try {
+      const docs = await listSteering(this.sessions.projectPath());
+      const note = docs.length ? await this.steeringNote(docs, s.agent) : null;
+      if (note) this.post({ type: "status", id: t.id, text: note });
+    } catch (e) { log("steering (fallback): " + e.message); }
     await this.sessions.send(t.key, pending.text, s.agent, pending.meta);
     return true;
   }
@@ -757,19 +763,31 @@ class ChatView {
     for (const d of docs) if (d.inclusion === "fileMatch" && steeringMatches(d, paths, root)) out.push(await steeringContext(d, "fileMatch"));
     for (const d of steeringMentions(text, docs)) if (d.inclusion !== "always" && !out.some((c) => c.steering.name === d.name)) out.push(await steeringContext(d, "mention"));
     let note = null;
-    if (firstTurn) {
-      const loads = agentLoadsSteering(await readAgentDoc(agentName));
-      const always = docs.filter((d) => d.inclusion === "always");
-      const tier = (scope) => always.filter((d) => d.scope === scope).map((d) => d.label).join(", ");
-      const parts = [];
-      if (tier("workspace")) parts.push("workspace " + tier("workspace"));
-      if (tier("global")) parts.push("global " + tier("global"));
-      if (loads === false) note = "Steering: agent " + agentName + " does not load .kiro/steering (its resources leave it out)" + (always.length ? " — " + always.length + " always-included file(s) are NOT in this session" : "");
-      else if (parts.length) note = "Steered by " + parts.join("; ") + " (always, loaded with the agent)";
-      const rest = docs.filter((d) => d.inclusion !== "always");
-      if (rest.length) note = (note ? note + ". " : "Steering: ") + rest.map((d) => d.label + " is " + steeringModeLabel(d)).join(", ");
-    }
+    if (firstTurn) note = await this.steeringNote(docs, agentName);
     return { contexts: out, note };
+  }
+  /**
+   * The one-line "steered by" receipt for `agentName`: the always-included
+   * files per tier (they load with the agent — on KAS for every agent, on the
+   * legacy engine only through the agent's `resources`), then the rest with
+   * their modes. Names the agent, since a Spec tab can change agent on the host's
+   * mode-id refusal (fallBackFromModeAgent re-posts it for the fallback agent).
+   */
+  async steeringNote(docs, agentName) {
+    const backend = await readAcpBackend();
+    const loads = agentLoadsSteering(await readAgentDoc(agentName), backend);
+    const who = agentName || "the crew default agent";
+    const always = docs.filter((d) => d.inclusion === "always");
+    const tier = (scope) => always.filter((d) => d.scope === scope).map((d) => d.label).join(", ");
+    const parts = [];
+    if (tier("workspace")) parts.push("workspace " + tier("workspace"));
+    if (tier("global")) parts.push("global " + tier("global"));
+    let note = null;
+    if (loads === false) note = "Steering: agent " + who + " does not load .kiro/steering (its resources leave it out" + (backend === "legacy" ? ", legacy engine" : "") + ")" + (always.length ? " — " + always.length + " always-included file(s) are NOT in this session" : "");
+    else if (parts.length) note = "Steered by " + parts.join("; ") + " (always, loaded with agent " + who + (backend === "kas" ? " on KAS" : "") + ")";
+    const rest = docs.filter((d) => d.inclusion !== "always");
+    if (rest.length) note = (note ? note + ". " : "Steering: ") + rest.map((d) => d.label + " is " + steeringModeLabel(d)).join(", ");
+    return note;
   }
   /**
    * Start a workflow from outside the composer (the spec editor's Continue, the
@@ -870,6 +888,12 @@ class ChatView {
         break;
       }
       case "chat_done": this.post({ type: "done", id }); break;
+      // The tool row itself arrives as a chat_message; its result and any
+      // refined title/arguments come as separate frames keyed by tool_call_id.
+      case "tool_result": this.post({ type: "toolResult", id, tcid: frame.data.tool_call_id || "", output: frame.data.output }); break;
+      case "tool_call":
+        if (frame.data.is_update && frame.data.tool_call_id) this.post({ type: "toolUpdate", id, tcid: frame.data.tool_call_id, title: frame.data.tool || "", purpose: frame.data.purpose, input: frame.data.input_preview });
+        break;
       default: break;
     }
   }
@@ -1061,42 +1085,84 @@ function steeringMatches(doc, paths, root) {
   return paths.some((p) => { const r = rel(p); const base = r.split("/").pop(); return res.some((re) => re.test(r) || re.test(base)); });
 }
 
-/** `#name` tokens in a typed message that name a steering file (by its file name without .md). */
+/**
+ * `#name` tokens in a typed message that name a steering file: the file name
+ * without .md, or for a nested file its path under the steering dir
+ * (`#amazon-builder/git`); a bare name also finds a nested file when exactly
+ * one file of that name exists across both tiers.
+ */
 function steeringMentions(text, docs) {
   const names = new Map(docs.map((d) => [d.name.toLowerCase(), d]));
+  const bases = new Map();
+  for (const d of docs) { const b = d.name.toLowerCase().split("/").pop(); bases.set(b, bases.has(b) ? null : d); }
   const out = [];
-  for (const m of String(text || "").matchAll(/(^|\s)#([\w.-]+)/g)) {
-    const d = names.get(m[2].toLowerCase().replace(/\.md$/, ""));
+  for (const m of String(text || "").matchAll(/(^|\s)#([\w./-]+)/g)) {
+    const key = m[2].toLowerCase().replace(/\.md$/, "").replace(/^\.?\//, "");
+    const d = names.get(key) || bases.get(key) || null;
     if (d && !out.includes(d)) out.push(d);
   }
   return out;
 }
 
-/** Does this agent load the steering trees itself? null = unknown (treated as yes, kiro-cli's default). */
-function agentLoadsSteering(agentDoc) {
+/**
+ * Does this agent load the steering trees itself? Depends on the engine the
+ * host runs sessions on (checked on kiro-cli 2.34 with a nested workspace tree):
+ *  - KAS (`acp_backend: kas`, kiro-cli --v3): both tiers load for EVERY agent,
+ *    inclusion rules applied — a workspace agent with no `resources` key and
+ *    one whose `resources` omit steering both saw them; Kiro's built-in Spec
+ *    mode (`--agent spec`) too. So the answer is yes regardless of the doc.
+ *  - legacy engine: steering comes only through the agent's `resources`; an
+ *    agent with no `resources` key loads none (a probe agent saw nothing).
+ * null = unknown (treated as yes, no warning).
+ */
+function agentLoadsSteering(agentDoc, backend) {
+  if (backend === "kas") return true;
   if (!agentDoc || typeof agentDoc !== "object") return null;
-  if (!Array.isArray(agentDoc.resources)) return true; // inherits kiro-cli's defaults, steering included
+  if (!Array.isArray(agentDoc.resources)) return backend === "legacy" ? false : null;
   return agentDoc.resources.some((r) => /steering/.test(String(r)));
 }
 
-/** Every steering file of both tiers, parsed: { name, label, scope, uri, path, inclusion, patterns, description }. */
+/** The host's agent engine from ~/.kiro/crew/config.json: "kas", "legacy", or null when unknown. */
+async function readAcpBackend() {
+  const home = homeUri();
+  if (!home) return null;
+  try {
+    const cfg = JSON.parse(new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(home, ".kiro", "crew", "config.json"))));
+    const b = String(cfg.acp_backend || "").trim().toLowerCase();
+    return b ? (b === "kas" ? "kas" : "legacy") : null;
+  } catch { return null; }
+}
+
+/** How deep listSteering follows subdirectories of a steering tree (kiro-cli's `**` is unbounded; this only guards against a pathological tree). */
+const STEERING_MAX_DEPTH = 8;
+
+/**
+ * Every steering file of both tiers, parsed: { name, label, scope, uri, path,
+ * inclusion, patterns, description }. Subdirectories are walked the way the
+ * agent's `file://…/.kiro/steering/**\/*.md` resource does (checked on
+ * kiro-cli 2.34: `steering/a/b/c.md` loads like `steering/c.md`), so a file in
+ * `steering/amazon-builder/git.md` is named `amazon-builder/git` and labelled by
+ * that relative path; `#name` accepts the path or, when unique, the bare name.
+ */
 async function listSteering(root) {
   const out = [];
-  const scan = async (base, scope) => {
+  const scan = async (base, scope, rel, depth) => {
     let entries = [];
     try { entries = await vscode.workspace.fs.readDirectory(base); } catch { return; }
     for (const [name, kind] of entries.sort((a, b) => a[0].localeCompare(b[0]))) {
-      if (kind !== vscode.FileType.File || !/\.md$/i.test(name) || name.startsWith(".")) continue;
+      if (name.startsWith(".")) continue;
       const uri = vscode.Uri.joinPath(base, name);
+      if (kind === vscode.FileType.Directory) { if (depth < STEERING_MAX_DEPTH) await scan(uri, scope, rel + name + "/", depth + 1); continue; }
+      if (kind !== vscode.FileType.File || !/\.md$/i.test(name)) continue;
       let text = "";
       try { text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri)); } catch { continue; }
       const doc = parseSteering(text);
-      out.push({ name: name.replace(/\.md$/i, ""), label: name, scope, uri, path: uri.path, inclusion: doc.inclusion, patterns: doc.patterns, description: doc.description, size: doc.body.length });
+      out.push({ name: rel + name.replace(/\.md$/i, ""), label: rel + name, scope, uri, path: uri.path, inclusion: doc.inclusion, patterns: doc.patterns, description: doc.description, size: doc.body.length });
     }
   };
-  for (const folder of vscode.workspace.workspaceFolders || []) await scan(vscode.Uri.joinPath(folder.uri, ".kiro", "steering"), "workspace");
+  for (const folder of vscode.workspace.workspaceFolders || []) await scan(vscode.Uri.joinPath(folder.uri, ".kiro", "steering"), "workspace", "", 0);
   const home = homeUri();
-  if (home) await scan(vscode.Uri.joinPath(home, ".kiro", "steering"), "global");
+  if (home) await scan(vscode.Uri.joinPath(home, ".kiro", "steering"), "global", "", 0);
   void root;
   return out;
 }
@@ -1256,9 +1322,41 @@ function chatHtml(foxUri) {
  .row{margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;line-height:1.55;min-width:0}
  .user{align-self:flex-end;width:fit-content;max-width:92%;background:var(--vscode-input-background);color:var(--vscode-input-foreground,inherit);border:1px solid var(--vscode-input-border,var(--vscode-widget-border,transparent));padding:6px 10px;border-radius:6px}
  .user .ctx{display:flex;flex-wrap:wrap;gap:3px;margin-bottom:4px}
+ /* The pinned prompt (KiroCrew's pinned-prompt): while the transcript is
+    scrolled past a user turn, that turn stays at the top right as a one-line
+    card in the bubble's own colours (three lines on hover, the whole prompt on
+    ⌄); clicking it scrolls back to where the turn starts. The wrapper lets the
+    transcript take every click around the card. */
+ .pin{position:absolute;top:0;left:8px;right:8px;z-index:3;display:flex;justify-content:flex-end;padding:4px 0 0;pointer-events:none;font-size:var(--kide-msg-size)}
+ .pin[hidden]{display:none}
+ .pin-card{pointer-events:auto;display:flex;align-items:flex-start;gap:4px;max-width:92%;min-width:0;background:var(--vscode-input-background);color:var(--vscode-input-foreground,inherit);border:1px solid var(--vscode-input-border,var(--vscode-widget-border,transparent));border-radius:6px;padding:4px 6px 4px 10px;box-shadow:0 2px 8px rgba(0,0,0,.22);will-change:transform;transition:transform .08s linear}
+ .pin-text{flex:1;min-width:0;margin:0;padding:0;border:0;background:transparent;color:inherit;font:inherit;line-height:1.55;text-align:left;cursor:pointer;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:1;overflow:hidden;white-space:normal;word-break:break-word;overflow-wrap:anywhere}
+ .pin-card:hover .pin-text,.pin-card:focus-within .pin-text{-webkit-line-clamp:3}
+ .pin.open .pin-text{display:block;-webkit-line-clamp:unset;max-height:40vh;overflow:auto;white-space:pre-wrap}
+ .pin-more{display:none;flex:none;margin:0;padding:0 3px;border:0;background:transparent;color:inherit;opacity:.6;cursor:pointer;font-size:14px;line-height:1.55;transition:transform .2s}
+ .pin.more .pin-more{display:inline-block}.pin-more:hover{opacity:1}.pin.open .pin-more{transform:rotate(180deg)}
+ .pin-text:focus-visible,.pin-more:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:1px}
+ @media (prefers-reduced-motion:reduce){.pin-card{transition:none}}
  .assistant,.streaming{padding:0 2px}
  .tool,.status,.thinking{color:var(--vscode-descriptionForeground);font-size:12px;font-family:var(--vscode-editor-font-family);padding:3px 8px;border-radius:4px;background:var(--vscode-editorWidget-background,transparent);box-shadow:inset 0 0 0 1px var(--vscode-widget-border,var(--vscode-panel-border))}
  .status{background:transparent;box-shadow:none;padding:0 2px}
+ /* A tool call row: the header toggles a body with the call's Input and Output
+    (the dashboard's tool card). \`.tool .tool-head\` outranks \`.row button\`. */
+ .tool.call{padding:0;white-space:normal}
+ .tool .tool-head{display:flex;align-items:center;gap:6px;width:100%;min-width:0;margin:0;padding:3px 8px;border:0;border-radius:4px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+ .tool .tool-head:hover{color:var(--vscode-foreground)}
+ .tool-ico{flex:none}
+ .tool-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .tool.call[data-open="true"] .tool-title{white-space:pre-wrap;word-break:break-word}
+ .tool-live{display:none;width:6px;height:6px;border-radius:50%;background:var(--vscode-progressBar-background,var(--vscode-focusBorder,#7c5cff));flex:none}
+ .tool.live .tool-live{display:inline-block;animation:kide-pulse 1.2s ease-in-out infinite}
+ .tool-chev{flex:none;opacity:.6;font-size:13px;line-height:1;transition:transform .2s}
+ .tool.call[data-open="true"] .tool-chev{transform:rotate(90deg)}
+ .tool-body{display:flex;flex-direction:column;gap:6px;padding:0 8px 7px 24px}
+ .tool-body[hidden]{display:none}
+ .tool-k{font-size:10px;text-transform:uppercase;letter-spacing:.05em;opacity:.7;margin-bottom:2px}
+ .tool-pre{margin:0;padding:6px 8px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-family:var(--vscode-editor-font-family);font-size:11px;line-height:1.45;color:var(--vscode-foreground);background:var(--vscode-editor-background);border:1px solid var(--vscode-widget-border,var(--vscode-panel-border));border-radius:4px}
+ .tool-pre.muted{opacity:.6;font-style:italic}
  .think{white-space:normal}
  .think .think-head{display:flex;align-items:center;gap:6px;width:100%;min-width:0;margin:0;padding:1px 0;border:0;border-radius:0;background:transparent;color:var(--vscode-descriptionForeground);font:inherit;font-size:12px;cursor:pointer;text-align:left}
  .think .think-head:hover{color:var(--vscode-foreground)}
@@ -1353,7 +1451,9 @@ function chatHtml(foxUri) {
 </style></head><body>
 <div id="noscript-hint" style="padding:10px 12px;font-size:12px;opacity:.7">KiroCrew chat is loading&hellip; If this line never disappears, scripts inside webviews are blocked in this browser &mdash; screenshot this and report it.</div>
 <div id="tabs"></div>
-<div id="panes"></div>
+<div id="panes">
+ <div id="pin" class="pin" hidden data-testid="pinned-prompt"><div class="pin-card"><button type="button" class="pin-text" title="Jump to this turn"></button><button type="button" class="pin-more" title="Show the whole prompt" aria-expanded="false">⌄</button></div></div>
+</div>
 <div id="compose">
  <div id="grip" title="Drag to resize the input box; double-click for automatic height" role="separator" aria-orientation="horizontal" aria-label="Resize input box"></div>
  <div id="chips"></div>
@@ -1390,7 +1490,7 @@ let choices = { agents: [], models: [], efforts: [] };
 function pane(id){
   let st = state.get(id);
   if(!st){
-    const log=document.createElement('div'); log.className='log'; log.dataset.id=id; panes.appendChild(log);
+    const log=document.createElement('div'); log.className='log'; log.dataset.id=id; panes.appendChild(log); log.addEventListener('scroll', pinSchedule, { passive:true });
     const empty=document.createElement('div'); empty.className='empty';
     if(FOX){const im=document.createElement('img'); im.src=FOX; im.alt=''; empty.appendChild(im);}
     const tx=document.createElement('div'); tx.textContent='New chat — pick an agent and a workflow below, then say something.'; empty.appendChild(tx); log.appendChild(empty);
@@ -1406,12 +1506,67 @@ function pane(id){
 // Foxes hop while the turn runs and no answer text is on its way (reasoning,
 // tool calls, the wait before the first token); streaming text replaces them.
 function setWork(st){ if(!st||!st.work) return; const on=Boolean(st.running && !st.streaming && !st.empty); st.work.classList.toggle('on', on); if(on) scrollLog(st); }
-function show(id){ active=id; for(const [tid,st] of state) st.log.classList.toggle('on', tid===id); renderCompose(); }
+function show(id){ active=id; for(const [tid,st] of state) st.log.classList.toggle('on', tid===id); renderCompose(); pinSchedule(); }
 function el(st, cls, content){ if(st.empty){st.empty.remove(); st.empty=null;} const d=document.createElement('div');d.className='row '+cls;if(content!==undefined)d.textContent=content;st.log.appendChild(d);return d;}
 // Named scrollLog, NOT scroll: a global \`scroll\` shadows window.scroll(),
 // which the webview host calls during setInitialScrollPosition — the resulting
 // TypeError aborted the host's onLoad chain and left the whole pane blank.
 function scrollLog(st){ if(!st || !st.log) return; st.log.scrollTop = st.log.scrollHeight; }
+// ---- the pinned prompt (KiroCrew's pinned-prompt, in the webview's own terms)
+// The pinned turn is the last user row whose top has scrolled above the fold
+// (the card's top edge, 4px under the pane's top); it shows once the bubble
+// itself has left the card's footprint, so the two are never both on screen,
+// and it slides up as the next user row comes within the card's height (gone
+// when under 6px would remain). One overlay serves the active tab.
+const pin=$('pin'), pinCard=pin.querySelector('.pin-card'), pinLabel=pin.querySelector('.pin-text'), pinMore=pin.querySelector('.pin-more');
+const PIN_GAP=4;
+let pinRow=null, pinRaf=0, pinOpen=false;
+// Preview text the way the dashboard makes it: fences folded to " … ", images
+// dropped, attachment markers reduced to the file name, whitespace collapsed.
+function pinText(s){ return String(s||'').replace(/\`\`\`[\\s\\S]*?\`\`\`/g,' … ').replace(/!\\[[^\\]]*\\]\\([^)]*\\)/g,' ').replace(/\\[attached_file \\d+\\]\\s*(\\S+)/g,(m,p)=>p.split('/').pop()||'').replace(/\\s+/g,' ').trim(); }
+function pinFull(s){ return String(s||'').replace(/\\[attached_file \\d+\\]\\s*(\\S+)/g,(m,p)=>'📎 '+(p.split('/').pop()||'')).trim(); }
+function pinRender(){ const raw = pinRow ? (pinRow.dataset.prompt!==undefined ? pinRow.dataset.prompt : pinRow.textContent) : ''; pinLabel.textContent = pinOpen ? pinFull(raw) : pinText(raw); pinLabel.title = pinOpen ? 'Jump to this turn' : 'Jump to this turn\\n\\n'+pinText(raw).slice(0,600); }
+function pinSet(row){
+  if(row===pinRow) return;
+  pinRow=row; pinOpen=false; pin.classList.remove('open'); pinMore.setAttribute('aria-expanded','false'); pinMore.title='Show the whole prompt';
+  pinRender();
+}
+function pinToggle(open){ pinOpen = open===undefined ? !pinOpen : Boolean(open); pin.classList.toggle('open', pinOpen); pinMore.setAttribute('aria-expanded', String(pinOpen)); pinMore.title = pinOpen ? 'Show one line' : 'Show the whole prompt'; pinRender(); pinSchedule(); }
+function pinSchedule(){ if(pinRaf) return; pinRaf=requestAnimationFrame(()=>{ pinRaf=0; pinUpdate(); }); }
+function pinUpdate(){
+  const st = active!=null ? state.get(active) : null; const log = st && st.log;
+  if(!log || !log.classList.contains('on') || st.empty){ pinSet(null); pin.hidden=true; pinCard.style.transform=''; return; }
+  const fold = log.getBoundingClientRect().top + PIN_GAP;
+  let cur=null, next=null;
+  for(const u of log.querySelectorAll('.row.user')){ if(u.getBoundingClientRect().top < fold){ cur=u; } else { if(cur) next=u; break; } }
+  if(!cur){ pinSet(null); pin.hidden=true; pinCard.style.transform=''; return; }
+  pinSet(cur); pin.hidden=false;
+  const cardH = pinCard.getBoundingClientRect().height, r = cardH + PIN_GAP;
+  // The bubble still shows under the card's footprint: it speaks for itself.
+  if(!pinOpen && cur.getBoundingClientRect().bottom > fold + cardH + PIN_GAP){ pin.hidden=true; return; }
+  let push=0;
+  if(next){ const nt = next.getBoundingClientRect().top - fold; if(nt < r) push = Math.max(0, r - nt); }
+  if(push && r - push < 6){ pin.hidden=true; return; }
+  pinCard.style.transform = push ? 'translateY(-'+push.toFixed(1)+'px)' : '';
+  // The ⌄ shows when the one-line preview hides something (kept as is while hovered, when three lines show).
+  const raw = pinRow.dataset.prompt!==undefined ? pinRow.dataset.prompt : pinRow.textContent;
+  const hovered = pinCard.matches(':hover');
+  const more = pinOpen || /\\n|\`\`\`|\\[attached_file /.test(raw) || (!hovered && pinLabel.scrollHeight > pinLabel.clientHeight + 1) || (hovered && pin.classList.contains('more'));
+  pin.classList.toggle('more', more);
+}
+function pinJump(){
+  const st = active!=null ? state.get(active) : null;
+  if(!st || !pinRow || !pinRow.isConnected) return;
+  if(pinOpen) pinToggle(false);
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  // offsetTop is relative to the log (its position:absolute makes it the offsetParent); land the row 8px under the pane's top, where the log's own padding puts a first row.
+  const top = Math.max(0, pinRow.offsetTop - 8);
+  if(typeof st.log.scrollTo==='function') st.log.scrollTo({ top, behavior: reduce ? 'auto' : 'smooth' }); else st.log.scrollTop = top;
+}
+pinLabel.onclick=pinJump;
+pinMore.onclick=(e)=>{ e.stopPropagation(); pinToggle(); };
+if(typeof ResizeObserver!=='undefined') new ResizeObserver(()=>pinSchedule()).observe(panes);
+if(typeof MutationObserver!=='undefined') new MutationObserver(()=>pinSchedule()).observe(panes, { childList:true, subtree:true });
 function linkify(node, s){
   node.textContent=''; let last=0;
   for(const m of s.matchAll(PATH_RE)){
@@ -1426,6 +1581,65 @@ function linkify(node, s){
 // \`[OPTIONS: a | b | c]\` on the last line of an assistant message: strip it and render the labels as
 // buttons; clicking one sends that label as the next message (the dashboard's own convention).
 const OPT_RE = /\\n?\\s*\\[OPTIONS:\\s*([^\\]]*)\\]\\s*$/;
+// ---- tool calls: a 🔧 row opens on click to show the call's input and output
+// (the dashboard's tool card). The host's tool row carries meta.input (the
+// call's arguments, usually JSON), meta.output once the tool returned, meta.done
+// and tool_call_id; a live run completes the row through a tool_result frame.
+const TOOL_PRE_MAX = 20000;
+function clipText(s, n){ s=String(s||''); return s.length>n ? s.slice(0,n)+'\\n… (truncated, '+(s.length-n)+' more chars)' : s; }
+function isToolCall(r){ const m=r.meta||{}; return Boolean(m.tool_call_id) || m.input!==undefined || m.output!==undefined; }
+// The arguments as a reader wants them: a shell call shows its command, a
+// one-field call its value, anything else pretty JSON; a non-JSON string as is.
+function toolInputText(input){
+  if(input===undefined||input===null||input==='') return '';
+  let v=input;
+  if(typeof v==='string'){ try{ v=JSON.parse(v); }catch{ return v; } }
+  if(v && typeof v==='object' && !Array.isArray(v)){
+    const keys=Object.keys(v);
+    if(typeof v.command==='string'){ const rest=keys.filter(k=>!['command','description','purpose','summary','__tool_use_purpose'].includes(k)); return v.command + (rest.length ? '\\n'+rest.map(k=>k+': '+(typeof v[k]==='string'?v[k]:JSON.stringify(v[k]))).join('\\n') : ''); }
+    if(keys.length===1 && typeof v[keys[0]]==='string') return v[keys[0]];
+  }
+  try{ return JSON.stringify(v,null,2); }catch{ return String(v); }
+}
+function toolRow(st, d, r){
+  const meta=r.meta||{}; const content=String(r.content||''); const lines=content.split('\\n'); const first=lines[0];
+  const em=/^(\\p{Extended_Pictographic}\\uFE0F?)\\s*/u.exec(first);
+  const title=(typeof meta.purpose==='string' && meta.purpose) || (em ? first.slice(em[0].length) : first) || meta.tool_name || 'tool';
+  d.classList.add('call'); d.dataset.tcid=meta.tool_call_id||''; d.dataset.open='false';
+  d._tool={ input: meta.input, output: meta.output, done: Boolean(meta.done), extra: lines.length>1 ? lines.slice(1).join('\\n') : '', body:null };
+  const head=document.createElement('button'); head.type='button'; head.className='tool-head'; head.setAttribute('aria-expanded','false'); head.title="Show this call's input and output";
+  const ic=document.createElement('span'); ic.className='tool-ico'; ic.textContent=em ? em[1] : '🔧';
+  const tt=document.createElement('span'); tt.className='tool-title'; tt.textContent=title;
+  const live=document.createElement('span'); live.className='tool-live'; live.title='running';
+  const chev=document.createElement('span'); chev.className='tool-chev'; chev.textContent='›';
+  head.appendChild(ic); head.appendChild(tt); head.appendChild(live); head.appendChild(chev); d.appendChild(head);
+  head.onclick=()=>toolToggle(d);
+  toolLive(st, d);
+}
+function toolLive(st, d){ const t=d._tool; if(!t) return; d.classList.toggle('live', Boolean(st.running) && !t.done); }
+function toolBody(d){
+  const t=d._tool; if(t.body) return t.body;
+  const body=document.createElement('div'); body.className='tool-body'; body.hidden=true;
+  const sec=(label)=>{ const s=document.createElement('div'); s.className='tool-sec'; const k=document.createElement('div'); k.className='tool-k'; k.textContent=label; const pre=document.createElement('pre'); pre.className='tool-pre'; s.appendChild(k); s.appendChild(pre); body.appendChild(s); return pre; };
+  t.inPre=sec('Input'); t.outPre=sec('Output'); d.appendChild(body); t.body=body; toolFill(d); return body;
+}
+function toolFill(d){
+  const t=d._tool; if(!t || !t.body) return;
+  const inText = toolInputText(t.input) || t.extra || '';
+  t.inPre.parentElement.hidden = !inText; if(inText) linkify(t.inPre, clipText(inText, TOOL_PRE_MAX));
+  const out = t.output===undefined||t.output===null ? '' : String(t.output);
+  if(out){ linkify(t.outPre, clipText(out, TOOL_PRE_MAX)); } else { t.outPre.textContent = t.done ? '(no output)' : 'running…'; }
+  t.outPre.classList.toggle('muted', !out);
+}
+function toolToggle(d, open){ const body=toolBody(d); const o = open===undefined ? body.hidden : Boolean(open); body.hidden=!o; d.dataset.open=String(o); d.querySelector('.tool-head').setAttribute('aria-expanded', String(o)); pinSchedule(); }
+function toolRows(st, tcid){ return tcid ? [...st.log.querySelectorAll('.row.tool.call')].filter(x=>x.dataset.tcid===tcid) : []; }
+// tool_result: the call returned; its output lands on the row (an empty output
+// still marks it done — the host sends that for tools that print nothing).
+function toolResult(st, tcid, output){ for(const d of toolRows(st, tcid)){ const t=d._tool; if(output!==undefined && output!==null && (String(output) || !t.output)) t.output=String(output); t.done=true; toolLive(st, d); toolFill(d); } }
+// tool_call (is_update): the refined title/arguments of a call already shown.
+function toolUpdate(st, m){ for(const d of toolRows(st, m.tcid)){ const t=d._tool; const title=(typeof m.purpose==='string' && m.purpose) || m.title; if(title){ const tt=d.querySelector('.tool-title'); if(tt) tt.textContent=String(title).replace(/^\\p{Extended_Pictographic}\\uFE0F?\\s*/u,''); } if(m.input && (t.input===undefined||t.input===null||t.input==='')) t.input=m.input; toolFill(d); } }
+// The turn ended: nothing is running any more, whatever rows never got a result.
+function toolsSettle(st){ for(const d of st.log.querySelectorAll('.row.tool.call')){ if(d._tool){ d._tool.done=true; toolLive(st, d); toolFill(d); } } }
 function assistant(st, node, s){
   const m = OPT_RE.exec(s||'');
   const body = m ? s.slice(0, m.index).replace(/\\s+$/,'') : s;
@@ -1473,7 +1687,7 @@ function thinkBlock(st){
   const live=document.createElement('span'); live.className='think-live'; live.dataset.testid='think-live'; head.appendChild(live);
   const body=document.createElement('div'); body.className='think-body'; body.dataset.testid='think-body'; body.hidden=true;
   box.appendChild(head); box.appendChild(body);
-  head.onclick=()=>{ const open=body.hidden; body.hidden=!open; box.dataset.open=String(open); head.setAttribute('aria-expanded',String(open)); head.title=open?'Hide reasoning':'Show reasoning'; if(open) body.scrollTop=body.scrollHeight; };
+  head.onclick=()=>{ const open=body.hidden; body.hidden=!open; box.dataset.open=String(open); head.setAttribute('aria-expanded',String(open)); head.title=open?'Hide reasoning':'Show reasoning'; if(open) body.scrollTop=body.scrollHeight; pinSchedule(); };
   if(st.streaming) st.log.insertBefore(box, st.streaming); else st.log.appendChild(box);
   st.think={box, label, live, body, text:'', timer:null}; return st.think;
 }
@@ -1503,7 +1717,7 @@ function row(id, r){
   if(r.role==='thinking'){ if(r.content){ thinkDelta(st, r.content); thinkClose(st); scrollLog(st); } return; }
   const cls = ['user','assistant','tool','status'].includes(r.role)?r.role:'tool';
   const isErr = cls==='assistant' && (/\\bmsg-err\\b/.test(r.cls||'') || /^\\s*[❌⏱]/.test(r.content||''));
-  const d = el(st,cls+(isErr?' err':'')); if(cls==='user'){d.textContent=r.content;} else if(cls==='assistant'){assistant(st, d, r.content);} else {linkify(d, r.content);} scrollLog(st);
+  const d = el(st,cls+(isErr?' err':'')); if(cls==='user'){d.textContent=r.content; d.dataset.prompt=String(r.content||'');} else if(cls==='assistant'){assistant(st, d, r.content);} else if(cls==='tool' && r.role==='tool' && isToolCall(r)){toolRow(st, d, r);} else {linkify(d, r.content);} scrollLog(st);
 }
 function question(id, card){
   const st=pane(id); const qid = card.ask_id||card.card_id; if(!qid||st.cards.has(qid)) return;
@@ -1538,7 +1752,7 @@ function question(id, card){
 function renderTabs(tabs, act){
   tabsEl.innerHTML='';
   for(const t of tabs){
-    const st=pane(t.id); st.running=Boolean(t.running); st.settings=t.settings||st.settings; st.key=t.key; setWork(st);
+    const st=pane(t.id); st.running=Boolean(t.running); st.settings=t.settings||st.settings; st.key=t.key; setWork(st); for(const d of st.log.querySelectorAll('.row.tool.call')) toolLive(st, d);
     const d=document.createElement('div'); d.className='tab'+(t.id===act?' on':''); d.title=t.key||'new chat';
     if(t.running||t.waiting){const dot=document.createElement('span'); dot.className='dot '+(t.waiting?'wait':'run'); d.appendChild(dot);}
     const tt=document.createElement('span'); tt.className='t'; tt.textContent=t.title; d.appendChild(tt);
@@ -1653,10 +1867,10 @@ window.addEventListener('message', (e)=>{
     case 'composerHeight': setManualHeight(m.px); break;
     case 'steering': steering = Array.isArray(m.items) ? m.items : []; renderSteering(); break;
     case 'closed': { const s=state.get(m.id); if(s){ s.log.remove(); state.delete(m.id);} break; }
-    case 'clear': st.log.innerHTML=''; st.log.appendChild(st.work); st.streaming=null; st.buf=''; st.seen=new Set(); st.cards.clear(); st.empty=null; thinkClose(st); st.think=null; setWork(st); break;
+    case 'clear': st.log.innerHTML=''; st.log.appendChild(st.work); st.streaming=null; st.buf=''; st.seen=new Set(); st.cards.clear(); st.empty=null; thinkClose(st); st.think=null; setWork(st); pinSchedule(); break;
     case 'session': st.key=m.key; if(m.id===active) renderHint(); break;
     case 'context': st.contexts.push(m.item); if(m.id===active) renderCompose(); break;
-    case 'user': { thinkClose(st); const d=el(st,'user'); if((m.contexts&&m.contexts.length)||(m.files&&m.files.length)){ const c=document.createElement('div'); c.className='ctx'; [...(m.contexts||[]).map(x=>'#'+x), ...(m.files||[]).map(x=>'📎'+x)].forEach((x)=>{ const ch=document.createElement('span'); ch.className='chip'; ch.textContent=x; c.appendChild(ch); }); d.appendChild(c); } d.appendChild(document.createTextNode(m.text)); st.running=true; setWork(st); scrollLog(st); break; }
+    case 'user': { thinkClose(st); const d=el(st,'user'); d.dataset.prompt=String(m.text||''); if((m.contexts&&m.contexts.length)||(m.files&&m.files.length)){ const c=document.createElement('div'); c.className='ctx'; [...(m.contexts||[]).map(x=>'#'+x), ...(m.files||[]).map(x=>'📎'+x)].forEach((x)=>{ const ch=document.createElement('span'); ch.className='chip'; ch.textContent=x; c.appendChild(ch); }); d.appendChild(c); } d.appendChild(document.createTextNode(m.text)); st.running=true; setWork(st); scrollLog(st); break; }
     case 'chunk': if(!st.streaming){st.streaming=el(st,'streaming cursor','');} st.buf+=m.text; st.streaming.textContent=st.buf; setWork(st); scrollLog(st); break;
     case 'segment': finishStream(st); thinkClose(st); break;
     case 'row': thinkClose(st); row(m.id, m.row); break;
@@ -1664,7 +1878,9 @@ window.addEventListener('message', (e)=>{
     case 'questionResolved': { const b=st.cards.get(m.qid); if(b){b.remove();st.cards.delete(m.qid);} break; }
     case 'thinking': if(m.text){thinkDelta(st, m.text);scrollLog(st);} break;
     case 'status': if(m.text){el(st,'status', m.text);scrollLog(st);} break;
-    case 'done': finishStream(st); thinkClose(st); st.running=false; setWork(st); break;
+    case 'done': finishStream(st); thinkClose(st); st.running=false; setWork(st); toolsSettle(st); break;
+    case 'toolResult': toolResult(st, m.tcid, m.output); break;
+    case 'toolUpdate': toolUpdate(st, m); break;
     case 'error': el(st,'error', m.text); scrollLog(st); break;
     case 'scroll': scrollLog(st); break;
   }
@@ -1738,7 +1954,7 @@ class AssetTree {
         items.push(item);
         continue;
       }
-      if (kind === vscode.FileType.Directory && depth < 2) {
+      if (kind === vscode.FileType.Directory && depth < STEERING_MAX_DEPTH) {
         const item = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.Collapsed);
         item.iconPath = vscode.ThemeIcon.Folder;
         item.contextValue = "asset-dir";
@@ -2912,4 +3128,4 @@ function activate(context) {
 
 module.exports = { activate, deactivate() {} };
 // Pure helpers, exposed for `tests/extension_unit.test.mjs` (never used by the host).
-module.exports.__test = { isReservedModeRefusal, isErrorRow, readText, readWholeText, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, findTask, serializeTask, makeAllTasksRequired, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, normalizeRow, findPathLinks, chatHtml, sameDir, slotTime, slotActivity, ageLabel, HOOK_TEMPLATE, STEERING_TEMPLATE, SKILL_TEMPLATE, mdToHtml, stageOf, specNameOf, continueAction, specEditorHtml, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, clip, ChatView, Sessions, themeFor, STOCK_THEMES, kasAgentFor, mergeRosters, agentPicks, modeOfAgent, activate };
+module.exports.__test = { isReservedModeRefusal, isErrorRow, readText, readWholeText, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, findTask, serializeTask, makeAllTasksRequired, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, normalizeRow, findPathLinks, chatHtml, sameDir, slotTime, slotActivity, ageLabel, HOOK_TEMPLATE, STEERING_TEMPLATE, SKILL_TEMPLATE, mdToHtml, stageOf, specNameOf, continueAction, specEditorHtml, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, clip, ChatView, Sessions, themeFor, STOCK_THEMES, kasAgentFor, mergeRosters, agentPicks, modeOfAgent, activate };

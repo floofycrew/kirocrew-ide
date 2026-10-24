@@ -77,6 +77,13 @@ const WAKE_BUDGET_MS = 20000;
 const PROGRESS_RIGHT_FALLBACK = 150;
 const PROGRESS_GAP = 8;
 const FOX = "/apps/kirocrew-ide/ui/art/fox.svg";
+// The browser's folder -> profile map (the web workbench keeps it in localStorage on the
+// dashboard origin, which this layer shares with every workbench document). The layer
+// reports it to the host — once at start, and after every write a workbench document
+// makes to it, which reaches this document as a `storage` event — so the host's seed can
+// hand it to the next browser or desktop client. Debounced: a profile switch writes twice.
+const ASSOCIATIONS_KEY = "profileAssociations";
+const ASSOCIATIONS_DEBOUNCE_MS = 1000;
 
 /**
  * The inline style that joins an "IDE" segment flush to the chip before it
@@ -276,6 +283,8 @@ export class IdeLayer {
     this.disposers = [];
     this.root = null;
     this.frame = null;
+    this.associationsSent = null;   // the last map string the host accepted (skip unchanged reports)
+    this.associationsTimer = null;
   }
 
   // ---------------------------------------------------------------- lifecycle
@@ -352,6 +361,12 @@ export class IdeLayer {
     const fit = () => { this.fitBar(); this.fitProgress(); };
     this.win.addEventListener("resize", fit);
     this.disposers.push(() => this.win.removeEventListener("resize", fit));
+    // A workbench document's write to the folder -> profile map reaches this document as a storage event.
+    const onStorage = (event) => { if (!event || event.key === null || event.key === ASSOCIATIONS_KEY) this.scheduleAssociationReport(); };
+    this.win.addEventListener("storage", onStorage);
+    this.disposers.push(() => this.win.removeEventListener("storage", onStorage));
+    this.disposers.push(() => { if (this.associationsTimer) { this.win.clearTimeout(this.associationsTimer); this.associationsTimer = null; } });
+    this.scheduleAssociationReport();
     // The dashboard's own folder picker for "Open a folder…", when this dashboard carries it.
     this.hostPicker = null;       // mounted controller, or null (the menu's own browser then)
     loadHostPicker(this.doc).then((Component) => {
@@ -382,6 +397,8 @@ export class IdeLayer {
       sleepIdle: (now) => this.sleepIdle(now), setIdleUnload: (minutes) => this.setIdleUnload(minutes),
       checkWakes: (now) => this.checkWakes(now), wakeReloads: () => this.wakeReloads,
       stuck: () => this.stuck(), relaunch: () => this.relaunch(),
+      // The browser's folder -> profile map and its report to the host (see the hook's association seed).
+      associations: () => this.readAssociations(), reportAssociations: () => this.reportAssociations(),
       // The dashboard's own folder picker for "Open a folder…" (default on when the dashboard carries it);
       // `false` falls back to the menu's built-in path box and directory list.
       useHostPicker: (on) => { this.useHostPicker = on !== false; return !!(this.hostPicker && this.useHostPicker); },
@@ -432,6 +449,39 @@ export class IdeLayer {
       this.render();
       this.notify();
     }
+    return reply;
+  }
+
+  /** The browser's folder -> profile map ({"<folder uri>": "<profile id>"}), or null when there is none to report. */
+  readAssociations() {
+    let raw = null;
+    try { raw = this.win.localStorage.getItem(ASSOCIATIONS_KEY); } catch { return null; }
+    if (!raw) return null;
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch { return null; }
+    const workspaces = parsed && typeof parsed === "object" && parsed.workspaces;
+    if (!workspaces || typeof workspaces !== "object" || Array.isArray(workspaces)) return null;
+    const map = {};
+    for (const key of Object.keys(workspaces).sort()) {
+      if (typeof workspaces[key] === "string") map[key] = workspaces[key];
+    }
+    return Object.keys(map).length ? map : null;
+  }
+
+  scheduleAssociationReport() {
+    if (this.disposed) return;
+    if (this.associationsTimer) this.win.clearTimeout(this.associationsTimer);
+    this.associationsTimer = this.win.setTimeout(() => { this.associationsTimer = null; this.reportAssociations(); }, ASSOCIATIONS_DEBOUNCE_MS);
+  }
+
+  /** POST the browser's map to the host (keyed by folder path there); skipped when nothing changed since the last accepted report. */
+  async reportAssociations() {
+    const map = this.readAssociations();
+    if (!map) return null;
+    const text = JSON.stringify(map);
+    if (text === this.associationsSent) return null;
+    const reply = await this.post("profiles/associations", { workspaces: map });
+    if (reply && reply.ok) this.associationsSent = text;
     return reply;
   }
 

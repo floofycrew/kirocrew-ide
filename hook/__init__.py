@@ -1713,8 +1713,8 @@ def _inject_activity_order(html):
 #: the browser merges those into its own list before the workbench boots —
 #: adding only ids and names it does not already have, never removing. It runs
 #: BEFORE the activity-order seed, which reads the same list synchronously.
-#: Associations (folder -> profile) are not merged: the browser may have
-#: deliberately unlinked one.
+#: Associations (folder -> profile) have their own record and seed, right below:
+#: the browser's own entry for a folder always wins there too.
 PROFILE_STORAGE_PATH = os.path.expanduser("~/.openvscode-server/data/User/globalStorage/storage.json")
 PROFILE_DIRS_PATH = os.path.expanduser("~/.openvscode-server/data/User/profiles")
 PROFILE_SEED_SCRIPT = """<script id="kirocrew-ide-profiles">
@@ -1791,6 +1791,248 @@ def _inject_profile_seed(html, profiles=None):
     # The list lands inside a <script>: keep "</" out of the JSON text.
     payload = json.dumps(profiles, separators=(",", ":")).replace("</", "<\\/")
     return html.replace("</head>", (PROFILE_SEED_SCRIPT % payload) + "</head>", 1)
+
+
+#: WHICH PROFILE A FOLDER OPENS IN is browser state too — localStorage
+#: "profileAssociations", {workspaces: {"<folder uri>": "<profile id>"}} — and,
+#: unlike the profile list, the browser never tells the server: the remote
+#: profiles service forwards profile creation and removal only, so the engine's
+#: mirror reads `workspaces: {}` whatever the user picked. The first time a
+#: folder is opened from a new browser (or the desktop app after its storage
+#: moved) it therefore boots into the Default profile. The mod keeps its own
+#: record instead: the layer shares the dashboard origin with every workbench
+#: document, so it reads the browser's map and POSTs it to
+#: `profiles/associations` whenever a document changes it (and once at start);
+#: the hook stores it keyed by FOLDER PATH; the seed below writes the record into
+#: a browser's map before the workbench boots — only for folders that browser has
+#: no entry for, so a choice made in this browser (an explicit switch back to
+#: Default included: the workbench stores that as "__default__profile__") wins.
+#:
+#: The key's authority is the engine's: the proxy drops the browser's Host, so
+#: the workbench's remoteAuthority is 127.0.0.1:<engine port>, and the workbench
+#: compares association keys as whole URIs. An engine relaunch that lands on the
+#: next free port orphaned every association made before it — the folder opened
+#: in Default again, with the old choice still sitting in the map under the old
+#: port. The seed heals that too: an entry this browser holds under another
+#: authority, for a path with none under the current one, is copied over.
+PROFILE_ASSOCIATIONS_FILE = "profile-associations.json"
+DEFAULT_PROFILE_ID = "__default__profile__"
+PROFILE_ASSOCIATIONS_MAX = 500
+_PROFILE_ID_RE = re.compile(r"^-?[0-9a-f]{1,16}$")
+PROFILE_ASSOCIATION_SEED_SCRIPT = """<script id="kirocrew-ide-associations">
+(function () {
+  var RECORD = %s;            // {"<abs folder path>": "<profile id>"} as the host recorded it
+  var ENGINE_AUTHORITY = %s;  // "127.0.0.1:<port>", the authority the workbench will key new entries with
+  try {
+    // The workbench's own remoteAuthority is in its configuration meta, written by the engine
+    // from the Host it saw; the embedded one is the same value computed host-side (fallback).
+    var authority = null;
+    try {
+      var meta = document.getElementById("vscode-workbench-web-configuration");
+      var cfg = meta ? JSON.parse(meta.getAttribute("data-settings") || "{}") : null;
+      authority = (cfg && typeof cfg.remoteAuthority === "string" && cfg.remoteAuthority) || null;
+    } catch (e) { authority = null; }
+    authority = authority || ENGINE_AUTHORITY;
+    if (!authority) return;
+    var KEY = "profileAssociations";
+    var assoc = {};
+    try { assoc = JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { assoc = {}; }
+    if (typeof assoc !== "object" || Array.isArray(assoc)) assoc = {};
+    var workspaces = assoc.workspaces && typeof assoc.workspaces === "object" && !Array.isArray(assoc.workspaces) ? assoc.workspaces : {};
+    var profiles = [];
+    try { profiles = JSON.parse(localStorage.getItem("userDataProfiles") || "[]") || []; } catch (e) { profiles = []; }
+    var known = {};
+    known["%s"] = true;  // the Default profile has no entry in the list
+    (Array.isArray(profiles) ? profiles : []).forEach(function (p) {
+      var loc = p && p.location, s = typeof loc === "string" ? loc : (loc && (loc.path || loc.external)) || "";
+      var id = s.replace(/\\/+$/, "").split("/").pop();
+      if (id) known[id] = true;
+    });
+    var pathOf = function (key) {
+      var path = key, at = key.indexOf("://");
+      if (at >= 0) { var rest = key.slice(at + 3), slash = rest.indexOf("/"); path = slash >= 0 ? rest.slice(slash) : ""; }
+      try { path = decodeURIComponent(path); } catch (e) { /* keep raw */ }
+      return path.replace(/\\/+$/, "") || (path ? "/" : "");
+    };
+    var authorityOf = function (key) {
+      var at = key.indexOf("://");
+      if (at < 0) return null;
+      var rest = key.slice(at + 3), slash = rest.indexOf("/");
+      return slash >= 0 ? rest.slice(0, slash) : rest;
+    };
+    var keyFor = function (path) { return "vscode-remote://" + authority + path.split("/").map(encodeURIComponent).join("/"); };
+    var current = {}, elsewhere = {};  // path -> id: under the current authority / under any other
+    Object.keys(workspaces).forEach(function (key) {
+      var path = pathOf(key);
+      if (!path || typeof workspaces[key] !== "string") return;
+      if (authorityOf(key) === authority) current[path] = workspaces[key];
+      else if (!(path in elsewhere)) elsewhere[path] = workspaces[key];
+    });
+    var added = 0;
+    var put = function (path, id) {
+      if (!known[id] || (path in current) || path.charAt(0) !== "/") return;
+      workspaces[keyFor(path)] = id; current[path] = id; added++;
+    };
+    Object.keys(elsewhere).forEach(function (path) { put(path, elsewhere[path]); });  // this browser's choice, keyed with an earlier engine port
+    Object.keys(RECORD).forEach(function (path) { put(path, RECORD[path]); });         // choices made in another client, recorded by the host
+    if (added) { assoc.workspaces = workspaces; localStorage.setItem(KEY, JSON.stringify(assoc)); }
+  } catch (e) { /* storage unavailable: the workbench boots as before */ }
+})();
+</script>"""
+
+
+def _associations_path():
+    return os.path.join(os.path.dirname(_state_path()), PROFILE_ASSOCIATIONS_FILE)
+
+
+def _uri_path(key):
+    """The decoded absolute path an association key names ('' if none).
+
+    Keys are URI strings (vscode-remote://<authority>/<encoded path>); a bare
+    absolute path is accepted too. Trailing slashes are dropped.
+    """
+    path = key
+    at = key.find("://")
+    if at >= 0:
+        rest = key[at + 3:]
+        slash = rest.find("/")
+        path = rest[slash:] if slash >= 0 else ""
+    try:
+        path = urllib.parse.unquote(path)
+    except Exception:  # noqa: BLE001
+        pass
+    path = path.rstrip("/") or ("/" if path.startswith("/") else "")
+    return path if path.startswith("/") and "\x00" not in path else ""
+
+
+def _uri_authority(key):
+    at = key.find("://")
+    if at < 0:
+        return None
+    rest = key[at + 3:]
+    slash = rest.find("/")
+    return rest[:slash] if slash >= 0 else rest
+
+
+def _normalise_associations(workspaces, dirs_path=None, authority=None):
+    """A browser's association map -> {abs folder path: profile id}.
+
+    Drops keys that name no absolute path and ids that are not a profile on
+    this host (the id must look like one and have its data folder, or be the
+    Default profile's). One path can sit under several authorities (an engine
+    relaunch moved the port): the entry under `authority` wins, else the last.
+    """
+    dirs_path = dirs_path or PROFILE_DIRS_PATH
+    out, pinned = {}, set()
+    for key, pid in (workspaces or {}).items():
+        if not isinstance(key, str) or not isinstance(pid, str) or len(key) > 2048:
+            continue
+        path = _uri_path(key)
+        if not path:
+            continue
+        if pid != DEFAULT_PROFILE_ID and not (_PROFILE_ID_RE.match(pid) and os.path.isdir(os.path.join(dirs_path, pid))):
+            continue
+        key_authority = _uri_authority(key)
+        if path in pinned and key_authority != authority:
+            continue
+        out[path] = pid
+        if authority and key_authority == authority:
+            pinned.add(path)
+    return out
+
+
+def _read_associations(path=None):
+    """The host's record, {abs folder path: profile id}, or {} when absent or unreadable."""
+    try:
+        with open(path or _associations_path(), encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    raw = doc.get("workspaces") if isinstance(doc, dict) else None
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(raw, dict) else {}
+
+
+def _record_associations(incoming, path=None):
+    """Merge {folder path: profile id} into the host's record (upsert by path). Returns (record, changed)."""
+    target = path or _associations_path()
+    record = _read_associations(target)
+    changed = {k: v for k, v in incoming.items() if record.get(k) != v}
+    if changed:
+        record.update(incoming)
+        if len(record) > PROFILE_ASSOCIATIONS_MAX:
+            # Keep the newest: the ones just reported, then whatever fits.
+            keep = dict(incoming)
+            for k, v in record.items():
+                if len(keep) >= PROFILE_ASSOCIATIONS_MAX:
+                    break
+                keep.setdefault(k, v)
+            record = keep
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"workspaces": record, "at": time.time()}, fh, indent=1, sort_keys=True)
+        os.replace(tmp, target)
+    return record, len(changed)
+
+
+def _recorded_associations(path=None, dirs_path=None):
+    """The record as the seed ships it: folders that exist, profiles that still have their data folder."""
+    dirs_path = dirs_path or PROFILE_DIRS_PATH
+    out = {}
+    for folder, pid in _read_associations(path).items():
+        if not os.path.isdir(folder):
+            continue
+        if pid != DEFAULT_PROFILE_ID and not (_PROFILE_ID_RE.match(pid) and os.path.isdir(os.path.join(dirs_path, pid))):
+            continue
+        out[folder] = pid
+    return out
+
+
+def _engine_authority(state=None):
+    """What the workbench served through the proxy sees as remoteAuthority: the engine's own host:port."""
+    state = _read_state() if state is None else state
+    port = state.get("port") if isinstance(state, dict) else None
+    return "127.0.0.1:%s" % port if port else None
+
+
+def _associations_get(_request):
+    """GET profiles/associations — the host's folder -> profile record."""
+    return {"workspaces": _read_associations(), "authority": _engine_authority()}
+
+
+def _associations_set(request):
+    """POST profiles/associations {"workspaces": {"<folder uri>": "<profile id>"}} — a browser's map, merged by folder path."""
+    try:
+        body = request.json() or {}
+    except Exception:  # noqa: BLE001
+        body = {}
+    workspaces = body.get("workspaces") if isinstance(body, dict) else None
+    if not isinstance(workspaces, dict):
+        return (400, {"error": "workspaces must be an object of {\"<folder uri>\": \"<profile id>\"}"})
+    if len(workspaces) > PROFILE_ASSOCIATIONS_MAX:
+        return (400, {"error": "at most %d associations per report" % PROFILE_ASSOCIATIONS_MAX})
+    incoming = _normalise_associations(workspaces, authority=_engine_authority())
+    record, changed = _record_associations(incoming)
+    return {"ok": True, "workspaces": record, "accepted": len(incoming), "changed": changed}
+
+
+def _inject_association_seed(html, record=None, authority=None):
+    """Write the host's folder -> profile record into the browser's map, in <head>. Idempotent.
+
+    Runs after the profile-list seed (it validates ids against the merged list)
+    and before the new-window-profile and activity-order seeds (both read the
+    association). Injected even with an empty record: the port-migration part
+    needs no record.
+    """
+    if 'id="kirocrew-ide-associations"' in html or "</head>" not in html:
+        return html
+    if record is None:
+        record = _recorded_associations()
+    if authority is None:
+        authority = _engine_authority()
+    payload = json.dumps(record, separators=(",", ":")).replace("</", "<\\/")
+    auth = json.dumps(authority).replace("</", "<\\/")
+    script = PROFILE_ASSOCIATION_SEED_SCRIPT % (payload, auth, DEFAULT_PROFILE_ID)
+    return html.replace("</head>", script + "</head>", 1)
 
 
 #: The profile a workspace opens in. The web workbench decides it from the URL
@@ -2221,6 +2463,7 @@ async def _proxy(request):
             body = _inject_webview_endpoint(body, scheme, request.headers.get("Host") or request.host)
             body = _inject_gallery(body)  # the browser's gallery client reads the page, not product.json
             body = _inject_profile_seed(body)  # before the order seed: it reads the merged list
+            body = _inject_association_seed(body)  # after the list seed (validates ids against it), before the two that read the association
             body = _inject_new_window_profile(body)  # after the list seed (it needs the names), before the order seed (it reads the payload)
             body = _inject_activity_order(body)
             # The App passes the dashboard's scheme on the frame URL (fresh at
@@ -2440,6 +2683,8 @@ def activate(ctx):
     ctx.routes.add("POST", "workspaces/open", _workspaces_open)
     ctx.routes.add("POST", "workspaces/close", _workspaces_close)
     ctx.routes.add("POST", "settings/idle-unload", _set_idle_unload)
+    ctx.routes.add("GET", "profiles/associations", _associations_get)
+    ctx.routes.add("POST", "profiles/associations", _associations_set)
     ctx.routes.add("GET", "engines", _engines)
     ctx.routes.add("POST", "engines/install", _engines_install)
     ctx.routes.add("POST", "extensions/install", _extensions_install)

@@ -367,15 +367,74 @@ test("steering mentions and agent resources: `#name` names a file; an agent with
   assert.deepEqual(steeringMentions("please #deploy-steps and #API.RULES now, see #nope and a#b", docs).map((d) => d.name), ["deploy-steps", "api.rules"]);
   assert.deepEqual(steeringMentions("#style.md", docs).map((d) => d.name), ["Style"], "the .md suffix is tolerated");
   assert.deepEqual(steeringMentions("#deploy-steps #deploy-steps", docs).length, 1);
-  assert.equal(agentLoadsSteering(null), null, "unknown agent: unknown (kiro-cli's default loads steering)");
-  assert.equal(agentLoadsSteering({ name: "x" }), true, "no resources key: inherits kiro-cli's defaults");
+  // Nested files: the path under the steering dir names them; a bare name works when it is unique.
+  const nested = [{ name: "amazon-builder/git" }, { name: "amazon-builder/coral" }, { name: "team/style" }, { name: "style" }];
+  assert.deepEqual(steeringMentions("#amazon-builder/git and #git", nested).map((d) => d.name), ["amazon-builder/git"], "path or unique bare name, once");
+  assert.deepEqual(steeringMentions("#coral.md #./amazon-builder/coral", nested).map((d) => d.name), ["amazon-builder/coral"]);
+  assert.deepEqual(steeringMentions("#style", nested).map((d) => d.name), ["style"], "a top-level file wins its own name outright");
+  assert.deepEqual(steeringMentions("#team/style", nested).map((d) => d.name), ["team/style"]);
+  const dup = [{ name: "a/rules" }, { name: "b/rules" }];
+  assert.deepEqual(steeringMentions("#rules", dup), [], "an ambiguous bare name resolves to nothing");
+  assert.deepEqual(steeringMentions("#b/rules", dup).map((d) => d.name), ["b/rules"]);
+  // Engine-aware (probed on kiro-cli 2.34): KAS loads steering for every agent; the legacy engine only through `resources`.
+  assert.equal(agentLoadsSteering(null), null, "unknown agent, unknown engine: unknown (no warning)");
+  assert.equal(agentLoadsSteering({ name: "x" }), null, "no resources key, unknown engine: unknown");
+  assert.equal(agentLoadsSteering({ name: "x" }, "legacy"), false, "no resources key on the legacy engine: nothing loads (probe agent saw no steering)");
+  assert.equal(agentLoadsSteering({ name: "x" }, "kas"), true, "no resources key on KAS: both tiers load");
+  assert.equal(agentLoadsSteering({ resources: ["file://README.md"] }, "kas"), true, "KAS loads steering even when resources omit it");
+  assert.equal(agentLoadsSteering(null, "kas"), true, "KAS: even an unknown agent (Kiro's built-in Spec mode) loads steering");
   assert.equal(agentLoadsSteering({ resources: ["file://README.md", "file://.kiro/steering/**/*.md"] }), true);
   assert.equal(agentLoadsSteering({ resources: ["file://README.md", "skill://.kiro/skills/*/SKILL.md"] }), false);
+  assert.equal(agentLoadsSteering({ resources: ["file://README.md", "skill://.kiro/skills/*/SKILL.md"] }, "legacy"), false);
+});
+
+test("listSteering walks subdirectories like kiro-cli's `steering/**/*.md`: nested files are named by their relative path", async () => {
+  const { listSteering } = ext.__test;
+  const home = "/local/home/someone";
+  const tree = {
+    [home + "/.kiro/steering"]: [["amazon-builder", 2], ["zz-top.md", 1], [".hidden", 2], ["notes.txt", 1]],
+    [home + "/.kiro/steering/amazon-builder"]: [["git.md", 1], ["crux.md", 1], ["deep", 2]],
+    [home + "/.kiro/steering/amazon-builder/deep"]: [["deeper.md", 1]],
+    [home + "/.kiro/steering/.hidden"]: [["secret.md", 1]],
+    [home + "/proj/.kiro/steering"]: [["ws.md", 1]],
+  };
+  const files = {
+    [home + "/.kiro/steering/zz-top.md"]: "top rules",
+    [home + "/.kiro/steering/amazon-builder/git.md"]: "# Git\nalways by default",
+    [home + "/.kiro/steering/amazon-builder/crux.md"]: "---\ninclusion: manual\n---\n# CRUX",
+    [home + "/.kiro/steering/amazon-builder/deep/deeper.md"]: "---\ninclusion: fileMatch\nfileMatchPattern: '*.py'\n---\ndeep",
+    [home + "/.kiro/steering/.hidden/secret.md"]: "never",
+    [home + "/proj/.kiro/steering/ws.md"]: "workspace rules",
+  };
+  const saved = { fs: stub.workspace.fs, folders: stub.workspace.workspaceFolders, FileType: stub.FileType };
+  stub.FileType = { Directory: 2, File: 1 };
+  stub.workspace.workspaceFolders = [{ uri: { path: home + "/proj", with: ({ path }) => ({ path }) } }];
+  stub.workspace.fs = {
+    readDirectory: async (uri) => { if (!(uri.path in tree)) throw new Error("ENOENT " + uri.path); return tree[uri.path].map((e) => [...e]); },
+    readFile: async (uri) => { if (!(uri.path in files)) throw new Error("ENOENT " + uri.path); return new TextEncoder().encode(files[uri.path]); },
+  };
+  try {
+    const docs = await listSteering(home + "/proj");
+    assert.deepEqual(docs.map((d) => [d.scope, d.name, d.label, d.inclusion]), [
+      ["workspace", "ws", "ws.md", "always"],
+      ["global", "amazon-builder/crux", "amazon-builder/crux.md", "manual"],
+      ["global", "amazon-builder/deep/deeper", "amazon-builder/deep/deeper.md", "fileMatch"],
+      ["global", "amazon-builder/git", "amazon-builder/git.md", "always"],
+      ["global", "zz-top", "zz-top.md", "always"],
+    ], "nested files found at every depth, dot-dirs and non-.md files skipped, sorted within each directory");
+    assert.equal(docs.find((d) => d.name === "amazon-builder/git").path, home + "/.kiro/steering/amazon-builder/git.md");
+    assert.deepEqual(docs.find((d) => d.name === "amazon-builder/deep/deeper").patterns, ["*.py"]);
+  } finally {
+    stub.workspace.fs = saved.fs; stub.workspace.workspaceFolders = saved.folders; stub.FileType = saved.FileType;
+  }
 });
 
 test("chat webview: steering indicator, `#name` hint, and a resizable input box with a remembered height", () => {
   const { chatHtml } = ext.__test;
   const html = chatHtml("fox.svg");
+  assert.ok(html.includes('data-testid="pinned-prompt"') && /function pinUpdate\(/.test(html) && /function pinJump\(/.test(html) && /addEventListener\('scroll', pinSchedule/.test(html), "the pinned prompt overlay, measured on scroll");
+  assert.ok(/-webkit-line-clamp:1/.test(html) && /\.pin-card:hover \.pin-text[^{]*\{-webkit-line-clamp:3\}/.test(html) && /\.pin\.open \.pin-text\{display:block/.test(html), "one line, three on hover, the whole prompt on ⌄");
+  assert.ok(/function toolRow\(/.test(html) && /case 'toolResult':/.test(html) && /case 'toolUpdate':/.test(html) && /\.tool \.tool-head\{/.test(html), "tool rows open to Input/Output and complete on tool_result");
   assert.ok(html.includes('id="p-steer"') && /case 'steering':/.test(html) && /function renderSteering\(\)/.test(html), "steering indicator fed by the extension");
   assert.ok(/steeringPick/.test(html) && /steeringOpen/.test(html), "a manual file is included on pick, an always file opened");
   assert.ok(/#steering-name to include/.test(html), "the box says how to include a manual file");
@@ -417,6 +476,48 @@ test("a host that reserves Kiro's mode ids: the refusal falls back to the prompt
   await assert.rejects(chat.send(chat.newTab(true), { text: "x" }), /502/);
 });
 
+test("Spec on a KAS host: the steering receipt names the agent and is re-posted for the fallback agent after the mode-id refusal", async () => {
+  const { ChatView } = ext.__test;
+  const home = "/local/home/someone";
+  const tree = { [home + "/proj/.kiro/steering"]: [["rules.md", 1], ["amazon-builder", 2]], [home + "/proj/.kiro/steering/amazon-builder"]: [["git.md", 1]], [home + "/.kiro/steering"]: [["crux.md", 1]] };
+  const files = {
+    [home + "/proj/.kiro/steering/rules.md"]: "always",
+    [home + "/proj/.kiro/steering/amazon-builder/git.md"]: "always too",
+    [home + "/.kiro/steering/crux.md"]: "---\ninclusion: manual\n---\nmanual",
+    [home + "/.kiro/crew/config.json"]: JSON.stringify({ acp_backend: "kas", default_agent: "o3r" }),
+    [home + "/.kiro/agents/spec.json"]: JSON.stringify({ name: "spec", prompt: "handle" }),            // no resources key
+    [home + "/.kiro/agents/o3r.json"]: JSON.stringify({ name: "o3r", resources: ["file://README.md"] }), // resources omit steering
+  };
+  const saved = { fs: stub.workspace.fs, folders: stub.workspace.workspaceFolders, FileType: stub.FileType, window: stub.window };
+  stub.FileType = { Directory: 2, File: 1 };
+  stub.workspace.workspaceFolders = [{ uri: { path: home + "/proj", with: ({ path }) => ({ path }) } }];
+  stub.workspace.fs = {
+    readDirectory: async (uri) => { if (!(uri.path in tree)) throw new Error("ENOENT"); return tree[uri.path].map((e) => [...e]); },
+    readFile: async (uri) => { if (!(uri.path in files)) throw new Error("ENOENT"); return new TextEncoder().encode(files[uri.path]); },
+  };
+  stub.window = { visibleTextEditors: [] };
+  const calls = { sent: [], posted: [] };
+  const sessions = {
+    projectPath: () => home + "/proj", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }, { name: "o3r" }],
+    create: async () => "k2", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, inject: async () => {}, setSlotAgent: async () => {},
+    send: async (key, text, agent) => { calls.sent.push(agent); if (agent === "spec") throw new Error("“spec” is reserved for a built-in agent"); },
+  };
+  try {
+    const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+    chat.post = (m) => calls.posted.push(m);
+    const t = chat.newTab(true); t.settings.mode = "spec"; t.settings.agent = "o3r";
+    await chat.send(t, { text: "build the thing" });
+    assert.deepEqual(calls.sent, ["spec", "o3r"]);
+    const notes = calls.posted.filter((m) => m.type === "status").map((m) => m.text);
+    assert.equal(notes.length, 2, "one receipt before the send, one after the fallback");
+    assert.match(notes[0], /^Steered by workspace amazon-builder\/git\.md, rules\.md \(always, loaded with agent spec on KAS\)\. crux\.md is manual \(#crux\)$/, "nested workspace file listed; KAS loads steering for the mode agent too");
+    assert.match(notes[1], /loaded with agent o3r on KAS/, "the fallback agent's receipt: on KAS its resources omitting steering does not matter");
+    assert.ok(!notes.some((n) => /does not load/.test(n)), "no false warning on KAS");
+  } finally {
+    stub.workspace.fs = saved.fs; stub.workspace.workspaceFolders = saved.folders; stub.FileType = saved.FileType; stub.window = saved.window;
+  }
+});
+
 test("the refusal that arrives as the turn's streamed error row (the send was accepted) also falls back, once", async () => {
   // On this host `/chat?ws=1` answers 200 and the turn runs asynchronously; the
   // KasReservedAgentIdError lands as an `error` row in the slot's history and a
@@ -454,6 +555,31 @@ test("the refusal that arrives as the turn's streamed error row (the send was ac
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(calls.sent.length, 2, "the fallback runs once per turn");
   assert.equal(chat.modeAgentsRefused, true);
+});
+
+test("tool lifecycle frames reach the webview: tool_result and a tool_call update are forwarded by tool_call_id, the initial tool_call is not", async () => {
+  const { ChatView } = ext.__test;
+  const calls = { posted: [] };
+  const sessions = {
+    projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [],
+    create: async () => "k7", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, inject: async () => {}, setSlotAgent: async () => {},
+    send: async () => {},
+  };
+  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+  chat.post = (m) => calls.posted.push(m);
+  const t = chat.newTab(true); t.settings.agent = "o3r";
+  await chat.send(t, { text: "look" });
+  calls.posted.length = 0;
+  chat.onFrame({ type: "tool_call", data: { slot: "k7", tool: "List Directory", tool_call_id: "tc1", kind: "read" } });
+  chat.onFrame({ type: "tool_result", data: { slot: "k7", tool_call_id: "tc1", output: "a.js\nb.js" } });
+  chat.onFrame({ type: "tool_call", data: { slot: "k7", tool: "List Directory /w", tool_call_id: "tc1", is_update: true, input_preview: "/w" } });
+  chat.onFrame({ type: "tool_result", data: { slot: "other", tool_call_id: "tc9", output: "x" } });
+  assert.deepEqual(calls.posted.map((m) => [m.type, m.tcid, m.output !== undefined ? m.output : m.title]), [
+    ["toolResult", "tc1", "a.js\nb.js"],
+    ["toolUpdate", "tc1", "List Directory /w"],
+  ], "the row comes as a chat_message; only its result and refinements are extra posts, and only for this tab's slot");
+  assert.equal(calls.posted[0].id, t.id);
+  assert.equal(calls.posted[1].input, "/w");
 });
 
 test("# context picks are clipped to the host's 40000-char entry cap (a 51 KB requirements.md used to be refused)", async () => {

@@ -2,7 +2,7 @@
   "name": "kirocrew-ide-bridge",
   "displayName": "KiroCrew",
   "description": "KiroCrew chat (tabbed, with per-project history), agents, approvals, and the Kiro spec / steering / skills / hooks workflow inside the IDE. Sessions run in the KiroCrew gateway and survive a dropped connection. Installed by the kirocrew-ide FloofyCrew mod. Unofficial.",
-  "version": "0.23.3",
+  "version": "0.24.0",
   "publisher": "kirocrew-ide",
   "license": "MIT",
   "engines": {

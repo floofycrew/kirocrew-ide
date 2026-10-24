@@ -35,6 +35,7 @@ import pathlib
 import socketserver
 import sys
 import threading
+import time
 
 from playwright.sync_api import sync_playwright
 
@@ -169,6 +170,7 @@ class Engine:
     workspaces = ["/tmp/demo"]
     idle = 15          # idleUnloadMinutes, as the hook reports it
     idle_posts = []    # what settings/idle-unload received
+    association_posts = []  # what profiles/associations received (the browser's folder -> profile maps)
     # The proxy's bridge counter (`status.proxy.websockets.opened`): a workbench document that loads
     # "connects", bumping it — unless `connects` is off, which models the blank-page case (HTML served,
     # no connection ever reaches the engine) the layer's wake guard must catch.
@@ -242,6 +244,12 @@ def make_handler(node_modules: pathlib.Path):
                 Engine.idle = minutes
                 Engine.idle_posts.append(minutes)
                 return self._send(json.dumps({"idleUnloadMinutes": minutes}).encode(), "application/json")
+            if p == API + "profiles/associations":
+                workspaces = json.loads(raw or b"{}").get("workspaces")
+                if not isinstance(workspaces, dict):
+                    return self._send(json.dumps({"error": "workspaces must be an object"}).encode(), "application/json", 400)
+                Engine.association_posts.append(workspaces)
+                return self._send(json.dumps({"ok": True, "workspaces": workspaces, "accepted": len(workspaces), "changed": len(workspaces)}).encode(), "application/json")
             self._send(b"{}", "application/json")
 
         def do_GET(self):
@@ -378,6 +386,12 @@ def main() -> int:
         page = ctx.new_page()
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+        # The browser already holds a folder -> profile choice (as the web workbench stores it) before the layer
+        # starts: the layer's start-up report must carry it to the host.
+        assoc_key_demo = "vscode-remote://127.0.0.1:35476/tmp/demo"
+        page.add_init_script(f"""if (location.pathname === '/pane.html' && !localStorage.getItem('profileAssociations')) {{
+          localStorage.setItem('profileAssociations', JSON.stringify({{ workspaces: {{ {json.dumps(assoc_key_demo)}: '-1180f179' }}, emptyWindows: {{}} }}));
+        }}""")
         page.goto(base + "/parent.html", wait_until="domcontentloaded")
         page.wait_for_selector("#pane")
         pane = page.query_selector("#pane").content_frame()
@@ -743,6 +757,30 @@ def main() -> int:
         pane.wait_for_function(f"() => document.querySelector('{FRAME}').dataset.folder === '/tmp/demo'", timeout=5000)
         # The rebuilt demo document is the "original" from here on: later no-reload checks compare against its mark.
         pane.evaluate(f"(m) => {{ document.querySelector('{FRAME}').__mark = m; }}", frame_id)
+
+        # --- folder -> profile associations: the browser's map reaches the host, at start and on every workbench write ---
+        def wait_posts(n, timeout=5.0):
+            deadline = time.time() + timeout
+            while len(Engine.association_posts) < n and time.time() < deadline:
+                time.sleep(0.05)
+            return len(Engine.association_posts) >= n
+        check(wait_posts(1) and Engine.association_posts[0] == {assoc_key_demo: "-1180f179"},
+              f"associations: the layer reports the browser's map to the host at start ({Engine.association_posts[:1]})")
+        check(pane.evaluate(f"() => {api}.associations()") == {assoc_key_demo: "-1180f179"}, "associations: the API reads the same map")
+        check(pane.evaluate(f"() => {api}.reportAssociations()") is None and len(Engine.association_posts) == 1,
+              "associations: an unchanged map is not reported again")
+        # A workbench document switches the folder's profile: its write to the shared map reaches the layer as a
+        # storage event and is reported (debounced) without the layer being told.
+        assoc_key_recent = "vscode-remote://127.0.0.1:35476/tmp/recent"
+        pane.evaluate(f"""() => {{
+          const f = document.querySelector('{FRAME}');
+          const ws = {{ {json.dumps(assoc_key_demo)}: '-1180f179', {json.dumps(assoc_key_recent)}: '4b57311b' }};
+          f.contentWindow.localStorage.setItem('profileAssociations', JSON.stringify({{ workspaces: ws, emptyWindows: {{}} }}));
+        }}""")
+        check(wait_posts(2) and Engine.association_posts[-1] == {assoc_key_demo: "-1180f179", assoc_key_recent: "4b57311b"},
+              f"associations: a workbench document's write is reported through the storage event ({Engine.association_posts[-1:]})")
+        pane.wait_for_timeout(1200)
+        check(len(Engine.association_posts) == 2, f"associations: one write, one report ({len(Engine.association_posts)})")
 
         # --- the bar stays clear of the workbench's title-bar centre; a long folder name fades and scrolls ---
         fit = pane.evaluate(f"""() => {{
