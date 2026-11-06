@@ -1,36 +1,67 @@
-"""Headless probe of the spec editor's tasks.md view (Kiro-style task running).
+"""Headless, real engine: the Kiro spec editor renders through the engine's own
+markdown renderer and draws mermaid; Shift+Cmd+V on a spec file opens IT.
 
-Drives the real ``specEditorHtml()`` document in Chromium with
-``acquireVsCodeApi`` stubbed and the same messages the extension posts
-(``doc`` with ``mdToHtml(tasks.md)``, ``continueLabel``), then checks what
-Kiro's IDE shows on a task list:
+    probe_spec_editor.py --engine <openvscode-server binary> [--mermaid <mermaid.min.js>] [--shots DIR]
 
-* every task row that is not done carries its own "Start task" (one task, one
-  session); a queued row reads "Queued", a running row "In progress", a done
-  row has no button;
-* a Start click posts ``startTask`` with the row's source line, and the host
-  maps that line back to the task;
-* the document's primary action (→ Continue) is "Run all tasks (N left)" —
-  one click, every remaining task, no re-clicking per task;
-* on requirements.md / design.md no task buttons are added.
+What runs: a scratch data dir is provisioned the way the hook does it (both
+extensions copied + registered; the pinned mermaid build vendored in when
+--mermaid is given), a scratch engine is launched on a free loopback port with
+that extensions dir and a scratch workspace holding `.kiro/specs/demo/*`, and
+Chromium drives the workbench:
 
-Usage: probe_spec_editor.py [--shots <dir>]      (needs Playwright + Chromium)
+* design.md opens in the Kiro spec editor (the custom editor is the default
+  for spec files): a python fence carries highlight.js token spans (proof the
+  body came from `markdown.api.render`, not mdToHtml), every fence has the
+  language + Copy bar, the mermaid fence is an <svg> (or stays a code block when
+  no library was vendored), a heading renders;
+* tasks.md: Kiro's task rows are boxes carrying their SOURCE LINE, open rows
+  have ▶ Start task, the in-progress and queued rows show their state, the done
+  row has no button; the Continue button reads "Run all tasks (N left)";
+* Edit source, then Ctrl+Shift+V: the Kiro spec editor opens again (no
+  "Preview tasks.md" tab from the built-in markdown preview).
+
+Needs Playwright + Chromium (the FloofyCrew dev venv has them).
 """
-
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
+import json
+import os
 import pathlib
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import types
 
 HERE = pathlib.Path(__file__).resolve().parent
+ROOT = HERE.parent.parent
+sys.dont_write_bytecode = True  # never leave hook/__pycache__ behind (it would be hashed into the manifest)
 
-STUB = """<script>
-window.__posted = [];
-window.acquireVsCodeApi = () => ({ postMessage: (m) => window.__posted.push(m), getState: () => null, setState: () => {} });
-</script>"""
+DESIGN_MD = """# Design
+
+Overview paragraph with a [link](../../README.md).
+
+```python
+def greet(name):
+    return f"hello {name}"  # comment
+```
+
+```mermaid
+flowchart LR
+  A[Start] --> B{Spec?}
+  B -->|yes| C[Run tasks]
+  B -->|no| D[Write it]
+```
+
+```
+plain fence without a language
+```
+"""
 
 TASKS_MD = """# Implementation Plan
 
@@ -38,94 +69,241 @@ TASKS_MD = """# Implementation Plan
   - [x] 1.1 Bootstrap
   - _Requirements: 1.1_
 - [-] 2. Manifest
-  - [ ] 2.1 Schema
-    - _Requirements: 2.1_
-  - [~] 2.2 Validator
-- [ ]* 3. Optional polish
-- [ ] 4. Wiring
+  - _Requirements: 2.1_
+- [~] 3. Queued thing
+- [ ] 4. Open task
+  - [ ] 4.1 Sub task
+- [ ]* 5. Optional task
 """
 
 
-def render(*args: str) -> str:
-    out = subprocess.run(["node", str(HERE / "render_chat_html.mjs"), *args], capture_output=True, text=True, check=True)
-    return out.stdout
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
-def main() -> int:
+def load_hook():
+    sys.modules.setdefault("floofy", types.ModuleType("floofy"))
+    spec = importlib.util.spec_from_file_location("kide_hook_probe", str(ROOT / "hook" / "__init__.py"))
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+    return hook
+
+
+class Ctx:
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.config = {}
+        self.state = {}
+
+        class Log:
+            def info(self, *a): pass
+            def warning(self, *a): print("hook warning:", a, flush=True)
+            debug = info
+        self.log = Log()
+
+
+def provision(data_dir, mermaid):
+    hook = load_hook()
+    hook._ctx = Ctx(data_dir)
+    if mermaid:
+        data = open(mermaid, "rb").read()
+        digest = hashlib.sha256(data).hexdigest()
+        assert digest == hook.MERMAID_SHA256, "the given mermaid build is not the pinned one (%s)" % digest[:12]
+        os.makedirs(os.path.dirname(hook._mermaid_path()), exist_ok=True)
+        shutil.copyfile(mermaid, hook._mermaid_path())
+    root = hook._provision_extension()
+    assert root, "provisioning failed"
+    return root
+
+
+def frame_with(page, selector):
+    for frame in page.frames:
+        try:
+            if frame.locator(selector).count():
+                return frame
+        except Exception:
+            continue
+    return None
+
+
+def wait_frame(page, selector, timeout=60):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        f = frame_with(page, selector)
+        if f:
+            return f
+        page.wait_for_timeout(500)
+    raise AssertionError("no frame with %s within %ss" % (selector, timeout))
+
+
+def quick_open(page, name):
+    page.keyboard.press("Control+P")
+    page.wait_for_selector(".quick-input-widget", timeout=15000)
+    page.keyboard.type(name)
+    page.wait_for_timeout(700)
+    page.keyboard.press("Enter")
+
+
+def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--engine", required=True)
+    ap.add_argument("--mermaid", default=None)
     ap.add_argument("--shots", default=None)
     args = ap.parse_args()
+
     from playwright.sync_api import sync_playwright
 
-    failures: list[str] = []
+    scratch = tempfile.mkdtemp(prefix="kide-spec-probe-")
+    data = os.path.join(scratch, "data"); os.makedirs(data)
+    ws = os.path.join(scratch, "ws"); spec_dir = os.path.join(ws, ".kiro", "specs", "demo"); os.makedirs(spec_dir)
+    open(os.path.join(ws, "README.md"), "w").write("# readme\n")
+    open(os.path.join(spec_dir, "requirements.md"), "w").write("# Requirements\n\n1. It works.\n")
+    open(os.path.join(spec_dir, "design.md"), "w").write(DESIGN_MD)
+    open(os.path.join(spec_dir, "tasks.md"), "w").write(TASKS_MD)
+    ext_dir = provision(data, args.mermaid)
+    port = free_port()
+    udd = os.path.join(scratch, "udd")
+    proc = subprocess.Popen([args.engine, "--host", "127.0.0.1", "--port", str(port), "--without-connection-token",
+                             "--extensions-dir", ext_dir, "--user-data-dir", udd, "--disable-workspace-trust", ws],
+                            stdout=open(os.path.join(scratch, "engine.log"), "wb"), stderr=subprocess.STDOUT)
+    failures = []
 
     def check(cond, msg):
-        print(("ok   " if cond else "FAIL ") + msg)
-        (failures.append(msg) if not cond else None)
+        print(("ok   " if cond else "FAIL ") + msg, flush=True)
+        if not cond:
+            failures.append(msg)
 
-    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
-        fh.write(TASKS_MD)
-        md_path = fh.name
-    doc_html = render("--md", md_path)
-    pathlib.Path(md_path).unlink()
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.25)
+        else:
+            raise AssertionError("engine did not open its port")
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(viewport={"width": 1400, "height": 900})
+            console = []
+            page.on("console", lambda m: console.append("%s: %s" % (m.type, m.text)))
+            page.goto("http://127.0.0.1:%d/?folder=%s" % (port, ws), wait_until="domcontentloaded")
+            page.wait_for_selector(".monaco-workbench", timeout=90000)
+            page.wait_for_timeout(6000)
+            trust = page.locator(".monaco-dialog-box a.monaco-button", has_text="trust the authors")
+            if trust.count():
+                trust.first.click(); page.wait_for_timeout(1500)
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        errors: list[str] = []
+            # --- design.md in the Kiro spec editor
+            quick_open(page, "design.md")
+            doc = wait_frame(page, "#doc .codeblock")
+            doc.wait_for_selector("#doc .hljs-keyword", timeout=30000)
+            check(doc.locator("#doc .hljs-keyword").count() >= 1, "design.md: highlight.js token spans present (engine's own renderer)")
+            check(doc.locator("#doc h1").count() == 1 and "Design" in doc.locator("#doc h1").inner_text(), "design.md: heading rendered")
+            langs = doc.locator("#doc .codeblock .codebar .lang").all_inner_texts()
+            check("python" in langs and "text" in langs, "design.md: every fence has a language label (%s)" % langs)
+            check(doc.locator("#doc .codeblock .codebar button.copy").count() >= 2, "design.md: Copy on each code block")
+            check(doc.locator("#doc a[href]").count() >= 1, "design.md: links kept as anchors")
+            if args.mermaid:
+                try:
+                    doc.wait_for_selector("#doc .mermaid svg", timeout=30000)
+                    check(True, "design.md: mermaid fence drawn as <svg>")
+                except Exception as error:
+                    check(False, "design.md: mermaid fence drawn as <svg> (%s)" % type(error).__name__)
+                check("mermaid" not in langs, "design.md: the drawn fence is not also shown as a code block")
+            else:
+                check("mermaid" in langs or "text" in langs, "design.md: no library vendored, the mermaid fence stays a code block")
+            check(doc.locator("#banner .stage.on").inner_text().strip().endswith("Design"), "design.md: banner marks the Design stage")
+            if args.shots:
+                os.makedirs(args.shots, exist_ok=True); page.screenshot(path=os.path.join(args.shots, "design.png"))
 
-        def load(stage: str):
-            page = browser.new_page(viewport={"width": 760, "height": 600})
-            page.on("pageerror", lambda e: errors.append(str(e)))
-            html = render("--spec", "my-feature", stage).replace("<head>", "<head>" + STUB, 1)
-            page.set_content(html, wait_until="domcontentloaded")
-            page.wait_for_function("() => window.__posted.some((m) => m.type === 'ready')")
-            page.evaluate("(m) => window.postMessage(m, '*')", {"type": "doc", "html": doc_html, "synced": False})
-            page.wait_for_selector("#doc li")
-            return page
+            # --- tasks.md: boxes with source lines, Start buttons, states, Continue label
+            quick_open(page, "tasks.md")
+            tdoc = None
+            t0 = time.time()
+            while time.time() - t0 < 40:
+                for f in page.frames:
+                    try:
+                        if f.locator("#doc .box[data-line]").count() and f.locator("#banner .stage.on").inner_text().strip().endswith("Task list"):
+                            tdoc = f; break
+                    except Exception:
+                        continue
+                if tdoc: break
+                page.wait_for_timeout(500)
+            check(tdoc is not None, "tasks.md: opened in the Kiro spec editor with task boxes")
+            if tdoc:
+                lines = [int(x) for x in tdoc.locator("#doc .box[data-line]").evaluate_all("els => els.map(e => e.dataset.line)")]
+                check(lines == [2, 3, 5, 7, 8, 9, 10], "tasks.md: boxes carry the source lines in order (%s)" % lines)
+                starts = tdoc.locator("#doc button.start:not(.state)")
+                check(starts.count() == 3, "tasks.md: ▶ Start task on the three open rows (got %d)" % starts.count())
+                check(tdoc.locator("#doc button.start.state.part").inner_text().strip() == "In progress", "tasks.md: the [-] row reads In progress")
+                check(tdoc.locator("#doc button.start.state.queued").inner_text().strip() == "Queued", "tasks.md: the [~] row reads Queued")
+                done_li = tdoc.locator("#doc .box.on").first.locator("xpath=ancestor::li[1]")
+                check(done_li.locator("button.start").count() == 0, "tasks.md: a done row has no button")
+                check(tdoc.locator("#doc .box.optional").count() == 1, "tasks.md: the optional mark survives")
+                cont = tdoc.locator("#continue").inner_text()
+                # The fixture carries a [-] and a [~] row: an interrupted run, so the primary action resumes it.
+                check("Resume run (3 left)" in cont, "tasks.md: Continue reads Resume run for the marks left in the file (%s)" % cont.strip())
+                check(not any("[ ]" in t or "[x]" in t for t in tdoc.locator("#doc li").all_inner_texts()), "tasks.md: no bracket text left in the rows")
+                if args.shots:
+                    page.screenshot(path=os.path.join(args.shots, "tasks.png"))
 
-        page = load("tasks.md")
-        page.evaluate("(m) => window.postMessage(m, '*')", {"type": "continueLabel", "label": "Resume tasks (3 left)", "title": "Continue"})
-        rows = page.evaluate("""() => Array.from(document.querySelectorAll('#doc .box[data-line]')).map((box) => {
-            const li = box.parentElement; const b = Array.from(li.children).find((c) => c.classList && c.classList.contains('start') && c.dataset.line === box.dataset.line);
-            return { line: Number(box.dataset.line), cls: box.className, button: b ? b.textContent : null, state: b ? b.classList.contains('state') : null };
-        })""")
-        by_line = {r["line"]: r for r in rows}
-        check(len(rows) == 7, f"seven task boxes rendered ({len(rows)})")
-        check(by_line[2]["button"] is None and by_line[3]["button"] is None, "done rows (1, 1.1) get no button")
-        check(by_line[5]["button"] == "In progress" and by_line[5]["state"], f"the running parent (2) shows 'In progress' ({by_line[5]})")
-        check(by_line[6]["button"] == "▶ Start task" and not by_line[6]["state"], f"an open sub-task (2.1) gets Start task ({by_line[6]})")
-        check(by_line[8]["button"] == "Queued" and by_line[8]["state"], f"a queued row (2.2) reads 'Queued' ({by_line[8]})")
-        check(by_line[9]["button"] == "▶ Start task" and "optional" in by_line[9]["cls"], f"an optional open task is startable and marked optional ({by_line[9]})")
-        check(by_line[10]["button"] == "▶ Start task", f"the last open task gets Start task ({by_line[10]})")
-        # The button of a parent with children sits before its nested list, so it reads on the parent's line.
-        order = page.evaluate("""() => { const box = document.querySelector('#doc .box[data-line="5"]'); const li = box.parentElement;
-            const kids = Array.from(li.children).map((c) => c.tagName + (c.className ? '.' + c.className.split(' ')[0] : '')); return kids; }""")
-        check(order.index("BUTTON.start") < order.index("UL"), f"a parent's state sits before its sub-task list ({order})")
-        # Clicking Start posts the row's source line; a state label posts nothing.
-        page.hover('#doc .box[data-line="6"]')
-        page.click('#doc li .start[data-line="6"]')
-        page.click('#doc li .start[data-line="8"]')
-        posted = page.evaluate("() => window.__posted.filter((m) => m.type === 'startTask')")
-        check(posted == [{"type": "startTask", "line": 6}], f"Start posts startTask with the source line; Queued posts nothing ({posted})")
-        cont = page.evaluate("() => document.getElementById('continue').textContent")
-        check(cont == "→ Resume tasks (3 left)", f"the primary action is the run-all/resume label ({cont!r})")
-        page.click("#continue")
-        check(page.evaluate("() => window.__posted.filter((m) => m.type === 'continue').length") == 1, "Continue posts one 'continue' (the host runs all remaining tasks)")
-        if args.shots:
-            page.hover('#doc .box[data-line="10"]')
-            page.screenshot(path=str(pathlib.Path(args.shots) / "spec-editor-tasks.png"))
-        # Re-posting the doc (tasks.md changed on disk) re-decorates without duplicating buttons.
-        page.evaluate("(m) => window.postMessage(m, '*')", {"type": "doc", "html": doc_html, "synced": True})
-        n = page.evaluate("() => document.querySelectorAll('#doc .start').length")
-        check(n == 5, f"a re-rendered doc has one button per non-done row, no duplicates ({n})")
-
-        design = load("design.md")
-        check(design.evaluate("() => document.querySelectorAll('#doc .start').length") == 0, "design.md: task boxes render but get no Start buttons")
-        check(not errors, f"no page errors ({errors})")
-        browser.close()
-
-    print(("PASS" if not failures else "FAIL") + f" — {len(failures)} failure(s)")
-    return 1 if failures else 0
+                # --- Edit source, then the preview key: our editor, not the built-in preview
+                tdoc.locator("#edit").click()
+                page.wait_for_timeout(2500)
+                page.wait_for_selector(".monaco-editor .view-lines", timeout=20000)
+                page.locator(".monaco-editor .view-lines").first.click()
+                page.keyboard.press("Control+Shift+V")
+                page.wait_for_timeout(4000)
+                tabs = page.locator(".tabs-container .tab .label-name").all_inner_texts()
+                check(not any(t.startswith("Preview") for t in tabs), "Ctrl+Shift+V on the source: no built-in 'Preview tasks.md' tab (%s)" % tabs)
+                active_label = page.locator(".tabs-container .tab.active .label-name").first.inner_text().strip()
+                visible_task_editor = False
+                for f in page.frames:
+                    try:
+                        if f.locator("#banner .stage.on").count() and f.locator("#banner").is_visible() and f.locator("#banner .stage.on").inner_text().strip().endswith("Task list"):
+                            visible_task_editor = True
+                    except Exception:
+                        continue
+                check(active_label == "tasks.md" and visible_task_editor, "Ctrl+Shift+V on the source: the active tab is tasks.md in the Kiro spec editor (active=%s, visible spec editor=%s)" % (active_label, visible_task_editor))
+                # --- Ctrl+F through the workbench: the webview host swallows the key and forwards it; the
+                # page's own keydown and the extension's keybinding (while a spec editor is active) both
+                # open the editor's find bar, and the built-in find widget stays out of it.
+                fdoc = wait_frame(page, "#doc .box[data-line]")
+                fdoc.locator("#doc").click(position={"x": 40, "y": 10})
+                page.wait_for_timeout(300)
+                page.keyboard.press("Control+F")
+                try:
+                    fdoc.wait_for_selector("#find:not([hidden])", timeout=8000)
+                    check(True, "Ctrl+F in the spec editor opens its find bar")
+                except Exception:
+                    check(False, "Ctrl+F in the spec editor opens its find bar")
+                check(page.locator(".webview .find-widget, .monaco-editor .find-widget.visible").count() == 0, "the workbench's own find widget did not open")
+                page.keyboard.type("Manifest")
+                try:
+                    fdoc.wait_for_function("() => document.querySelectorAll('#doc mark.hit').length === 1", timeout=8000)
+                    check(fdoc.locator("#findcount").inner_text().strip() == "1 of 1", "typing marks the match and counts it (%s)" % fdoc.locator("#findcount").inner_text().strip())
+                except Exception:
+                    check(False, "typing marks the match and counts it")
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+                check(fdoc.locator("#find").get_attribute("hidden") is not None and fdoc.locator("#doc mark.hit").count() == 0, "Esc closes the bar and clears the marks")
+                if args.shots:
+                    page.screenshot(path=os.path.join(args.shots, "preview-key.png"))
+            errs = [c for c in console if c.startswith("error") and "kirocrew" in c.lower()]
+            check(not errs, "no kirocrew console errors (%s)" % errs[:3])
+            browser.close()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+    print("\n%s (%d failure(s)); scratch kept at %s" % ("PASS" if not failures else "FAIL", len(failures), scratch))
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":

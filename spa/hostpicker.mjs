@@ -56,11 +56,16 @@ export function hostReact(win = globalThis.window) {
  * CSS that lets the host picker's box paint over the fullscreen IDE layer. The
  * picker portals to document.body at `z-index: 9999`; the layer sits far above
  * that so the IDE covers every dashboard surface. The box is recognised by the
- * picker's own stable element ids (`pp-recent-list` / `pp-browse-list`, source
- * identifiers, not build hashes).
+ * picker's own stable element ids: every list and row it renders is `pp-…`
+ * (`pp-recent-list`, `pp-browse-list`, `pp-favorite-list`, `pp-favorite-0`,
+ * `pp-dir-…`; source identifiers, not build hashes), on ANY of its tabs. Until
+ * 0.30.7 the rule named the Recent and Browse lists only; KiroCrew 0.11's
+ * picker opens on a Favorites tab when favourites exist, so the box was raised
+ * for the first paint (state starts on Recent), then dropped back under the
+ * fullscreen IDE as the tab switched: it flashed and vanished (2026-11-06).
  */
-export const HOST_PICKER_RAISE_CSS =
-  "body > div:has(#pp-recent-list), body > div:has(#pp-browse-list) { z-index: 2147483100 !important; }";
+export const HOST_PICKER_SELECTOR = 'body > div:has([id^="pp-"])';
+export const HOST_PICKER_RAISE_CSS = HOST_PICKER_SELECTOR + " { z-index: 2147483100 !important; }";
 
 /**
  * Mount the host picker from plain DOM. Returns a controller

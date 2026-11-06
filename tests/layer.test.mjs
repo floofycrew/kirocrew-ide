@@ -68,3 +68,19 @@ test("the joining style is shared: the row gap is what the negative margin cance
 test("exitFullscreen() (API only) navigates to the App page route", () => {
   assert.equal(APP_ROUTE, "/apps/kirocrew-ide");
 });
+
+test("clearedAssociations: a folder that went from a real profile to Default in this browser is a choice; absent -> Default is the workbench's auto-write", async () => {
+  const { clearedAssociations, associationPath } = await import("../spa/layer.mjs");
+  const D = "__default__profile__";
+  const k = (host, path) => "vscode-remote://" + host + path.split("/").map(encodeURIComponent).join("/");
+  assert.equal(associationPath(k("localhost:5480", "/local/home/u/proj a")), "/local/home/u/proj a", "the decoded path, whatever the authority");
+  assert.equal(associationPath("nonsense"), "");
+  assert.deepEqual(clearedAssociations(null, { [k("h", "/a")]: D }), [], "no earlier report: nothing to compare");
+  assert.deepEqual(clearedAssociations({ [k("h", "/a")]: "-422143cd" }, { [k("h", "/a")]: D }), ["/a"], "real -> Default: a switch");
+  assert.deepEqual(clearedAssociations({}, { [k("h", "/a")]: D }), [], "absent -> Default: the auto-write, not a choice");
+  assert.deepEqual(clearedAssociations({ [k("h", "/a")]: D }, { [k("h", "/a")]: D }), [], "Default -> Default: nothing");
+  assert.deepEqual(clearedAssociations({ [k("h", "/a")]: "-422143cd" }, { [k("h", "/a")]: "4b57311b" }), [], "real -> another real: a new choice the map itself carries");
+  assert.deepEqual(clearedAssociations({ [k("h", "/a")]: "-422143cd" }, {}), [], "entry gone: nothing to say");
+  assert.deepEqual(clearedAssociations({ [k("h", "/a")]: "-422143cd" }, { [k("h", "/a")]: D, [k("127.0.0.1:35477", "/a")]: "-422143cd" }), [], "a real entry under another authority still names the profile: not cleared");
+  assert.deepEqual(clearedAssociations({ [k("h", "/a")]: "-422143cd", [k("h", "/b")]: "4b57311b" }, { [k("h", "/a")]: D, [k("h", "/b")]: D }), ["/a", "/b"], "sorted");
+});

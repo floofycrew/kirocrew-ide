@@ -1,0 +1,34 @@
+{
+  "name": "kirocrew-spec-preview",
+  "displayName": "KiroCrew Spec Preview",
+  "description": "Teaches the built-in Markdown preview about Kiro spec files (task states, the optional mark, a progress strip on .kiro/specs/*/tasks.md; a spec header on requirements.md and design.md) and renders ```mermaid fences in every Markdown preview with the library the KiroCrew IDE mod vendors in. Provisioned by the mod next to its bridge.",
+  "version": "0.26.0",
+  "publisher": "kirocrew-ide",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": true,
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "markdown.markdownItPlugins": true,
+    "markdown.previewStyles": [
+      "./media/spec.css"
+    ],
+    "markdown.previewScripts": [
+      "./media/mermaid.min.js",
+      "./media/mermaid-preview.js"
+    ]
+  }
+}

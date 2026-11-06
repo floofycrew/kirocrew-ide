@@ -25,7 +25,7 @@ Module._resolveFilename = function (request, ...rest) {
 };
 require.cache["vscode-stub"] = { id: "vscode-stub", filename: "vscode-stub", loaded: true, exports: stub };
 const ext = require(path.join(here, "..", "extension", "extension.js"));
-const { mdToHtml, stageOf, specNameOf, continueAction, specEditorHtml } = ext.__test;
+const { mdToHtml, stageOf, specNameOf, continueAction, specEditorHtml, isSpecDocument, openSpecPreview, markSpecEditor, renderMarkdown, localizeImages } = ext.__test;
 
 test("stageOf and specNameOf read the spec path", () => {
   const s = stageOf("/ws/.kiro/specs/my-feature/design.md");
@@ -77,9 +77,14 @@ test("continueAction advances requirements → design → tasks → run all (res
   spec.tasks[1].done = true;
   const resume = continueAction({ file: "tasks.md" }, spec);
   assert.deepEqual([resume.label, resume.command], ["Resume tasks (1 left)", "kirocrew.spec.runAll"]);
+  // A `[-]` / `[~]` mark is a run's own trace left behind: the primary action resumes THAT run
+  // (in its session when the tab is still open), through kirocrew.spec.resume.
   spec.tasks[1].done = false; spec.tasks[1].partial = true;
-  assert.equal(continueAction({ file: "tasks.md" }, spec).label, "Resume tasks (2 left)", "an in-progress mark also reads as started");
-  spec.tasks[1].partial = false; spec.tasks[1].done = true; spec.tasks[2].done = true;
+  const interrupted = continueAction({ file: "tasks.md" }, spec);
+  assert.deepEqual([interrupted.label, interrupted.command, interrupted.interrupted], ["Resume run (2 left)", "kirocrew.spec.resume", true], "an in-progress mark is an interrupted run");
+  spec.tasks[1].partial = false; spec.tasks[2].queued = true;
+  assert.equal(continueAction({ file: "tasks.md" }, spec).command, "kirocrew.spec.resume", "a queued mark too");
+  spec.tasks[2].queued = false; spec.tasks[1].done = true; spec.tasks[2].done = true;
   const opt = continueAction({ file: "tasks.md" }, spec);
   assert.deepEqual([opt.label, opt.command], ["Run optional tasks (1)", "kirocrew.spec.runAllOptional"], "only optional work left");
   spec.tasks[3].done = true;
@@ -115,7 +120,128 @@ test("the editor's script parses and, on tasks.md, hangs a Start task on open ro
   assert.match(script, /postMessage\(\{type:'startTask', line:Number\(a\.dataset\.line\)\}\)/, "a Start posts the row's source line");
   assert.match(script, /'▶ Start task'/);
   assert.match(script, /'In progress'[\s\S]*'Queued'/);
-  assert.match(script, /if\(box\.classList\.contains\('on'\)\) return;/, "done rows get nothing");
+  assert.match(script, /if\(box\.classList\.contains\('on'\) \|\| Number\(box\.dataset\.line\)<0\) return;/, "done rows (and rows with no source line) get nothing");
+  // The page dresses what the engine's renderer hands it: a bar with language + Copy on every
+  // <pre><code class="language-x">, Kiro's task boxes carrying the SOURCE LINE (k-th task row ↔
+  // k-th parsed task), and mermaid fences drawn when the vendored library is on the page.
+  assert.match(script, /function dressCode\(\)/);
+  assert.match(script, /l\.textContent=lang\|\|'text'/, "language label, 'text' when the fence named none");
+  assert.match(script, /c\.textContent='Copy'/);
+  assert.match(script, /function dressTasks\(\)[\s\S]*const task=tasks\[k\+\+\]/, "task rows map to the parsed tasks in order");
+  assert.match(script, /box\.dataset\.line=String\(task\?task\.line:-1\)/);
+  assert.match(script, /if\(!window\.mermaid\)\{ blocks\.forEach/, "no library: the fence stays a code block");
+  assert.match(script, /window\.mermaid\.render\(/);
+  // Plain anchors from the renderer: schemes open externally, '#' scrolls, anything else is a path relative to the spec dir.
+  assert.match(script, /relative:true/);
+});
+
+test("find in the document: a bar in the banner, every match marked, Enter/Shift+Enter walk them, Esc closes; the task filter only on tasks.md; the host's 'find' message opens it", async () => {
+  const vm = await import("node:vm");
+  const html = specEditorHtml("my-feature", { file: "tasks.md" }, { "requirements.md": true, "design.md": true, "tasks.md": true });
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  assert.doesNotThrow(() => new vm.Script(script));
+  assert.ok(/<div id="find" role="search" hidden>/.test(html) && /id="findbtn"/.test(html), "the bar (hidden until asked) and a Find button in the actions");
+  for (const id of ["findtext", "findcount", "findprev", "findnext", "findcase", "findfilter", "findclose"]) assert.ok(html.includes('id="' + id + '"'), id);
+  assert.match(html, /#find\{flex:1 0 100%/, "the bar wraps onto its own row of the sticky banner");
+  assert.match(html, /mark\.hit\{background:var\(--vscode-editor-findMatchHighlightBackground/, "matches use the editor's find colours");
+  assert.match(html, /mark\.hit\.cur\{background:var\(--vscode-editor-findMatchBackground/);
+  assert.match(html, /#doc li\.find-hide\{display:none\}/);
+  // The keys: Ctrl/Cmd+F opens (the host already prevents the browser's own find), F3 walks, Esc closes.
+  assert.match(script, /\(e\.ctrlKey\|\|e\.metaKey\) && !e\.altKey && \(e\.key==='f'\|\|e\.key==='F'\)\)\{ e\.preventDefault\(\); findOpen\(\)/);
+  assert.match(script, /if\(e\.key==='Enter'\)\{ e\.preventDefault\(\); findGo\(e\.shiftKey\?-1:1\); \}/);
+  assert.match(script, /e\.key==='Escape'\)\{ e\.preventDefault\(\); findClose\(\)/);
+  assert.match(script, /if\(e\.key==='F3'\)/);
+  assert.match(script, /if\(m\.type==='find'\)\{ findOpen\(\); \}/, "the extension's keybinding reaches the page as a message");
+  // Matching: text nodes only, never inside drawn diagrams or the page's own labels; capped; regex metacharacters escaped.
+  assert.match(script, /p\.closest\('svg, script, style, \.codebar, button\.start, \.box, \.mermaid-error'\)\) return NodeFilter\.FILTER_REJECT/);
+  assert.match(script, /const FIND_CAP = 2000;/);
+  assert.match(script, /function findEscape\(s\)\{ return s\.replace\(\/\[\.\*\+\?\^\$\{\}\(\)\|\[\\\]\\\\\]\/g, '\\\\\$&'\); \}/, "the escape regex survives the template literal");
+  assert.match(script, /find\.cs \? 'g' : 'gi'/, "case-insensitive unless Aa is pressed");
+  // Re-run on a document refresh, keeping the current match; marks are removed on close and the nodes re-joined.
+  assert.match(script, /if\(!find\.bar\.hidden\) findRun\(true\);/);
+  assert.match(script, /p\.replaceChild\(document\.createTextNode\(m\.textContent\), m\); p\.normalize\(\);/);
+  // The task filter is shown on tasks.md only, and a row survives when a parent or sub-task matches.
+  assert.match(script, /if\(STAGE_FILE==='tasks\.md'\) findBtn\('findfilter'\)\.hidden=false;/);
+  assert.match(script, /if\(li\.querySelector\('mark\.hit'\)\) return;[\s\S]*if\(own\.has\(a\)\) return;[\s\S]*li\.classList\.add\('find-hide'\)/);
+  const design = specEditorHtml("my-feature", { file: "design.md" }, { "requirements.md": true, "design.md": true, "tasks.md": true });
+  assert.ok(design.includes('id="findfilter" class="filter"') && design.includes("hidden>Filter tasks"), "the filter button is in the markup for every stage, hidden; only tasks.md reveals it");
+});
+
+test("SpecEditorProvider.findInActive posts `find` to the active spec editor only", async () => {
+  const { SpecEditorProvider } = ext.__test;
+  const provider = new SpecEditorProvider({ extensionUri: { path: "/ext" } });
+  assert.equal(provider.findInActive(), false, "no editor open: nothing to post, says so");
+  const posted = [];
+  const panel = (active) => { const disposers = []; return { active, webview: { postMessage: (m) => posted.push([active, m]) }, onDidDispose: (fn) => disposers.push(fn), dispose: () => disposers.forEach((fn) => fn()) }; };
+  const a = panel(false), b = panel(true);
+  provider.panels.add(a); a.onDidDispose(() => provider.panels.delete(a));
+  provider.panels.add(b); b.onDidDispose(() => provider.panels.delete(b));
+  assert.equal(provider.findInActive(), true);
+  assert.deepEqual(posted, [[true, { type: "find" }]], "only the active panel is asked");
+  b.dispose();
+  assert.equal(provider.panels.size, 1, "a closed editor leaves the set");
+  assert.equal(provider.findInActive(), false, "the remaining editor is not active");
+});
+
+test("the page loads the vendored mermaid only when the hook put it there", () => {
+  const stage = { file: "design.md" }; const present = { "requirements.md": true, "design.md": true, "tasks.md": false };
+  const with_ = specEditorHtml("s", stage, present, { mermaid: "https://webview.invalid/media/mermaid.min.js" });
+  assert.match(with_, /<script src="https:\/\/webview\.invalid\/media\/mermaid\.min\.js"><\/script>/);
+  const without = specEditorHtml("s", stage, present, { mermaid: null });
+  assert.ok(!/<script src=/.test(without), "no library, no script tag");
+  assert.ok(!/<script src=/.test(specEditorHtml("s", stage, present)), "callers that pass no assets");
+  // highlight.js classes the engine's renderer emits have colours for each theme kind
+  for (const cls of ["hljs-keyword", "hljs-string", "hljs-comment", "hljs-title", "hljs-number"]) assert.ok(with_.includes("." + cls), cls);
+  assert.match(with_, /body\.vscode-light \.hljs-keyword/);
+});
+
+test("isSpecDocument: only the three spec files under .kiro/specs/<name>/", () => {
+  assert.equal(isSpecDocument("/ws/.kiro/specs/my-feature/tasks.md"), true);
+  assert.equal(isSpecDocument("C:\\ws\\.kiro\\specs\\x\\design.md"), true);
+  assert.equal(isSpecDocument("/ws/.kiro/specs/my-feature/notes.md"), false);
+  assert.equal(isSpecDocument("/ws/.kiro/specs/tasks.md"), false, "a spec needs its own directory");
+  assert.equal(isSpecDocument("/ws/docs/tasks.md"), false);
+});
+
+test("openSpecPreview: a spec file opens the Kiro spec editor (beside when asked); any other file keeps the built-in preview", async () => {
+  const calls = [];
+  stub.commands.executeCommand = async (...a) => { calls.push(a); };
+  stub.ViewColumn = { Beside: -2 };
+  stub.window.activeTextEditor = { document: { uri: { path: "/ws/.kiro/specs/f/design.md" } } };
+  await openSpecPreview(undefined, false);
+  assert.deepEqual(calls.pop(), ["vscode.openWith", stub.window.activeTextEditor.document.uri, "kirocrew.spec", undefined]);
+  await openSpecPreview({ path: "/ws/.kiro/specs/f/tasks.md" }, true);
+  assert.deepEqual(calls.pop(), ["vscode.openWith", { path: "/ws/.kiro/specs/f/tasks.md" }, "kirocrew.spec", -2]);
+  await openSpecPreview({ path: "/ws/README.md" }, true);
+  assert.deepEqual(calls.pop(), ["markdown.showPreviewToSide", { path: "/ws/README.md" }]);
+  // While a spec file's source is active, the built-in preview button steps aside (its own context key).
+  markSpecEditor({ document: { uri: { path: "/ws/.kiro/specs/f/tasks.md" } } });
+  assert.deepEqual(calls.splice(-2), [["setContext", "hasCustomMarkdownPreview", true], ["setContext", "kirocrew.specFile", "tasks.md"]]);
+  markSpecEditor({ document: { uri: { path: "/ws/src/a.py" } } });
+  assert.deepEqual(calls.splice(-2), [["setContext", "hasCustomMarkdownPreview", false], ["setContext", "kirocrew.specFile", ""]]);
+  markSpecEditor(undefined);
+  assert.equal(calls.length, 0, "a webview becoming active leaves the keys alone");
+  delete stub.window.activeTextEditor;
+});
+
+test("renderMarkdown: the engine's own renderer when its command exists, mdToHtml otherwise; relative images point into the spec dir", async () => {
+  stub.commands.getCommands = async () => ["markdown.api.render"];
+  stub.commands.executeCommand = async (cmd, text) => { assert.equal(cmd, "markdown.api.render"); return "<p>" + text + "</p><pre><code class=\"language-js\"><span class=\"hljs-keyword\">const</span></code></pre>"; };
+  const builtin = await renderMarkdown("hi");
+  assert.equal(builtin.engine, "builtin");
+  assert.match(builtin.html, /hljs-keyword/);
+  stub.commands.executeCommand = async () => { throw new Error("gone"); };
+  const fallback = await renderMarkdown("# T\n\n- [ ] 1. a");
+  assert.equal(fallback.engine, "own");
+  assert.match(fallback.html, /<h1>T<\/h1>/);
+  assert.match(fallback.html, /class="box open" data-line="2"/, "the own renderer boxes task rows itself");
+  const webview = { asWebviewUri: (u) => ({ toString: () => "https://wv.invalid" + u.path }) };
+  const dir = { path: "/ws/.kiro/specs/f" };
+  const out = localizeImages('<img src="diagrams/a.png"> <img src="https://x.invalid/b.png"> <img src="/abs.png"> <img alt="z" src="data:image/png;base64,AA">', dir, webview);
+  assert.match(out, /<img src="https:\/\/wv\.invalid\/ws\/\.kiro\/specs\/f\/diagrams\/a\.png">/);
+  assert.match(out, /src="https:\/\/x\.invalid\/b\.png"/);
+  assert.match(out, /src="\/abs\.png"/);
+  assert.match(out, /src="data:image\/png;base64,AA"/);
 });
 
 test("mdToHtml (GFM): tables, ordered/nested lists, fenced code with lang + copy, links, autolinks, strikethrough, file-path anchors", () => {

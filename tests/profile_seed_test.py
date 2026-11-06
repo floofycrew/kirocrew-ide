@@ -67,7 +67,7 @@ def main():
             fh.write("{not json")
         assert hook._mirrored_profiles(storage, dirs) == []
         html = "<html><head><title>x</title></head><body></body></html>"
-        assert hook._inject_profile_seed(html, []) == html, "no profiles -> untouched"
+        assert 'id="kirocrew-ide-profiles"' in hook._inject_profile_seed(html, []), "injected with an empty mirror: the repair of stored bare-id entries needs none"
 
         out = hook._inject_profile_seed(html, kept)
         assert out.count('id="kirocrew-ide-profiles"') == 1
@@ -101,8 +101,15 @@ process.stdout.write(JSON.stringify(out));
             work = {"location": {"$mid": 1, "scheme": "vscode-userdata", "path": "/User/profiles/1a2b3c4d"}, "name": "Work"}
             same_name = {"location": {"$mid": 1, "scheme": "vscode-userdata", "path": "/User/profiles/aaaaaaaa"}, "name": "vscode"}
             already = {"location": {"$mid": 1, "scheme": "vscode-userdata", "path": "/User/profiles/-1180f179"}, "name": "vscode"}
+            # What an earlier seed (0.2x - 0.30.5) stored: the server's bare-id shape, which the
+            # engine's loader cannot revive ("Cannot read properties of undefined (reading 'length')
+            # at dirname … at get profiles", 2026-11-06): it aborts the list there.
+            legacy_str = {"location": "-422143cd", "name": "vsc"}
+            legacy_obj = {"location": {"path": "/User/profiles/-71208a3e"}, "name": "old"}
             cases = [
                 ("empty browser list", {}, ["-1180f179", "-3904788d"]),
+                ("bare-id and $mid-less entries stored by an earlier seed are repaired to the URI shape",
+                 {"userDataProfiles": json.dumps([legacy_str, legacy_obj, work])}, ["-422143cd", "-71208a3e", "1a2b3c4d", "-1180f179", "-3904788d"]),
                 ("browser has another profile: mirror appended, nothing removed", {"userDataProfiles": json.dumps([work])},
                  ["1a2b3c4d", "-1180f179", "-3904788d"]),
                 ("browser already has the id: not duplicated", {"userDataProfiles": json.dumps([already])},
@@ -110,6 +117,8 @@ process.stdout.write(JSON.stringify(out));
                 ("browser has the name under another id: the name is not doubled", {"userDataProfiles": json.dumps([same_name])},
                  ["aaaaaaaa", "-3904788d"]),
                 ("corrupt browser list: replaced by the mirror", {"userDataProfiles": "{not json"}, ["-1180f179", "-3904788d"]),
+                ("the mirror's entries already present as bare ids: repaired in place, not doubled",
+                 {"userDataProfiles": json.dumps([{"location": "-1180f179", "name": "vscode"}, {"location": "-3904788d", "name": "vscode-default"}])}, ["-1180f179", "-3904788d"]),
             ]
             paths = {}
             for fname, text in (("seed.js", body), ("run.js", runner),
@@ -130,8 +139,18 @@ process.stdout.write(JSON.stringify(out));
                 return out_ids
             for (label, _, expected), got in zip(cases, results):
                 assert ids(got) == expected, "%s: %r, expected %r" % (label, ids(got), expected)
-            # The browser's own entries keep their stored shape (uri location), the mirrored ones the bare id.
-            assert results[1][0]["location"] == work["location"]
+            # The browser's own entries keep their stored shape; the mirrored ones get the browser
+            # service's URI shape ({$mid:1, scheme, path}), never the server's bare id.
+            assert results[2][0]["location"] == work["location"]
+            assert results[0][0] == {"location": {"$mid": 1, "scheme": "vscode-userdata", "path": "/User/profiles/-1180f179"}, "name": "vscode", "icon": "briefcase"}, results[0][0]
+            assert results[0][1]["location"] == {"$mid": 1, "scheme": "vscode-userdata", "path": "/User/profiles/-3904788d"} and results[0][1]["useDefaultFlags"] == {"globalState": True}
+            for entry in sum(results, []):
+                loc = entry["location"]
+                assert isinstance(loc, dict) and loc.get("$mid") == 1 and loc.get("scheme") == "vscode-userdata" and loc.get("path", "").startswith("/User/profiles/"), entry
+            assert all(isinstance(e["location"], dict) and e["location"]["$mid"] == 1 for e in results[6]), results[6]
+            repaired = results[1]
+            assert repaired[0] == {"location": {"$mid": 1, "scheme": "vscode-userdata", "path": "/User/profiles/-422143cd"}, "name": "vsc"}, repaired[0]
+            assert repaired[1]["location"] == {"$mid": 1, "scheme": "vscode-userdata", "path": "/User/profiles/-71208a3e"}
             print("seed script merges the mirror into the browser list (%d cases, node)" % len(cases))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

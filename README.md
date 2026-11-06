@@ -144,7 +144,11 @@ other theme and it stays yours.
   the same picker. The dashboard does not export that component, so the mod
   reaches it through the chunk the dashboard preloads (`spa/hostpicker.mjs`,
   no build hash hardcoded); a dashboard without it gets the mod's own
-  combobox (recent workspaces, then the engine-side directory listing). One engine serves them all; each
+  combobox (recent workspaces, then the engine-side directory listing). The picker's box is
+  raised above the fullscreen IDE by a rule keyed on its own `pp-…` element ids on *any*
+  of its tabs; until 0.30.7 the rule named the Recent and Browse lists only, and KiroCrew
+  0.11's picker, which opens on a Favorites tab when favourites exist, flashed for its
+  first paint and then vanished behind the IDE. One engine serves them all; each
   workspace is its own workbench document, created when first shown and kept
   warm, so switching never reloads anything. The App page mirrors this: Start
   reads **Open** while the engine runs and adds the folder, and a tab row sits
@@ -185,7 +189,10 @@ other theme and it stays yours.
 - **The bar keeps out of the workbench's way.** In fullscreen the layer's bar
   (`◁ KiroCrew | host ▾ | IDE · folder ▾`) ends where the workbench's own
   title-bar centre (the ← → arrows and the command centre) begins, measured
-  from the live document and re-measured on resize. Under that budget the
+  from the live document and re-measured on resize. The command centre itself
+  is served at half its stock width (`command_center_scale`, default `0.5`):
+  the stock 38vw / 600px pill shows only "Search <folder>" and took most of
+  the title bar once docked in the dashboard. Under that budget the
   folder name is the piece that gives way: it is not ellipsised but faded at
   the cut edge, like KiroCrew's crew row. Rest the pointer on the chip and
   the name glides to its end (and back when you leave); a wheel or trackpad
@@ -220,7 +227,56 @@ other theme and it stays yours.
   overwritten. The same seed heals a second, quieter loss: the workbench keys
   those entries by the engine's `127.0.0.1:<port>`, so a relaunch that landed
   on the next free port orphaned every earlier choice; an entry held under an
-  old port is copied to the current one.
+  old port is copied to the current one. **A relaunch now keeps its port.** Until
+  0.30.4 every relaunch (each new bridge version relaunches) flipped the engine
+  between 35476 and 35477: the stop watched the `sh` wrapper's pid, which dies
+  at once, while `node` was still closing the listener, so the port read busy
+  250 ms later and the next one was taken. The workbench writes
+  `__default__profile__` itself the first time a folder boots with no entry
+  under the current port, and that stale Default came back on every other
+  relaunch, so a folder given a profile on one port opened in Default on the
+  other (2026-11-05). The stop now waits for the port to be released and the
+  relaunch takes it again (the probe binds with `SO_REUSEADDR`, like node, so
+  TIME_WAIT leftovers do not count). The seed also repairs the damage already
+  in a browser's map: a Default under the current port gives way to a real
+  profile the same browser holds under an earlier port, and once a folder has
+  its entry under the workbench's own authority the copies under earlier ports
+  are dropped, so they cannot come back. (A Default you chose on purpose for a
+  folder that still has an old-port entry is undone once by that repair; pick
+  it again and it stays, there is no old entry left to fight it.) **A Default
+  is never a choice.** The web workbench writes the profile it booted into for
+  the folder on *every* boot (`web.main`'s `setProfileForWorkspace` right
+  after picking it), so a folder's first boot in any browser, or under any
+  engine port, leaves `__default__profile__` behind, indistinguishable from a
+  user switching to Default. Until 0.30.5 the host recorded those, the seed
+  copied them into every other browser, and a Default association switched the
+  folder off "Use for New Windows" for good: one new client booting a folder
+  put every other client into Default on its next reload. Now a Default is
+  never recorded, shipped or copied (stale ones in the host record are purged
+  on the next write), and "Use for New Windows" applies to a folder whose only
+  association is a Default. The one casualty: a folder you switched back to
+  Default on purpose boots into the new-window profile again while that setting
+  names one; clear the setting to keep a folder in Default. **Two faults fixed in
+  0.30.6, both found live in a user's browser.** The profile-list seed copied
+  the server's records with the server's `location` shape (a bare id); the
+  browser service stores a URI object and its loader aborts the whole list at
+  the first string, so a browser whose list the seed had filled saw *no*
+  profiles at all: an empty picker, every folder in Default, and the list
+  rewritten to `[]` on the next save ("my profile disappeared"). The seed now
+  writes `{"$mid":1,"scheme":"vscode-userdata","path":"/User/profiles/<id>"}`
+  and repairs entries an earlier seed stored. And the association seed keyed
+  entries by the configuration meta's `remoteAuthority` (the engine's own
+  `127.0.0.1:<port>`, since the proxy drops the browser's Host) while the
+  workbench keys them by the page's `location.host` (openvscode's
+  `workbench.ts`); from 0.30.4 that seed moved every real entry to the dead
+  authority and pruned it, so a folder switched to a profile booted into
+  Default on the next reload. The seed now keys by `location.host`, repairs
+  the dead-authority copies back, and a real profile (this browser's own or
+  the host record's) replaces a Default under the live key, a Default being
+  never a choice. The one shape of Default that *is* a choice, a switch in a
+  live document (real → Default), is reported by the layer as `cleared` and
+  removed from the host record, so it is not brought back. The host pins the
+  record by the dashboard host the browser reported from (its `Host` header).
 - **KiroCrew Chat** in the IDE's secondary side bar (the built-in AI chat is
   turned off): tabs, one KiroCrew session per tab, per-project **History**
   (every session whose project is the open folder — created here or in the
@@ -233,7 +289,10 @@ other theme and it stays yours.
   what happened. The composer's model/effort/Autopilot picks are yours alone:
   what a live session actually runs with is shown on its tab but never
   inherited by the next tab, and a model id the host's catalog has retired is
-  dropped (with a note) instead of pinned on a new session.
+  dropped (with a note) instead of pinned on a new session. The tab that was in
+  front is remembered with the tabs: a reopened window comes back on it (until
+  0.30.8 it always opened the first, oldest tab); a record without that memory
+  opens on the newest chat.
 - **Steering, Kiro's way.** Every chat started here runs on kiro-cli with the
   open folder as its working directory, so the workspace's `.kiro/steering`
   and `~/.kiro/steering` load exactly as Kiro CLI loads them: a file with no
@@ -264,8 +323,47 @@ other theme and it stays yours.
 - **The input box is yours to size.** It grows with what you type (to about
   45% of the pane); drag the grip on its top edge for a height of your own,
   remembered per workspace; double-click the grip to go back to automatic.
+- **Your turn shows the instant you send it.** The page draws your bubble
+  (text, `#` chips, image thumbnails) and starts the working foxes on Enter,
+  before the extension has created the session, applied your picks, uploaded
+  the files, scanned steering and injected the contexts; the extension's own
+  copy of the turn then completes that bubble in place (the uploaded paths,
+  for the lightbox's Open file) rather than adding a second one. If the send
+  fails, the error lands under the bubble and the pane is released. The
+  steering inventory, read on every send through the remote fs, is cached for
+  20 s and dropped the moment a steering file changes.
+- **Pictures in the chat.** An image pasted into the composer, picked with 📎
+  or dropped onto the composer shows as a thumbnail in the chip row (× to
+  remove, click to preview) before it is sent; in your bubble it is the picture
+  itself, with any other file as a 📎 chip that opens it. A transcript loaded
+  from history shows the same: the `[attached_file N]` markers are resolved
+  against the row's file list (a path with a space survives) and each image is
+  fetched through the extension, since the page cannot read the disk and the
+  dashboard keeps uploads outside the workspace (`~/.kiro/crew/uploads/`). A
+  markdown image in an answer (`![chart](/tmp/out/chart.png)`, an https URL
+  too) is drawn in place instead of linking to the file. Every picture opens a
+  lightbox on click (full size, the file name, **Open file** for an editor tab,
+  Esc to close). Images over 8 MB are not previewed: the card names the file and
+  opens it; a missing file is an error note with the path as a link. Fetched
+  images are cached per path for the window.
+- **Scroll up to read; jump back when you want.** The transcript follows new
+  rows only while it is at the bottom (within 8px, the dashboard's rule).
+  Scrolled up, streaming text and new rows land without moving the view, and a
+  **Jump to latest** pill appears over the pane's bottom edge; it reads **New
+  messages** and takes the accent colour once something arrived unseen. A click
+  scrolls to the end (smoothly, instantly under reduced motion) and following
+  resumes; scrolling back down by hand does the same. Your own turn and a
+  reload always land at the bottom. The pill is the active tab's: each tab
+  keeps its own position.
+- **A reading column in a wide pane.** The transcript, the pinned prompt and
+  the composer sit in a centred column, with the dashboard's three Chat
+  settings presets (`kirocrew.chatWidth`): **compact** (default) is an 800px
+  column (816px for the composer) scaled by the message font size, so no line
+  runs the width of a 1400px panel; **comfortable** is 84% of the pane, **full**
+  92%. A pane narrower than the column is unaffected (its 8px gutters stay).
 - **KiroCrew** activity-bar views: *Specs* (`.kiro/specs/<name>/`, phase
-  commands, ▶ Start task per row, ⏵⏵ Run all tasks per spec, Kiro's queued /
+  commands, ▶ Start task per row, ⏵⏵ Run all tasks per spec, ⟳ Resume run on a
+  spec whose tasks.md still carries a run's `[~]` / `[-]` marks, Kiro's queued /
   in-progress / done marks), *Steering*, *Skills*, *Agent Hooks* — each showing
   the workspace's `.kiro/` and the global `~/.kiro/` tier, with a ＋ that
   scaffolds a new file or skill folder. The bridge is registered for **every
@@ -293,6 +391,28 @@ other theme and it stays yours.
   streaming yet (reasoning, tool calls, the wait for the first token) four
   small FloofyCrew foxes hop in turn under the last row, where KiroCrew shows
   its ghosts; they go still under *prefers-reduced-motion*.
+- **The host's own notices are cards, not prose.** KiroCrew writes what it did
+  to a turn as `inject` rows: a tool call its safety policy stopped (`[Tool
+  blocked — reason sent to the agent] policy …`), a turn it resumed after a
+  dropped connection or a stall, a Continue you asked for, a sub-agent
+  synthesis. The IDE folds each into the dashboard's collapsed recovery card —
+  a one-line header with the dashboard's own title and detail ("Tool call
+  blocked · safety policy blocked the call · the agent was told why, in this
+  turn"), the matched policy pattern as a mono chip (or "N patterns"), the
+  whole notice under it on click, paths in it as links. Blocked, refused and
+  stalled kinds carry the warning icon; resumed turns, a Continue and a
+  synthesis are routine. A gateway notice with no known prefix is a generic
+  "System notice" card; an automation notice draws nothing; cron notifications
+  stay the quiet row they were.
+- **Kiro's `task_status` rows say what they are.** Every status change the
+  task orchestrator writes into `tasks.md` (`[~]` queued, `[-]` in progress,
+  `[x]` done) is announced as a `task_status` action with no input, no output
+  and no title; kiro-cli relays it as a completed tool call and KiroCrew
+  persists it as such (one spec run had 410 of them among 698 tool rows). The
+  only trace of *which* task is the action id (`…_taskStatus_1_1_Create__conne`:
+  the task's line sanitized, capped at 64 chars), so the row reads "Task
+  status · 1.1 Create conne…" with a 📋, and opening it shows a note saying what
+  the row is instead of "(no output)".
 - Attachments travel exactly as the dashboard composer sends them: each file
   is uploaded to the host and referenced by an `[attached_file N] <path>`
   marker with the path list in the send's `meta.files`, so the host inlines an
@@ -310,6 +430,7 @@ other theme and it stays yours.
 | `hook/` (python-hook, early) | gateway | engine supervisor + control API (`status` with per-workspace spec-task counts and engine health, `start` `stop` `relaunch` `workspaces/open` `workspaces/close` `engines` `engines/install` `extensions/install` `browse`), the same-origin proxy at `/kirocrew-ide`, bridge-extension provisioning |
 | `app/` (app) | App Kit | the **KiroCrew IDE** App page. `app/ui/art/icon.svg` is the App's face in the Apps sidebar and the store (manifest `iconPath`): the fox wearing a `</>` badge |
 | `extension/` | the engine | the KiroCrew web extension (chat, sessions, approvals, specs), provisioned per start |
+| `preview/` | the engine | the spec-preview extension (engine-side host): a markdown-it plugin + styles for the built-in Markdown preview (Kiro task rows, spec header) and the mermaid preview script; provisioned per start beside the bridge |
 | `ui/page.mjs` (ui) | FloofyCrew App | engine status and settings; points at the App. `ui/icon.svg` is the mod's face in FloofyCrew's Mod pages and Installed mods (the same fox as the App page's loading splash) |
 
 ## Requirements
@@ -376,8 +497,15 @@ Hosts from KiroCrew 0.8.0.9 on reserve KAS's bundled mode ids (`spec`,
 which is exactly the name kiro-spec-plan's handles use. The bridge catches that
 refusal on the first send, says so once in the transcript, and re-sends the
 turn as the prompt-guided workflow on your picked agent, skipping the doomed
-attempt for the rest of the window. A kiro-spec-plan that activates the modes
-another way will be picked up as before.
+attempt for the rest of the window. KiroCrew 0.11 wears the same refusal
+differently: it renames a reserved id on the wire (`spec` registers as
+`spec-crewmate`) and, when nothing registers under that alias, fails the start
+with "Agent mode 'spec' is not available on this session (advertised modes:
+[… 'spec' …]); its ~/.kiro/agents/spec.json is likely missing" (the file is
+there; the id it looked for was the alias). The bridge treats that sentence,
+for the four mode ids only, as the same refusal. **kiro-spec-plan 0.2.2** pins
+the mode ids to the bundled ids on that host, so with it installed Kiro's
+real Spec mode runs and neither fallback is needed.
 
 **Running tasks** works the way Kiro's IDE does. On a `tasks.md` the
 editor's primary action is **Run all tasks** (or **Resume tasks** once some
@@ -395,6 +523,85 @@ paraphrase carrying the same task block asks your crew agent for the same
 non-stop loop. Optional tasks (`- [ ]* …`) are skipped by Run all; the spec's
 context menu has **Run all required and optional tasks**, which removes the
 `*` marks first (Kiro's "make all required").
+
+**An interrupted run resumes itself.** A long Run all tasks gets cut: by the
+host's turn limit (`agent.chat_turn_timeout_secs`, 4 hours by default, 24 at
+most, in `~/.kiro/crew/config.json`: "⏱️ This turn hit the 4-hour limit and was
+stopped …"), by a dropped connection, a backend error, a gateway restart, or a
+model that simply ends its turn mid-list. The IDE does not key on the error
+text for any of these. It judges the run from `tasks.md`: Kiro's orchestrator
+writes `[~]` (queued) and `[-]` (in progress) as it goes and leaves neither
+behind when it finishes, so a turn that ends with either still in the file did
+not finish the run (for a run this IDE dispatched, open required rows count
+too). A moment after each turn ends, with the session idle, the bridge
+re-reads `tasks.md` and, if work is left, sends the run's own request again
+(Kiro's "Run all tasks for this spec." with the ticked tasks to skip, or the
+single task's request; a note asks the engine to check a `[-]` row before
+trusting it), up to `kirocrew.specResumeLimit` times per run (default 3, so a
+run can span four turns), each resume announced with its cause ("The host
+stopped this turn at its 4-hour limit", "The turn ended on an error (…)",
+"The turn ended with 1 task in progress and 10 queued, without finishing the
+run"). It holds back, and shows a card with a **Resume run** button instead,
+when you pressed Stop, when a question card is waiting, when the answer
+ended on a question (an `[OPTIONS:` line or a trailing "?"), past the cap, with
+`kirocrew.specAutoResume` off, and at startup (a reloaded window judges each
+restored tab once and never sends on its own). A Spec tab with no run record
+of its own (a tab from before 0.27, a run the dashboard started) adopts the
+one spec whose `tasks.md` carries those marks. The ⏱ card keeps its red box
+and **Continue from where it stopped** button for plain chats. Outside the
+chat, the same run is one click away: the **Specs view** marks a spec with
+marks left behind as *interrupted: 1 task in progress and 10 queued* with a
+⟳ **Resume run** action, and the spec editor's primary action on such a
+`tasks.md` reads **Resume run (N left)**; both resume in the session that ran
+it when its tab is still open and idle (the orchestrator keeps its context),
+and start a fresh Run all tasks otherwise. Nothing is sent while the session
+is still running or when every task is already ticked.
+
+**The spec editor's page** is rendered by the engine's own markdown renderer
+(the built-in preview's markdown-it, through its `markdown.api.render`
+command): GFM tables, the same highlight.js colouring on fenced code as the
+built-in preview, one palette per theme kind. On top of that the page keeps
+what the built-in preview does not have: a language label and **Copy** on
+every code block, Kiro's task boxes and Start buttons, and `mermaid` fences
+drawn in place (see *Mermaid* below). Relative links open against the spec's
+own directory; relative images load from it. Should the markdown extension be
+disabled, the mod's own renderer takes over, without the colouring.
+**Shift+Cmd+V / Ctrl+Shift+V and Ctrl+K V on a spec file open the spec
+editor** (beside the source for Ctrl+K V), and the title-bar preview button on
+a spec file's source is the spec editor's; every other markdown file keeps the
+built-in preview and its keys. **Edit source** in the banner (or *Reopen
+Editor With → Text Editor*) is the way back to the text.
+
+**Find in a spec document.** Ctrl+F (⌘F) in the spec editor, the 🔍 Find
+button, or *KiroCrew Spec: Find in document* opens a find bar in the sticky
+banner: every match is marked, the current one stronger and scrolled into
+view, with "3 of 12", ↑ ↓ (Enter / Shift+Enter, F3), an **Aa** match-case
+toggle and Esc to close. The search covers headings, text and code (not the
+page's own labels or drawn diagrams), case-insensitive by default, and stays
+live across a Sync Files or an edit on disk. On `tasks.md` a **Filter tasks**
+toggle hides the task rows that do not match, keeping a matching task's
+sub-tasks and a matching sub-task's parent, so a long plan reduces to the
+tasks about one thing. The webview host swallows Ctrl+F before the browser
+sees it and forwards the key to the workbench; the page opens the bar on its
+own keydown and the extension's keybinding (while a spec editor is active)
+sends the same request, so the shortcut works whichever way it arrives.
+Matches are found within one run of text: a phrase split by inline markup
+(`**bold** text`) is not matched across the split.
+
+**Mermaid.** The engine has no renderer for ```` ```mermaid ```` fences, and
+Kiro's `design.md` is full of them. The mod does not ship the library: the
+first time an engine starts, the hook fetches one pinned build of mermaid
+(`MERMAID_VERSION` in the hook, SHA-256 checked, 3.5 MB, from
+`cdn.jsdelivr.net`) into `<data>/vendor/` and copies it into both provisioned
+extensions as `media/mermaid.min.js`. The spec editor draws its fences with
+it, and the **built-in markdown preview** of any file does too, through the
+mod's second extension (`preview/`, see *Parts*): that extension also marks
+Kiro's task rows in the built-in preview of a spec `tasks.md` (state boxes, the
+optional tag, a progress strip) and puts a spec header on `requirements.md` /
+`design.md` there. A diagram that does not parse keeps its source with the
+parser's message under it. Offline, the start goes on without diagrams and the
+fetch is retried at the next start; `status.mermaid` says which.
+`mermaid.enabled: false` in the mod config turns all of it off.
 
 ## Install / develop
 
@@ -416,6 +623,7 @@ mod, not an App" proof: [DESIGN.md](DESIGN.md).
 |---|---|
 | `default_folder` | folder the picker starts in / Start opens when none is given |
 | `idle_unload_minutes` | minutes an off-screen workspace document stays warm before it is unloaded (default 15, `0` never); set from the workspace menu's footer, route `POST settings/idle-unload {"minutes"}` |
+| `command_center_scale` | width of the title bar's command centre (the search pill) relative to the stock 38vw / 600px (default `0.5`, so half; `1` = stock width; floor 0.25). Served in the workbench page, so a reload applies it |
 | `engine.heap_mb` | V8 heap ceiling (MB) handed to the engine and every extension host through `NODE_OPTIONS --max-old-space-size` (default 8192; `0` leaves node's own ~4 GB). A ceiling, not a reservation. |
 | `engine.command` | full engine command template (`{port}` `{token}` `{folder}` `{auth}` `{basepath}` `{extensions}`) |
 | `engine.version` | pin the auto-installed openvscode-server version (default: latest release) |
@@ -423,10 +631,14 @@ mod, not an App" proof: [DESIGN.md](DESIGN.md).
 | `engine.token` | `true` runs the engine with a connection token; breaks embedding (its cookie is `SameSite=Lax`) |
 | `engine.gallery` | `merged` (default: Open VSX + Microsoft Marketplace in one Extensions view), `openvsx` (engine's own store), `marketplace` |
 | `engine.gallery_port` | pin the merged gallery's loopback port (default: first free of 35486–35495) |
+| `mermaid.enabled` | `false` skips the pinned mermaid download and leaves ```` ```mermaid ```` fences as code blocks everywhere (default `true`) |
 
 IDE-side settings (VS Code settings, `kirocrew.*`): `agent` (default agent
 for chats and spec phases), `specAgent` (agent that executes tasks),
-`specAutopilot` (task runs approve their tools, default on),
+`specAutopilot` (task runs approve their tools, default on), `specAutoResume`
+and `specResumeLimit` (an interrupted task run resumes itself from tasks.md,
+whatever cut it, default on, 3 times), `chatFontSize` and `chatWidth` (the
+transcript's font size and reading column: `compact` | `comfortable` | `full`),
 `folderName` (dashboard folder, default "KiroCrew IDE"), `notifyApprovals`.
 
 ## One port only (remote hosts)
@@ -463,12 +675,14 @@ counts (`opened`, `failed`, `live`).
 
 ```
 python tests/<name>_test.py            # hook units (stub floofy module, no host code)
-node --test tests/extension_unit.test.mjs
+node --test tests/*.test.mjs
 tests/e2e/probe_extension.py <url>     # headless: the extension activates in the workbench
 tests/e2e/probe_profile.py <url> <profile> <udd>   # headless: bridge + seeded order in a non-default profile
 tests/e2e/probe_hosts.py               # headless, self-contained: the layer (host switcher, modes, workspaces) in stub realms
 tests/e2e/probe_chat_webview.py        # headless, self-contained: the chat webview's transcript (the thinking block) driven with the extension's own messages
 tests/e2e/probe_gallery.py <url> <gallery> <text>   # headless: the Extensions view searches through the merged gallery (browser route aborted = remote browser; --direct keeps it)
+tests/e2e/probe_spec_editor.py --engine <bin> [--mermaid <mermaid.min.js>]   # headless, scratch engine: the spec editor renders through the engine's renderer (hljs spans, code bars, task boxes, mermaid) Ctrl+Shift+V on a spec file opens it, and Ctrl+F through the workbench opens its find bar
+tests/e2e/probe_spec_find.py           # headless, self-contained: the spec editor's find bar (marks, count, Enter/Shift+Enter, Aa, Filter tasks, refresh, Esc) driven with the keyboard
 tests/e2e/chat_roundtrip.py <url>      # headless: a message round-trips through a gateway session
 ```
 

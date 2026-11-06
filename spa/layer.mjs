@@ -43,7 +43,7 @@
 import { HostModelStore, clickLocalChip, entriesFor, isEmbedded, localEntries, switchTo } from "./hostmodel.mjs";
 import { dashboardScheme, injectLetterpressStyle, readWorkbenchTheme, withScheme, workbenchCentreLeft, workbenchRightLeft } from "./workbench.mjs";
 import { donutMarkup, progressLabel, summarize } from "./progress.mjs";
-import { HOST_PICKER_RAISE_CSS, loadHostPicker, mountHostPicker } from "./hostpicker.mjs";
+import { HOST_PICKER_RAISE_CSS, HOST_PICKER_SELECTOR, loadHostPicker, mountHostPicker } from "./hostpicker.mjs";
 
 export const API = "/api/apps/floofycrew/mods/kirocrew-ide/api/";
 export const APP_ROUTE = "/apps/kirocrew-ide";
@@ -83,6 +83,30 @@ const FOX = "/apps/kirocrew-ide/ui/art/fox.svg";
 // makes to it, which reaches this document as a `storage` event — so the host's seed can
 // hand it to the next browser or desktop client. Debounced: a profile switch writes twice.
 const ASSOCIATIONS_KEY = "profileAssociations";
+const DEFAULT_PROFILE_ID = "__default__profile__";
+
+/** The decoded folder path an association key names ("" when it names none). */
+export function associationPath(key) {
+  let path = String(key || "");
+  const at = path.indexOf("://");
+  if (at >= 0) { const rest = path.slice(at + 3), slash = rest.indexOf("/"); path = slash >= 0 ? rest.slice(slash) : ""; }
+  try { path = decodeURIComponent(path); } catch { /* keep raw */ }
+  path = path.replace(/\/+$/, "");
+  return path.startsWith("/") ? path : "";
+}
+
+/**
+ * Folder paths whose entry went from a real profile (in `before`, the last map reported)
+ * to the Default profile (in `after`): a profile switch the user made in a live document.
+ * Absent -> Default is the workbench's own auto-write and is not reported.
+ */
+export function clearedAssociations(before, after) {
+  if (!before || typeof before !== "object" || !after || typeof after !== "object") return [];
+  const was = {}, now = {};
+  for (const [key, id] of Object.entries(before)) { const p = associationPath(key); if (p && typeof id === "string") was[p] = id; }
+  for (const [key, id] of Object.entries(after)) { const p = associationPath(key); if (p && typeof id === "string" && (!(p in now) || id !== DEFAULT_PROFILE_ID)) now[p] = id; }
+  return Object.keys(was).filter((p) => was[p] !== DEFAULT_PROFILE_ID && now[p] === DEFAULT_PROFILE_ID).sort();
+}
 const ASSOCIATIONS_DEBOUNCE_MS = 1000;
 
 /**
@@ -313,7 +337,7 @@ export class IdeLayer {
       if (this.wsMenuOpen) {
         const ws = this.root.querySelector(".kide-ws");
         // The host picker's box portals to document.body: a click in it belongs to the menu.
-        const inHostPicker = this.hostPicker && this.hostPicker.isOpen() && event.target.closest && event.target.closest("body > div:has(#pp-recent-list), body > div:has(#pp-browse-list)");
+        const inHostPicker = this.hostPicker && this.hostPicker.isOpen() && event.target.closest && event.target.closest(HOST_PICKER_SELECTOR);
         if (!(ws && ws.contains(event.target)) && !inHostPicker) this.setWsMenuOpen(false);
       }
       if (this.progressOpen) {
@@ -474,13 +498,22 @@ export class IdeLayer {
     this.associationsTimer = this.win.setTimeout(() => { this.associationsTimer = null; this.reportAssociations(); }, ASSOCIATIONS_DEBOUNCE_MS);
   }
 
-  /** POST the browser's map to the host (keyed by folder path there); skipped when nothing changed since the last accepted report. */
+  /**
+   * POST the browser's map to the host (keyed by folder path there); skipped when nothing
+   * changed since the last accepted report. Folders that went from a real profile to the
+   * Default profile since that report are named in `cleared`: that is the one shape of
+   * Default that is a choice (a switch in a live document) — the workbench's own auto-write
+   * only ever goes from no entry to Default — and the host drops them from its record so
+   * no seed brings the old profile back.
+   */
   async reportAssociations() {
     const map = this.readAssociations();
     if (!map) return null;
     const text = JSON.stringify(map);
     if (text === this.associationsSent) return null;
-    const reply = await this.post("profiles/associations", { workspaces: map });
+    const cleared = clearedAssociations(this.associationsSent ? JSON.parse(this.associationsSent) : null, map);
+    const body = cleared.length ? { workspaces: map, cleared } : { workspaces: map };
+    const reply = await this.post("profiles/associations", body);
     if (reply && reply.ok) this.associationsSent = text;
     return reply;
   }

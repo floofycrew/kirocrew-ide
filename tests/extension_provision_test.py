@@ -87,9 +87,16 @@ def main():
     assert len(ours) == 1 and ours[0]["metadata"]["isApplicationScoped"] is True, ours
     assert os.path.isfile(marker), "the provisioned folder was re-copied under a running engine"
     assert json.load(open(os.path.join(root, ".obsolete"))) == {}, "un-obsoleted again"
-    # Nothing on disk to register (never provisioned): a no-op, not a copy.
+    # Nothing on disk to register (never provisioned): a no-op, not a copy. Two
+    # extensions ship (bridge + spec preview), so both copies must be gone first;
+    # with only the bridge gone the preview's entry is still rewritten.
     import shutil
     shutil.rmtree(target)
+    assert hook._reregister_extension() is True, "the spec-preview copy is still on disk"
+    assert not os.path.isdir(target), "never re-copied"
+    for entry in os.listdir(root):
+        if entry.startswith("kirocrew-ide.kirocrew-spec-preview-"):
+            shutil.rmtree(os.path.join(root, entry))
     assert hook._reregister_extension() is False
     assert not os.path.isdir(target)
     print("extension provisioning OK: copied, registered application-scoped in extensions.json, un-obsoleted, older copies removed; adoption re-registers without re-copying")

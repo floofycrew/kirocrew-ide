@@ -91,23 +91,46 @@ def main():
             "vscode-remote://127.0.0.1:35476/notastring": 7,
         }
         norm = hook._normalise_associations(reported, dirs_path=dirs, authority="127.0.0.1:35476")
-        assert norm == {folder_a: "-1180f179", folder_b: hook.DEFAULT_PROFILE_ID}, norm
+        assert norm == {folder_a: "-1180f179"}, (norm, "a Default is not a choice: the workbench writes it on every first boot")
         # Without a known authority the last entry for a path wins.
         two = {"vscode-remote://127.0.0.1:35477/p": "4b57311b", "vscode-remote://127.0.0.1:35476/p": "-1180f179"}
         assert hook._normalise_associations(two, dirs_path=dirs, authority=None) == {"/p": "-1180f179"}
         # The pinned (current-authority) entry is kept even when an older one comes later in the map.
         assert hook._normalise_associations({"vscode-remote://127.0.0.1:35476/p": "-1180f179", "vscode-remote://127.0.0.1:35477/p": "4b57311b"},
                                             dirs_path=dirs, authority="127.0.0.1:35476") == {"/p": "-1180f179"}
+        # A Default under the current port never hides a real profile under an earlier one, and a
+        # Default alone records nothing: the workbench wrote it itself when the folder first booted
+        # under that port (2026-11-05, the user's profile "gone" on every reload).
+        assert hook._normalise_associations({"vscode-remote://127.0.0.1:35476/p": "-1180f179", "vscode-remote://127.0.0.1:35477/p": hook.DEFAULT_PROFILE_ID},
+                                            dirs_path=dirs, authority="127.0.0.1:35477") == {"/p": "-1180f179"}
+        assert hook._normalise_associations({"vscode-remote://127.0.0.1:35477/p": hook.DEFAULT_PROFILE_ID, "vscode-remote://127.0.0.1:35476/p": "-1180f179"},
+                                            dirs_path=dirs, authority="127.0.0.1:35477") == {"/p": "-1180f179"}, "whatever the order"
+        assert hook._normalise_associations({"vscode-remote://127.0.0.1:35476/p": hook.DEFAULT_PROFILE_ID, "vscode-remote://127.0.0.1:35477/p": hook.DEFAULT_PROFILE_ID},
+                                            dirs_path=dirs, authority="127.0.0.1:35477") == {}
+        assert hook._normalise_associations({"vscode-remote://127.0.0.1:35477/p": hook.DEFAULT_PROFILE_ID}, dirs_path=dirs, authority="127.0.0.1:35477") == {}
 
         # --- the record: upsert by path, atomic file, read-back ---
         record_path = os.path.join(tmp, "profile-associations.json")
         assert hook._read_associations(record_path) == {}
         record, changed = hook._record_associations({"/a": "-1180f179", "/b": hook.DEFAULT_PROFILE_ID}, record_path)
-        assert changed == 2 and record == {"/a": "-1180f179", "/b": hook.DEFAULT_PROFILE_ID}
+        assert changed == 1 and record == {"/a": "-1180f179"}, "a Default is never recorded"
         record, changed = hook._record_associations({"/a": "-1180f179"}, record_path)
         assert changed == 0, "an unchanged report writes nothing"
         record, changed = hook._record_associations({"/a": "4b57311b"}, record_path)
-        assert changed == 1 and record == {"/a": "4b57311b", "/b": hook.DEFAULT_PROFILE_ID}, "another browser's choice updates the path, others stay"
+        assert changed == 1 and record == {"/a": "4b57311b"}, "another browser's choice updates the path"
+        hook._record_associations({"/c": "-1180f179"}, record_path)
+        # A record written by an earlier version may hold Defaults: they are purged on the next write.
+        with open(record_path, "w", encoding="utf-8") as fh:
+            json.dump({"workspaces": {"/a": "4b57311b", "/old": hook.DEFAULT_PROFILE_ID, "/c": "-1180f179"}}, fh)
+        record, changed = hook._record_associations({}, record_path)
+        assert changed == 0 and record == {"/a": "4b57311b", "/c": "-1180f179"}, "stale Defaults go even when the report changes nothing"
+        record, _ = hook._record_associations({"/c": "4b57311b"}, record_path)
+        assert record == {"/a": "4b57311b", "/c": "4b57311b"}
+        # `cleared`: a folder the user switched back to Default in a live document leaves the record.
+        record, changed = hook._record_associations({}, record_path, cleared=["/a", "/never"])
+        assert changed == 0 and record == {"/c": "4b57311b"}, record
+        record, changed = hook._record_associations({"/a": "-1180f179"}, record_path, cleared=["/a"])
+        assert record == {"/c": "4b57311b"}, "a folder both reported and cleared stays cleared"
         assert hook._read_associations(record_path) == record
         assert not os.path.exists(record_path + ".tmp")
         with open(record_path, "w", encoding="utf-8") as fh:
@@ -126,7 +149,15 @@ def main():
         hook._record_associations({folder_a: "-1180f179", folder_b: hook.DEFAULT_PROFILE_ID,
                                    os.path.join(tmp, "missing"): "-1180f179", "/also": "feedbeef"}, record_path)
         shipped = hook._recorded_associations(record_path, dirs)
-        assert shipped == {folder_a: "-1180f179", folder_b: hook.DEFAULT_PROFILE_ID}, shipped
+        assert shipped == {folder_a: "-1180f179"}, (shipped, "a Default is never shipped")
+        # A .code-workspace FILE is a workspace too (the record is rewritten: the cap test above filled it).
+        ws_file = os.path.join(tmp, "proj.code-workspace")
+        with open(ws_file, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        with open(record_path, "w", encoding="utf-8") as fh:
+            json.dump({"workspaces": {folder_a: "-1180f179", ws_file: "-1180f179", os.path.join(tmp, "gone.code-workspace"): "-1180f179"}}, fh)
+        shipped = hook._recorded_associations(record_path, dirs)
+        assert shipped == {folder_a: "-1180f179", ws_file: "-1180f179"}, shipped
 
         # --- the routes ---
         os.remove(record_path)
@@ -139,11 +170,20 @@ def main():
         assert status == 400, "an oversized report is refused before any work"
         hook.PROFILE_DIRS_PATH = dirs
         reply = hook._associations_set(_Request({"workspaces": reported}))
-        assert reply["ok"] and reply["accepted"] == 2 and reply["changed"] == 2, reply
-        assert reply["workspaces"] == {folder_a: "-1180f179", folder_b: hook.DEFAULT_PROFILE_ID}
+        assert reply["ok"] and reply["accepted"] == 1 and reply["changed"] == 1, reply
+        assert reply["workspaces"] == {folder_a: "-1180f179"}
         assert hook._associations_get(None)["workspaces"] == reply["workspaces"]
         reply = hook._associations_set(_Request({"workspaces": reported}))
         assert reply["changed"] == 0
+        # The route's pin authority is the dashboard host the browser used (its Host header), not the engine's.
+        class _HostRequest(_Request):
+            headers = {"Host": "localhost:5480"}
+        two_hosts = {"vscode-remote://localhost:5480" + folder_a.replace(" ", "%20"): "4b57311b",
+                     "vscode-remote://127.0.0.1:35477" + folder_a.replace(" ", "%20"): "-1180f179"}
+        reply = hook._associations_set(_HostRequest({"workspaces": two_hosts}))
+        assert reply["workspaces"][folder_a] == "4b57311b", reply
+        reply = hook._associations_set(_HostRequest({"workspaces": {}, "cleared": ["vscode-remote://localhost:5480" + folder_a.replace(" ", "%20"), "not a path", 7]}))
+        assert reply["cleared"] == 1 and folder_a not in reply["workspaces"], reply
 
         # --- the injection: placement, idempotency, escaping ---
         html = "<html><head><title>x</title></head><body></body></html>"
@@ -180,6 +220,7 @@ for (const c of cases) {
   const ctx = { localStorage: { getItem: (k) => (k in ls ? ls[k] : null), setItem: (k, v) => { ls[k] = v; } },
                 document: { getElementById: (id) => (id === "vscode-workbench-web-configuration" ? meta : null) },
                 JSON, Array, Object, String, encodeURIComponent, decodeURIComponent };
+  if (c.host !== undefined) ctx.location = { host: c.host };  // the page's own address: what the workbench keys with
   vm.runInNewContext(c.body, ctx);
   out.push(ls.profileAssociations === undefined ? null : JSON.parse(ls.profileAssociations));
 }
@@ -194,65 +235,90 @@ process.stdout.write(JSON.stringify(out));
 
             def seed(record, authority):
                 if authority is None:  # the injector reads None as "from the engine state": build the bare script instead
-                    s = hook.PROFILE_ASSOCIATION_SEED_SCRIPT % (json.dumps(record), "null", hook.DEFAULT_PROFILE_ID)
+                    s = hook.PROFILE_ASSOCIATION_SEED_SCRIPT % (json.dumps(record), "null", hook.DEFAULT_PROFILE_ID, hook.DEFAULT_PROFILE_ID)
                 else:
                     s = hook._inject_association_seed(html, record, authority)
                 s = s[s.index('<script id="kirocrew-ide-associations">'):]
                 return s[s.index(">") + 1:s.index("</script>")]
 
+            # The page's own host is what the workbench keys associations with (openvscode's
+            # workbench.ts builds the folder URI from window.location.host); the configuration
+            # meta's remoteAuthority is the engine's own 127.0.0.1:<port> and is NOT the key
+            # (2026-11-06: keys vscode-remote://localhost:5480/…, meta 127.0.0.1:35477).
+            HOST = "localhost:5480"
+            key_host = "vscode-remote://" + HOST + folder_a.replace(" ", "%20")
+            key_b_host = "vscode-remote://" + HOST + folder_b
+            key_engine = "vscode-remote://127.0.0.1:35477" + folder_a.replace(" ", "%20")   # what the 0.25-0.30.5 seeds wrote: never read
             cases = [
-                # (label, body, meta, localStorage, expected workspaces)
-                ("empty browser: the record is seeded under the meta's authority",
+                # (label, body, meta, localStorage, expected workspaces, location.host)
+                ("empty browser: the record is seeded under the PAGE's host, not the meta's authority",
                  seed({folder_a: "-1180f179"}, "127.0.0.1:9"), meta_now, {"userDataProfiles": json.dumps([work])},
-                 {key_now: "-1180f179"}),
-                ("no meta: the embedded authority is used",
+                 {key_host: "-1180f179"}, HOST),
+                ("no location.host: the meta's authority is the fallback",
+                 seed({folder_a: "-1180f179"}, "127.0.0.1:35476"), meta_now, {"userDataProfiles": json.dumps([work])},
+                 {key_now: "-1180f179"}, None),
+                ("no location.host and no meta: the embedded authority",
                  seed({folder_a: "-1180f179"}, "127.0.0.1:35476"), None, {"userDataProfiles": json.dumps([work])},
-                 {key_now: "-1180f179"}),
-                ("no meta and no authority: nothing written",
+                 {key_now: "-1180f179"}, None),
+                ("nothing to key with: nothing written",
                  seed({folder_a: "-1180f179"}, None), None, {"userDataProfiles": json.dumps([work])},
-                 None),
-                ("the browser's own choice for the folder wins over the record",
+                 None, None),
+                ("the browser's own real choice for the folder wins over the record",
                  seed({folder_a: "-1180f179"}, "127.0.0.1:35476"), meta_now,
-                 {"userDataProfiles": json.dumps([work, other]), "profileAssociations": json.dumps({"workspaces": {key_now: "4b57311b"}})},
-                 {key_now: "4b57311b"}),
-                ("an explicit Default in the browser is a choice too",
+                 {"userDataProfiles": json.dumps([work, other]), "profileAssociations": json.dumps({"workspaces": {key_host: "4b57311b"}})},
+                 {key_host: "4b57311b"}, HOST),
+                ("a Default under the page's host is not a choice: the record's real profile replaces it",
                  seed({folder_a: "-1180f179"}, "127.0.0.1:35476"), meta_now,
-                 {"userDataProfiles": json.dumps([work]), "profileAssociations": json.dumps({"workspaces": {key_now: hook.DEFAULT_PROFILE_ID}})},
-                 {key_now: hook.DEFAULT_PROFILE_ID}),
-                ("a choice keyed with an earlier engine port is copied to the current one (and beats the record)",
-                 seed({folder_a: "-1180f179"}, "127.0.0.1:35476"), meta_now,
-                 {"userDataProfiles": json.dumps([work, other]), "profileAssociations": json.dumps({"workspaces": {key_old: "4b57311b"}})},
-                 {key_old: "4b57311b", key_now: "4b57311b"}),
+                 {"userDataProfiles": json.dumps([work]), "profileAssociations": json.dumps({"workspaces": {key_host: hook.DEFAULT_PROFILE_ID}})},
+                 {key_host: "-1180f179"}, HOST),
+                ("the 2026-11-06 repair: a real profile this browser holds under the engine authority an earlier seed wrote comes back under the page's host; the dead key goes",
+                 seed({}, "127.0.0.1:35477"), meta_now,
+                 {"userDataProfiles": json.dumps([work, other]), "profileAssociations": json.dumps({"workspaces": {key_host: hook.DEFAULT_PROFILE_ID, key_engine: "4b57311b"}})},
+                 {key_host: "4b57311b"}, HOST),
                 ("a recorded profile this browser does not list is skipped",
                  seed({folder_a: "feedbeef", folder_b: "-1180f179"}, "127.0.0.1:35476"), meta_now, {"userDataProfiles": json.dumps([work])},
-                 {key_b_now: "-1180f179"}),
-                ("a recorded Default is seeded (it stops the new-window profile for that folder)",
+                 {key_b_host: "-1180f179"}, HOST),
+                ("a recorded Default is NOT seeded (the workbench writes its own; seeding one blocked the new-window profile)",
                  seed({folder_b: hook.DEFAULT_PROFILE_ID}, "127.0.0.1:35476"), meta_now, {"userDataProfiles": json.dumps([work])},
-                 {key_b_now: hook.DEFAULT_PROFILE_ID}),
+                 None, HOST),
+                ("a Default under another authority alone is not copied",
+                 seed({}, "127.0.0.1:35476"), meta_now,
+                 {"userDataProfiles": json.dumps([work]), "profileAssociations": json.dumps({"workspaces": {key_engine: hook.DEFAULT_PROFILE_ID}})},
+                 {key_engine: hook.DEFAULT_PROFILE_ID}, HOST),
                 ("other entries and emptyWindows survive",
                  seed({folder_a: "-1180f179"}, "127.0.0.1:35476"), meta_now,
-                 {"userDataProfiles": json.dumps([work]), "profileAssociations": json.dumps({"workspaces": {key_b_now: "-1180f179"}, "emptyWindows": {"w1": "-1180f179"}})},
-                 {key_b_now: "-1180f179", key_now: "-1180f179"}),
+                 {"userDataProfiles": json.dumps([work]), "profileAssociations": json.dumps({"workspaces": {key_b_host: "-1180f179"}, "emptyWindows": {"w1": "-1180f179"}})},
+                 {key_b_host: "-1180f179", key_host: "-1180f179"}, HOST),
                 ("corrupt map: replaced by the seed",
                  seed({folder_a: "-1180f179"}, "127.0.0.1:35476"), meta_now,
                  {"userDataProfiles": json.dumps([work]), "profileAssociations": "{nope"},
-                 {key_now: "-1180f179"}),
+                 {key_host: "-1180f179"}, HOST),
                 ("nothing recorded, nothing stale: the map is left alone",
                  seed({}, "127.0.0.1:35476"), meta_now, {"userDataProfiles": json.dumps([work])},
-                 None),
+                 None, HOST),
+                ("without the page's host (fallback authority) a copy is made but nothing is dropped: a guess must not delete",
+                 seed({}, "127.0.0.1:35476"), None,
+                 {"userDataProfiles": json.dumps([work, other]), "profileAssociations": json.dumps({"workspaces": {key_old: "4b57311b"}})},
+                 {key_old: "4b57311b", key_now: "4b57311b"}, None),
+                ("a real profile under the page's host is kept over anything elsewhere; the stale copies go",
+                 seed({}, "127.0.0.1:35476"), meta_now,
+                 {"userDataProfiles": json.dumps([work, other]), "profileAssociations": json.dumps({"workspaces": {key_host: "-1180f179", key_engine: "4b57311b", key_old: hook.DEFAULT_PROFILE_ID}})},
+                 {key_host: "-1180f179"}, HOST),
             ]
             paths = {}
             for fname, text in (("run.js", runner),
-                                ("cases.json", json.dumps([{"body": b, "meta": m, "ls": ls} for _, b, m, ls, _ in cases]))):
+                                ("cases.json", json.dumps([{"body": b, "meta": m, "ls": ls, "host": h} for _, b, m, ls, _, h in cases]))):
                 paths[fname] = os.path.join(tmp, fname)
                 with open(paths[fname], "w", encoding="utf-8") as fh:
                     fh.write(text)
             res = subprocess.run([node, paths["run.js"], paths["cases.json"]], check=True, capture_output=True, text=True)
             results = json.loads(res.stdout)
-            for (label, _, _, _, expected), got in zip(cases, results):
+            for (label, _, _, _, expected, _), got in zip(cases, results):
                 workspaces = got.get("workspaces") if isinstance(got, dict) else got
                 assert workspaces == expected, "%s: %r, expected %r" % (label, workspaces, expected)
-            assert results[8]["emptyWindows"] == {"w1": "-1180f179"}
+            assert results[[c[0] for c in cases].index("other entries and emptyWindows survive")]["emptyWindows"] == {"w1": "-1180f179"}
+            # The old keys the seed used to write are gone from the repaired browser.
+            assert key_engine not in results[[c[0] for c in cases].index("the 2026-11-06 repair: a real profile this browser holds under the engine authority an earlier seed wrote comes back under the page's host; the dead key goes")]["workspaces"]
             print("seed script merges the record and migrates stale ports (%d cases, node)" % len(cases))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -129,6 +129,9 @@ PRESETS = {
 # with --extensions-dir; the engine's own user data dir is untouched.
 EXTENSIONS_DIR = "extensions"
 EXTENSION_SRC = "extension"
+PREVIEW_SRC = "preview"
+#: Shipped extensions, provisioned together: the bridge (browser host) and the spec preview (engine host).
+EXTENSION_SRCS = (EXTENSION_SRC, PREVIEW_SRC)
 
 # Auto-install source: openvscode-server GitHub releases (MIT). All hosts here
 # are declared in the manifest's network.hosts[]; every request is https and
@@ -215,13 +218,26 @@ def _mod_dir():
 
 
 def _provision_extension():
-    """Copy extension/ into <data>/extensions as an unpacked VS Code extension; returns the extensions dir or None.
+    """Copy the shipped extensions into <data>/extensions as unpacked VS Code extensions; returns the extensions dir or None.
 
-    Older copies of the same extension are removed so the workbench never sees
-    two versions. Any failure is logged and skipped: the IDE must still start
-    without its bridge.
+    Two extensions ship: `extension/` (the bridge: chat, specs, approvals; a
+    `web` extension, it runs in the browser's extension host so it can reach
+    the dashboard with the browser's own session) and `preview/` (the spec
+    preview: a `workspace` extension that runs in the engine's host, the only
+    place the built-in markdown extension picks markdown-it plugins up from).
+    Older copies of each are removed so the workbench never sees two versions.
+    Any failure is logged and skipped: the IDE must still start without them.
     """
-    src = os.path.join(_mod_dir(), EXTENSION_SRC)
+    root = None
+    for src_dir in EXTENSION_SRCS:
+        provisioned = _provision_one(src_dir)
+        if provisioned and src_dir == EXTENSION_SRC:
+            root = provisioned
+    return root
+
+
+def _provision_one(src_dir):
+    src = os.path.join(_mod_dir(), src_dir)
     manifest_path = os.path.join(src, "package.json")
     if not os.path.isfile(manifest_path):
         return None
@@ -239,40 +255,132 @@ def _provision_extension():
         if os.path.isdir(target):
             shutil.rmtree(target, ignore_errors=True)
         shutil.copytree(src, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "node_modules", ".git"))
+        _vendor_into(target)
         _register_extension(root, "%s.%s" % (publisher, name), version, target)
-        _ctx.log.info("bridge extension provisioned: %s", target)
+        _ctx.log.info("%s extension provisioned: %s", "bridge" if src_dir == EXTENSION_SRC else "spec-preview", target)
         return root
-    except Exception as error:  # noqa: BLE001 — the IDE starts without its bridge
-        _ctx.log.warning("bridge extension not provisioned: %s", error)
+    except Exception as error:  # noqa: BLE001 — the IDE starts without this extension
+        _ctx.log.warning("%s extension not provisioned: %s", "bridge" if src_dir == EXTENSION_SRC else "spec-preview", error)
         return None
 
 
 def _reregister_extension():
-    """Rewrite our extensions.json entry for the copy ALREADY on disk; the folder is not touched.
+    """Rewrite our extensions.json entries for the copies ALREADY on disk; the folders are not touched.
 
     For a running engine the hook adopts (a Loader reload, a mod update): the
-    engine keeps serving webview resources out of the provisioned folder, so it
-    must not be re-copied under it, but a registry fix — 0.14.2's
+    engine keeps serving webview resources out of the provisioned folders, so
+    they must not be re-copied under it, but a registry fix — 0.14.2's
     application scope — should reach the engine without a Stop/Start. Returns
-    True when an entry was written.
+    True when at least one entry was written.
     """
-    src = os.path.join(_mod_dir(), EXTENSION_SRC)
-    manifest_path = os.path.join(src, "package.json")
-    if not os.path.isfile(manifest_path):
-        return False
+    written = False
+    for src_dir in EXTENSION_SRCS:
+        manifest_path = os.path.join(_mod_dir(), src_dir, "package.json")
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            publisher, name, version = manifest["publisher"], manifest["name"], manifest["version"]
+            root = os.path.join(str(_ctx.data_dir), EXTENSIONS_DIR)
+            target = os.path.join(root, "%s.%s-%s" % (publisher, name, version))
+            if not os.path.isdir(target):
+                continue
+            _register_extension(root, "%s.%s" % (publisher, name), version, target)
+            written = True
+        except Exception as error:  # noqa: BLE001 — the next start re-provisions anyway
+            _ctx.log.warning("%s extension not re-registered: %s", src_dir, error)
+    return written
+
+
+#: Mermaid for the built-in preview AND the spec editor. Kiro's design.md is full
+#: of ```mermaid fences; the engine has no renderer for them. The mod does not
+#: ship the library (3.5 MB) but fetches ONE pinned, checksum-verified build the
+#: first time an engine starts, keeps it under <data>/vendor and copies it into
+#: both provisioned extensions as media/mermaid.min.js, where the spec editor's
+#: webview and the preview extension's script load it. `mermaid.enabled: false`
+#: in the mod config skips all of it; offline, the start goes on without diagrams
+#: and the fetch is retried at the next start.
+MERMAID_VERSION = "11.17.2"
+MERMAID_SHA256 = "581ed7d74bd9048d0e3a91363927d72ef22942d7722546b27f7cc29e35390eb8"
+MERMAID_URL = "https://cdn.jsdelivr.net/npm/mermaid@{version}/dist/mermaid.min.js"
+MERMAID_FILE = "mermaid.min.js"
+VENDOR_DIR = "vendor"
+_mermaid = {"present": False, "version": None, "note": "not checked yet"}
+
+
+def _mermaid_enabled():
+    config = getattr(_ctx, "config", None) if _ctx else None
+    value = config.get("mermaid.enabled") if hasattr(config, "get") else None
+    return True if value is None else bool(value)
+
+
+def _mermaid_path():
+    return os.path.join(str(_ctx.data_dir), VENDOR_DIR, "mermaid-%s.min.js" % MERMAID_VERSION)
+
+
+def _ensure_mermaid(fetch=None):
+    """Make sure the pinned mermaid build is in <data>/vendor; never fails the engine start.
+
+    `fetch(url) -> bytes` is replaceable for tests; the default goes through the
+    manifest-allowlisted fetcher. The file is written only when its SHA-256
+    matches the pin, so a tampered or truncated download is never installed.
+    """
+    if not _mermaid_enabled():
+        _mermaid.update(present=False, version=None, note="disabled (mermaid.enabled is false)")
+        return None
+    path = _mermaid_path()
+    if os.path.isfile(path):
+        _mermaid.update(present=True, version=MERMAID_VERSION, note="vendored")
+        return path
+    try:
+        if fetch is None:
+            def fetch(url):
+                with _open_checked(url, timeout=90) as reply:
+                    return reply.read()
+        data = fetch(MERMAID_URL.format(version=MERMAID_VERSION))
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != MERMAID_SHA256:
+            raise RuntimeError("checksum mismatch (%s…)" % digest[:12])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".part"
+        with open(tmp, "wb") as out:
+            out.write(data)
+        os.replace(tmp, path)
+        _mermaid.update(present=True, version=MERMAID_VERSION, note="downloaded")
+        _ctx.log.info("mermaid %s vendored (%d bytes)", MERMAID_VERSION, len(data))
+        return path
+    except Exception as error:  # noqa: BLE001 — recorded, retried next start
+        _mermaid.update(present=False, version=None, note="download failed: %s" % (str(error) or type(error).__name__)[:200])
+        _ctx.log.warning("mermaid not vendored: %s", error)
+        return None
+
+
+def _vendor_into(target):
+    """Copy the vendored mermaid into a provisioned extension's media/; drop the preview script entry when absent.
+
+    The preview extension lists media/mermaid.min.js among its preview scripts;
+    without the file the workbench would log a 404 for it on every preview, so
+    the entry is removed from the provisioned copy's manifest instead.
+    """
+    src = _mermaid_path() if _mermaid_enabled() else None
+    media = os.path.join(target, "media")
+    if src and os.path.isfile(src):
+        os.makedirs(media, exist_ok=True)
+        shutil.copyfile(src, os.path.join(media, MERMAID_FILE))
+        return True
+    manifest_path = os.path.join(target, "package.json")
     try:
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
-        publisher, name, version = manifest["publisher"], manifest["name"], manifest["version"]
-        root = os.path.join(str(_ctx.data_dir), EXTENSIONS_DIR)
-        target = os.path.join(root, "%s.%s-%s" % (publisher, name, version))
-        if not os.path.isdir(target):
-            return False
-        _register_extension(root, "%s.%s" % (publisher, name), version, target)
-        return True
-    except Exception as error:  # noqa: BLE001 — the next start re-provisions anyway
-        _ctx.log.warning("bridge extension not re-registered: %s", error)
-        return False
+        scripts = (manifest.get("contributes") or {}).get("markdown.previewScripts")
+        if isinstance(scripts, list) and any(MERMAID_FILE in str(x) for x in scripts):
+            manifest["contributes"]["markdown.previewScripts"] = [x for x in scripts if MERMAID_FILE not in str(x)]
+            with open(manifest_path, "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, indent=2)
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 #: Machine-scope settings the engine starts with. The Machine layer sits BELOW
@@ -482,10 +590,37 @@ PORT_SCAN = 10
 def _port_free(port):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            # Node's listener binds with SO_REUSEADDR (libuv's default on Unix), so a
+            # port whose last engine left connections in TIME_WAIT is free for the
+            # engine; probe the same way, or the leftovers push it to the next port.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("127.0.0.1", port))
             return True
     except OSError:
         return False
+
+
+#: How long a relaunch waits for the stopped engine's port to come back. The
+#: engine is `sh` wrapping `node`; `_stop` watches the wrapper's pid, which dies
+#: at once on SIGTERM while node is still closing its listener and extension
+#: hosts, so the port read busy ~250 ms later and `_pick_port` moved to the next
+#: one. That flipped the engine between 35476 and 35477 on EVERY relaunch (each
+#: new bridge version relaunches), and the workbench keys which profile a
+#: folder opens in by `vscode-remote://127.0.0.1:<port>/<folder>`: every other
+#: relaunch brought back the other port's stale entries, so a folder given a
+#: profile on one port opened in Default on the other (2026-11-05).
+PORT_RELEASE_WAIT = 5.0
+
+
+def _wait_port_free(port, timeout=None):
+    """True once `port` can be bound, polling up to `timeout` seconds (PORT_RELEASE_WAIT)."""
+    deadline = time.time() + (PORT_RELEASE_WAIT if timeout is None else timeout)
+    while True:
+        if _port_free(port):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _pick_port():
@@ -495,6 +630,11 @@ def _pick_port():
         if not _port_free(port):
             raise RuntimeError("configured engine.port %d is in use" % port)
         return port
+    # A relaunch keeps the port the engine had, so the workbench's remoteAuthority
+    # (and every association keyed with it) stays put.
+    last = _ctx.state.get("last_port") if isinstance(getattr(_ctx, "state", None), dict) else None
+    if last and _wait_port_free(int(last)):
+        return int(last)
     for port in range(PORT_BASE, PORT_BASE + PORT_SCAN):
         if _port_free(port):
             return port
@@ -811,6 +951,7 @@ def _status(_request):
         "health": _engine_health(state) if state else {"stuck": False, "reason": None, "silentBridges": 0, "aliveAt": None, "lastConnection": None, "lastServe": None},
         "heapMb": _engine_heap_mb(),
         "gallery": _gallery_status(),
+        "mermaid": dict(_mermaid),
         "proxy": {
             "registered": _proxy_registered(),
             "base": PROXY_BASE,
@@ -899,6 +1040,7 @@ def _start(request):
     # proxy path; without it, it serves from its own root on the direct port.
     proxied = _proxy_registered()
     basepath = "--server-base-path " + PROXY_BASE if proxied else ""
+    _ensure_mermaid()  # one pinned download, then copied into the provisioned extensions
     extensions_dir = _provision_extension()
     extensions = "--extensions-dir " + shlex.quote(extensions_dir) if extensions_dir else ""
     _seed_machine_settings()
@@ -1000,6 +1142,13 @@ def _stop(_request):
                 os.killpg(int(pid), signal.SIGKILL)
             except OSError:
                 pass
+    # The wrapper is gone; node, which holds the listener, may not be. Wait for the
+    # port so the relaunch can take it again, and remember it for `_pick_port`.
+    port = state.get("port")
+    if port:
+        if not _wait_port_free(int(port)):
+            _ctx.log.warning("engine port %s still busy %.0fs after the stop; the relaunch may move", port, PORT_RELEASE_WAIT)
+        _ctx.state["last_port"] = int(port)
     _clear_state()
     _ctx.state.pop("server", None)
     _ctx.log.info("engine stopped (pid=%s)", pid)
@@ -1717,12 +1866,26 @@ def _inject_activity_order(html):
 #: the browser's own entry for a folder always wins there too.
 PROFILE_STORAGE_PATH = os.path.expanduser("~/.openvscode-server/data/User/globalStorage/storage.json")
 PROFILE_DIRS_PATH = os.path.expanduser("~/.openvscode-server/data/User/profiles")
+#: The browser service stores a profile's `location` as the JSON of a URI
+#: (`{"$mid":1,"scheme":"vscode-userdata","path":"/User/profiles/<id>"}`:
+#: `URI.toJSON`, revived by `$mid` on read). The server's storage.json keeps the
+#: bare id instead, and until 0.30.6 the seed copied THAT shape into the browser
+#: list. The engine's loader runs `extUri.dirname(location)` on every stored
+#: entry and aborts the whole list at the first string ("Cannot read properties
+#: of undefined (reading 'length') at dirname … at get profiles"); its own
+#: "removing invalid stored profiles" pass fails on the same error, and the next
+#: save writes the truncated list back. In a browser whose list the seed had
+#: filled, the engine saw NO profiles: every folder booted into Default, the
+#: picker was empty, and `userDataProfiles` ended up `[]` (2026-11-06, seen in
+#: the user's console). The seed now writes the URI shape and repairs entries
+#: already stored as strings or as objects without `$mid`.
+PROFILE_LOCATION_SCHEME = "vscode-userdata"
+PROFILE_LOCATION_DIR = "/User/profiles"
 PROFILE_SEED_SCRIPT = """<script id="kirocrew-ide-profiles">
 (function () {
   var MIRROR = %s;
-  if (!MIRROR.length) return;
   try {
-    var KEY = "userDataProfiles";
+    var KEY = "userDataProfiles", SCHEME = "%s", DIR = "%s";
     var list = [];
     try { list = JSON.parse(localStorage.getItem(KEY) || "[]") || []; } catch (e) { list = []; }
     if (!Array.isArray(list)) list = [];
@@ -1731,15 +1894,28 @@ PROFILE_SEED_SCRIPT = """<script id="kirocrew-ide-profiles">
       var s = typeof loc === "string" ? loc : (loc && (loc.path || loc.external)) || "";
       return s.replace(/\\/+$/, "").split("/").pop() || null;
     };
+    // The shape the browser service writes (URI.toJSON): $mid 1 is what revives it on read.
+    var locationOf = function (id) { return { $mid: 1, scheme: SCHEME, path: DIR + "/" + id }; };
+    var changed = 0;
+    // Repair what an earlier seed stored: a bare id, or a URI object without $mid (neither revives).
+    list.forEach(function (p) {
+      if (!p || typeof p !== "object") return;
+      var loc = p.location, i = idOf(p);
+      if (!i) return;
+      if (typeof loc === "string") { p.location = locationOf(i); changed++; }
+      else if (loc && typeof loc === "object" && loc.$mid !== 1) { p.location = { $mid: 1, scheme: loc.scheme || SCHEME, path: loc.path || (DIR + "/" + i) }; changed++; }
+    });
     var ids = {}, names = {};
     list.forEach(function (p) { var i = idOf(p); if (i) ids[i] = true; if (p && p.name) names[p.name] = true; });
-    var added = 0;
     MIRROR.forEach(function (p) {
       var i = idOf(p);
       if (!i || ids[i] || !p.name || names[p.name]) return;
-      list.push(p); ids[i] = true; names[p.name] = true; added++;
+      var entry = { location: locationOf(i), name: p.name };
+      if (p.icon) entry.icon = p.icon;
+      if (p.useDefaultFlags) entry.useDefaultFlags = p.useDefaultFlags;
+      list.push(entry); ids[i] = true; names[p.name] = true; changed++;
     });
-    if (added) localStorage.setItem(KEY, JSON.stringify(list));
+    if (changed) localStorage.setItem(KEY, JSON.stringify(list));
   } catch (e) { /* storage unavailable: the workbench boots with its own list */ }
 })();
 </script>"""
@@ -1786,11 +1962,12 @@ def _inject_profile_seed(html, profiles=None):
         return html
     if profiles is None:
         profiles = _mirrored_profiles()
-    if not profiles:
-        return html
+    # Injected even with nothing to add: the repair of entries an earlier seed
+    # stored in the server's shape needs no mirror.
     # The list lands inside a <script>: keep "</" out of the JSON text.
-    payload = json.dumps(profiles, separators=(",", ":")).replace("</", "<\\/")
-    return html.replace("</head>", (PROFILE_SEED_SCRIPT % payload) + "</head>", 1)
+    payload = json.dumps(profiles or [], separators=(",", ":")).replace("</", "<\\/")
+    script = PROFILE_SEED_SCRIPT % (payload, PROFILE_LOCATION_SCHEME, PROFILE_LOCATION_DIR)
+    return html.replace("</head>", script + "</head>", 1)
 
 
 #: WHICH PROFILE A FOLDER OPENS IN is browser state too — localStorage
@@ -1822,16 +1999,26 @@ _PROFILE_ID_RE = re.compile(r"^-?[0-9a-f]{1,16}$")
 PROFILE_ASSOCIATION_SEED_SCRIPT = """<script id="kirocrew-ide-associations">
 (function () {
   var RECORD = %s;            // {"<abs folder path>": "<profile id>"} as the host recorded it
-  var ENGINE_AUTHORITY = %s;  // "127.0.0.1:<port>", the authority the workbench will key new entries with
+  var ENGINE_AUTHORITY = %s;  // "127.0.0.1:<port>": the engine's own address, a last-resort fallback only
   try {
-    // The workbench's own remoteAuthority is in its configuration meta, written by the engine
-    // from the Host it saw; the embedded one is the same value computed host-side (fallback).
-    var authority = null;
-    try {
-      var meta = document.getElementById("vscode-workbench-web-configuration");
-      var cfg = meta ? JSON.parse(meta.getAttribute("data-settings") || "{}") : null;
-      authority = (cfg && typeof cfg.remoteAuthority === "string" && cfg.remoteAuthority) || null;
-    } catch (e) { authority = null; }
+    // The workbench keys a folder's association by the URI it builds from the page's
+    // own address: vscode-remote://<location.host>/<folder> (openvscode's workbench.ts
+    // uses window.location.host for the folder URI). NOT the configuration meta's
+    // remoteAuthority: the proxy drops the browser's Host, so the engine writes its
+    // own 127.0.0.1:<port> there, and a seed keyed on that (0.25.0 - 0.30.5) wrote
+    // entries the workbench never read and, from 0.30.4, moved the real ones there
+    // and pruned them: a folder switched to a profile booted into Default on the
+    // next reload (2026-11-06, keys vscode-remote://localhost:5480/… vs meta
+    // 127.0.0.1:35477).
+    var authority = (typeof location !== "undefined" && location.host) || null;
+    var cfgAuthority = !!authority;  // true: the authority is the one the workbench will use, so stale copies may be dropped
+    if (!authority) {
+      try {
+        var meta = document.getElementById("vscode-workbench-web-configuration");
+        var cfg = meta ? JSON.parse(meta.getAttribute("data-settings") || "{}") : null;
+        authority = (cfg && typeof cfg.remoteAuthority === "string" && cfg.remoteAuthority) || null;
+      } catch (e) { authority = null; }
+    }
     authority = authority || ENGINE_AUTHORITY;
     if (!authority) return;
     var KEY = "profileAssociations";
@@ -1861,21 +2048,41 @@ PROFILE_ASSOCIATION_SEED_SCRIPT = """<script id="kirocrew-ide-associations">
       return slash >= 0 ? rest.slice(0, slash) : rest;
     };
     var keyFor = function (path) { return "vscode-remote://" + authority + path.split("/").map(encodeURIComponent).join("/"); };
-    var current = {}, elsewhere = {};  // path -> id: under the current authority / under any other
+    var DEFAULT = "%s";
+    var current = {}, elsewhere = {}, stale = {};  // path -> id under the current authority / under any other; path -> [keys] under others
     Object.keys(workspaces).forEach(function (key) {
       var path = pathOf(key);
       if (!path || typeof workspaces[key] !== "string") return;
-      if (authorityOf(key) === authority) current[path] = workspaces[key];
-      else if (!(path in elsewhere)) elsewhere[path] = workspaces[key];
+      if (authorityOf(key) === authority) { current[path] = workspaces[key]; return; }
+      // Several earlier ports: a real profile beats a Default (the workbench writes
+      // Default itself on the first boot of a folder with no entry).
+      if (!(path in elsewhere) || (elsewhere[path] === DEFAULT && workspaces[key] !== DEFAULT)) elsewhere[path] = workspaces[key];
+      (stale[path] = stale[path] || []).push(key);
     });
     var added = 0;
+    // A Default is never seeded and never defended: the workbench writes it itself on every
+    // boot of a folder with no entry, so one is not a choice. A real profile — this browser's
+    // own under another authority, or another client's as the host recorded it — replaces a
+    // current Default; a real profile already current is left alone. (A folder switched back
+    // to Default on purpose clears the host record through the layer's `cleared` report, so
+    // the record does not bring the old profile back.)
     var put = function (path, id) {
-      if (!known[id] || (path in current) || path.charAt(0) !== "/") return;
+      if (id === DEFAULT || !known[id] || path.charAt(0) !== "/") return;
+      if (path in current && current[path] !== DEFAULT) return;
       workspaces[keyFor(path)] = id; current[path] = id; added++;
     };
-    Object.keys(elsewhere).forEach(function (path) { put(path, elsewhere[path]); });  // this browser's choice, keyed with an earlier engine port
+    Object.keys(elsewhere).forEach(function (path) { put(path, elsewhere[path]); });  // this browser's choice, keyed with another authority
     Object.keys(RECORD).forEach(function (path) { put(path, RECORD[path]); });         // choices made in another client, recorded by the host
-    if (added) { assoc.workspaces = workspaces; localStorage.setItem(KEY, JSON.stringify(assoc)); }
+    // Once a path has its entry under the workbench's own authority, the copies under other
+    // authorities (the 127.0.0.1:<port> keys earlier seeds wrote) are dead weight that would
+    // come back on the next move: drop them. Only when the authority is the page's own
+    // (location.host); the fallbacks are guesses, and a guess must not delete anything.
+    var pruned = 0;
+    if (cfgAuthority) Object.keys(stale).forEach(function (path) {
+      if (!(path in current)) return;
+      stale[path].forEach(function (key) { delete workspaces[key]; pruned++; });
+    });
+    if (added || pruned) { assoc.workspaces = workspaces; localStorage.setItem(KEY, JSON.stringify(assoc)); }
   } catch (e) { /* storage unavailable: the workbench boots as before */ }
 })();
 </script>"""
@@ -1918,9 +2125,15 @@ def _normalise_associations(workspaces, dirs_path=None, authority=None):
     """A browser's association map -> {abs folder path: profile id}.
 
     Drops keys that name no absolute path and ids that are not a profile on
-    this host (the id must look like one and have its data folder, or be the
-    Default profile's). One path can sit under several authorities (an engine
-    relaunch moved the port): the entry under `authority` wins, else the last.
+    this host (the id must look like one and have its data folder). A Default
+    entry is dropped too: the web workbench writes the profile it booted into
+    for every folder on EVERY boot (web.main: `setProfileForWorkspace(workspace,
+    profile)` right after choosing it), so a folder's first boot in any browser
+    or under any engine port leaves `__default__profile__` behind, and that is
+    indistinguishable from a user choosing Default. Recording it carried the
+    auto-write to every other client (2026-11-05: the user's profile "gone" on
+    every reload). One path under several authorities (an engine relaunch moved
+    the port): the entry under `authority` wins, else the last.
     """
     dirs_path = dirs_path or PROFILE_DIRS_PATH
     out, pinned = {}, set()
@@ -1930,7 +2143,7 @@ def _normalise_associations(workspaces, dirs_path=None, authority=None):
         path = _uri_path(key)
         if not path:
             continue
-        if pid != DEFAULT_PROFILE_ID and not (_PROFILE_ID_RE.match(pid) and os.path.isdir(os.path.join(dirs_path, pid))):
+        if pid == DEFAULT_PROFILE_ID or not (_PROFILE_ID_RE.match(pid) and os.path.isdir(os.path.join(dirs_path, pid))):
             continue
         key_authority = _uri_authority(key)
         if path in pinned and key_authority != authority:
@@ -1952,12 +2165,17 @@ def _read_associations(path=None):
     return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(raw, dict) else {}
 
 
-def _record_associations(incoming, path=None):
-    """Merge {folder path: profile id} into the host's record (upsert by path). Returns (record, changed)."""
+def _record_associations(incoming, path=None, cleared=()):
+    """Merge {folder path: profile id} into the host's record (upsert by path); drop `cleared` folders. Returns (record, changed)."""
     target = path or _associations_path()
     record = _read_associations(target)
+    incoming = {k: v for k, v in incoming.items() if v != DEFAULT_PROFILE_ID and k not in set(cleared)}
+    stale = [k for k, v in record.items() if v == DEFAULT_PROFILE_ID]  # written by versions before 0.30.5
+    dropped = [k for k in cleared if k in record]
     changed = {k: v for k, v in incoming.items() if record.get(k) != v}
-    if changed:
+    if changed or stale or dropped:
+        for k in stale + dropped:
+            record.pop(k, None)
         record.update(incoming)
         if len(record) > PROFILE_ASSOCIATIONS_MAX:
             # Keep the newest: the ones just reported, then whatever fits.
@@ -1975,13 +2193,13 @@ def _record_associations(incoming, path=None):
 
 
 def _recorded_associations(path=None, dirs_path=None):
-    """The record as the seed ships it: folders that exist, profiles that still have their data folder."""
+    """The record as the seed ships it: workspaces that exist (a folder, or a .code-workspace file), profiles that still have their data folder; never a Default."""
     dirs_path = dirs_path or PROFILE_DIRS_PATH
     out = {}
     for folder, pid in _read_associations(path).items():
-        if not os.path.isdir(folder):
+        if not os.path.exists(folder):
             continue
-        if pid != DEFAULT_PROFILE_ID and not (_PROFILE_ID_RE.match(pid) and os.path.isdir(os.path.join(dirs_path, pid))):
+        if pid == DEFAULT_PROFILE_ID or not (_PROFILE_ID_RE.match(pid) and os.path.isdir(os.path.join(dirs_path, pid))):
             continue
         out[folder] = pid
     return out
@@ -1999,8 +2217,26 @@ def _associations_get(_request):
     return {"workspaces": _read_associations(), "authority": _engine_authority()}
 
 
+def _request_authority(request):
+    """The authority the reporting browser's workbench keys its associations with: the dashboard host it used (location.host)."""
+    headers = getattr(request, "headers", None) or {}
+    host = None
+    try:
+        host = headers.get("Host") or headers.get("host")
+    except Exception:  # noqa: BLE001
+        host = None
+    return host or _engine_authority()
+
+
 def _associations_set(request):
-    """POST profiles/associations {"workspaces": {"<folder uri>": "<profile id>"}} — a browser's map, merged by folder path."""
+    """POST profiles/associations {"workspaces": {"<folder uri>": "<profile id>"}, "cleared": ["<folder path>", …]}.
+
+    A browser's map, merged by folder path. `cleared` names folders the layer saw go
+    from a real profile to the Default profile in a live document — the one shape of
+    Default that IS a choice (the workbench's own auto-write only ever goes from no
+    entry to Default) — and those are dropped from the record so no seed brings the
+    old profile back.
+    """
     try:
         body = request.json() or {}
     except Exception:  # noqa: BLE001
@@ -2010,9 +2246,15 @@ def _associations_set(request):
         return (400, {"error": "workspaces must be an object of {\"<folder uri>\": \"<profile id>\"}"})
     if len(workspaces) > PROFILE_ASSOCIATIONS_MAX:
         return (400, {"error": "at most %d associations per report" % PROFILE_ASSOCIATIONS_MAX})
-    incoming = _normalise_associations(workspaces, authority=_engine_authority())
-    record, changed = _record_associations(incoming)
-    return {"ok": True, "workspaces": record, "accepted": len(incoming), "changed": changed}
+    cleared_raw = body.get("cleared") if isinstance(body, dict) else None
+    cleared = []
+    for item in (cleared_raw if isinstance(cleared_raw, list) else [])[:PROFILE_ASSOCIATIONS_MAX]:
+        path = _uri_path(item) if isinstance(item, str) else ""
+        if path:
+            cleared.append(path)
+    incoming = _normalise_associations(workspaces, authority=_request_authority(request))
+    record, changed = _record_associations(incoming, cleared=cleared)
+    return {"ok": True, "workspaces": record, "accepted": len(incoming), "changed": changed, "cleared": len(cleared)}
 
 
 def _inject_association_seed(html, record=None, authority=None):
@@ -2031,7 +2273,7 @@ def _inject_association_seed(html, record=None, authority=None):
         authority = _engine_authority()
     payload = json.dumps(record, separators=(",", ":")).replace("</", "<\\/")
     auth = json.dumps(authority).replace("</", "<\\/")
-    script = PROFILE_ASSOCIATION_SEED_SCRIPT % (payload, auth, DEFAULT_PROFILE_ID)
+    script = PROFILE_ASSOCIATION_SEED_SCRIPT % (payload, auth, DEFAULT_PROFILE_ID, DEFAULT_PROFILE_ID)
     return html.replace("</head>", script + "</head>", 1)
 
 
@@ -2073,11 +2315,19 @@ NEW_WINDOW_PROFILE_SCRIPT = """<script id="kirocrew-ide-new-window-profile">
     try { profiles = JSON.parse(localStorage.getItem("userDataProfiles") || "[]") || []; } catch (e) { profiles = []; }
     try { assoc = JSON.parse(localStorage.getItem("profileAssociations") || "{}") || {}; } catch (e) { assoc = {}; }
     var want = folder.replace(/\\/+$/, "");
-    var associated = Object.keys((assoc && assoc.workspaces) || {}).some(function (key) {
+    // A folder associated with a REAL profile keeps it. One associated with the Default
+    // profile does not count as chosen: the web workbench writes "__default__profile__"
+    // itself on every boot of a folder that has no entry (web.main's setProfileForWorkspace),
+    // so that entry says nothing about what the user wanted and, honoured, it switched every
+    // folder off "Use for New Windows" after its first boot (2026-11-05). The one casualty: a
+    // folder switched back to Default on purpose while the setting names a profile boots into
+    // that profile again; clear the setting to keep a folder in Default.
+    var wsmap = (assoc && assoc.workspaces) || {};
+    var associated = Object.keys(wsmap).some(function (key) {
       var path = key, at = key.indexOf("://");
       if (at >= 0) { var rest = key.slice(at + 3), slash = rest.indexOf("/"); path = slash >= 0 ? rest.slice(slash) : ""; }
       try { path = decodeURIComponent(path); } catch (e) { /* keep raw */ }
-      return path.replace(/\\/+$/, "") === want;
+      return path.replace(/\\/+$/, "") === want && wsmap[key] !== "__default__profile__";
     });
     if (associated) return;  // the user chose a profile for this folder: that wins
     var known = function (name) { return !!name && profiles.some(function (p) { return p && p.name === name; }); };
@@ -2133,6 +2383,60 @@ def _inject_new_window_profile(html):
     if 'id="kirocrew-ide-new-window-profile"' in html or "</head>" not in html:
         return html
     return html.replace("</head>", NEW_WINDOW_PROFILE_SCRIPT + "</head>", 1)
+
+
+#: The command centre (the title bar's search pill) is sized by ONE stock rule in
+#: the engine's workbench.css: width 38vw, max-width 600px. Docked in the
+#: dashboard, and beside the layer's own bar in fullscreen, that is a lot of
+#: title bar for a box that shows "Search <folder>", so the served page carries
+#: a style that scales it (default: half). Same selector as the stock rule and
+#: later in the document, so it wins by source order; the layer measures
+#: .titlebar-center live, so its bar grows into the freed room by itself. The
+#: scale is a mod config key (COMMAND_CENTER_SCALE_KEY): 1 restores the stock
+#: width, anything below 0.25 is treated as 0.25 (the pill still needs to be a
+#: target). Nothing else of the chrome is touched.
+COMMAND_CENTER_SCALE_KEY = "command_center_scale"
+COMMAND_CENTER_SCALE_DEFAULT = 0.5
+COMMAND_CENTER_SCALE_MIN = 0.25
+COMMAND_CENTER_STOCK_VW = 38
+COMMAND_CENTER_STOCK_MAX_PX = 600
+CHROME_STYLE = """<style id="kirocrew-ide-chrome">
+.monaco-workbench .part.titlebar>.titlebar-container>.titlebar-center>.window-title>.command-center .action-item.command-center-center{width:%svw;max-width:%spx}
+</style>"""
+
+
+def _command_center_scale():
+    """The configured command-centre scale, clamped to [COMMAND_CENTER_SCALE_MIN, 1]."""
+    raw = _ctx.config.get(COMMAND_CENTER_SCALE_KEY) if _ctx else None
+    if raw is None:
+        return COMMAND_CENTER_SCALE_DEFAULT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return COMMAND_CENTER_SCALE_DEFAULT
+    if value != value:  # NaN
+        return COMMAND_CENTER_SCALE_DEFAULT
+    return min(1.0, max(COMMAND_CENTER_SCALE_MIN, value))
+
+
+def _chrome_style(scale=None):
+    """The <style> block for the given scale (None = configured); '' at stock width."""
+    scale = _command_center_scale() if scale is None else scale
+    if scale >= 1.0:
+        return ""
+    vw = ("%.4g" % (COMMAND_CENTER_STOCK_VW * scale)).rstrip("0").rstrip(".")
+    px = int(round(COMMAND_CENTER_STOCK_MAX_PX * scale))
+    return CHROME_STYLE % (vw, px)
+
+
+def _inject_chrome_style(html):
+    """Scale the command centre in the served workbench page. Idempotent; stock width = no-op."""
+    if 'id="kirocrew-ide-chrome"' in html or "</head>" not in html:
+        return html
+    style = _chrome_style()
+    if not style:
+        return html
+    return html.replace("</head>", style + "</head>", 1)
 
 
 #: The webview host page, served same-origin once _inject_webview_endpoint is in
@@ -2466,6 +2770,7 @@ async def _proxy(request):
             body = _inject_association_seed(body)  # after the list seed (validates ids against it), before the two that read the association
             body = _inject_new_window_profile(body)  # after the list seed (it needs the names), before the order seed (it reads the payload)
             body = _inject_activity_order(body)
+            body = _inject_chrome_style(body)  # the command centre at half width (command_center_scale)
             # The App passes the dashboard's scheme on the frame URL (fresh at
             # every load); the file it also posts to is the fallback.
             body = _inject_theme_default(body, request.query.get("kideScheme") or _read_scheme())

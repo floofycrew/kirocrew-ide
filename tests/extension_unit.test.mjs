@@ -319,8 +319,12 @@ test("attachments go the dashboard's way: [attached_file N] markers in the text 
   assert.equal(calls.sent[0].text, "compare these\n[attached_file 1] /data/uploads/1_shot.png\n[attached_file 2] /data/uploads/2_app.log");
   assert.deepEqual(calls.sent[0].meta, { files: ["/data/uploads/1_shot.png", "/data/uploads/2_app.log"] });
   const shown = calls.posted.find((m) => m.type === "user");
-  assert.equal(shown.text, "compare these", "the transcript shows the typed text; the chips name the files");
-  assert.deepEqual(shown.files, ["shot.png", "app.log"]);
+  assert.equal(shown.text, "compare these", "the transcript shows the typed text; the strip shows the files");
+  // The bubble gets name, host path and kind per file; an image under the preview cap carries its data URL for the thumbnail.
+  assert.deepEqual(shown.files, [
+    { name: "shot.png", path: "/data/uploads/1_shot.png", image: true, data: "data:image/png;base64,AAAA" },
+    { name: "app.log", path: "/data/uploads/2_app.log", image: false, data: undefined },
+  ]);
   // No text at all: a stand-in sentence, markers, meta.
   await chat.send(t, { text: "", files: [{ name: "a.pdf", mime: "application/pdf", data: "AAAA" }] });
   assert.equal(calls.sent[1].text, "[attached_file 1] /data/uploads/3_a.pdf");
@@ -411,8 +415,10 @@ test("listSteering walks subdirectories like kiro-cli's `steering/**/*.md`: nest
   stub.workspace.workspaceFolders = [{ uri: { path: home + "/proj", with: ({ path }) => ({ path }) } }];
   stub.workspace.fs = {
     readDirectory: async (uri) => { if (!(uri.path in tree)) throw new Error("ENOENT " + uri.path); return tree[uri.path].map((e) => [...e]); },
-    readFile: async (uri) => { if (!(uri.path in files)) throw new Error("ENOENT " + uri.path); return new TextEncoder().encode(files[uri.path]); },
+    readFile: async (uri) => { reads.push(uri.path); if (!(uri.path in files)) throw new Error("ENOENT " + uri.path); return new TextEncoder().encode(files[uri.path]); },
   };
+  const reads = [];
+  ext.__test.invalidateSteeringCache();
   try {
     const docs = await listSteering(home + "/proj");
     assert.deepEqual(docs.map((d) => [d.scope, d.name, d.label, d.inclusion]), [
@@ -424,7 +430,16 @@ test("listSteering walks subdirectories like kiro-cli's `steering/**/*.md`: nest
     ], "nested files found at every depth, dot-dirs and non-.md files skipped, sorted within each directory");
     assert.equal(docs.find((d) => d.name === "amazon-builder/git").path, home + "/.kiro/steering/amazon-builder/git.md");
     assert.deepEqual(docs.find((d) => d.name === "amazon-builder/deep/deeper").patterns, ["*.py"]);
+    // The inventory is cached between sends (every directory and file is a remote-fs RPC);
+    // the Steering view's watcher invalidates it, and a new workspace set misses the cache.
+    const before = reads.length;
+    assert.equal(await listSteering(home + "/proj"), docs, "a second listing within the window is the same object, no RPC");
+    assert.equal(reads.length, before);
+    ext.__test.invalidateSteeringCache();
+    assert.notEqual(await listSteering(home + "/proj"), docs, "invalidated: rescanned");
+    assert.ok(reads.length > before);
   } finally {
+    ext.__test.invalidateSteeringCache();
     stub.workspace.fs = saved.fs; stub.workspace.workspaceFolders = saved.folders; stub.FileType = saved.FileType;
   }
 });
@@ -432,7 +447,7 @@ test("listSteering walks subdirectories like kiro-cli's `steering/**/*.md`: nest
 test("chat webview: steering indicator, `#name` hint, and a resizable input box with a remembered height", () => {
   const { chatHtml } = ext.__test;
   const html = chatHtml("fox.svg");
-  assert.ok(html.includes('data-testid="pinned-prompt"') && /function pinUpdate\(/.test(html) && /function pinJump\(/.test(html) && /addEventListener\('scroll', pinSchedule/.test(html), "the pinned prompt overlay, measured on scroll");
+  assert.ok(html.includes('data-testid="pinned-prompt"') && /function pinUpdate\(/.test(html) && /function pinJump\(/.test(html) && /addEventListener\('scroll', \(\)=>\{ pinSchedule\(\);/.test(html), "the pinned prompt overlay, measured on scroll");
   assert.ok(/-webkit-line-clamp:1/.test(html) && /\.pin-card:hover \.pin-text[^{]*\{-webkit-line-clamp:3\}/.test(html) && /\.pin\.open \.pin-text\{display:block/.test(html), "one line, three on hover, the whole prompt on ⌄");
   assert.ok(/function toolRow\(/.test(html) && /case 'toolResult':/.test(html) && /case 'toolUpdate':/.test(html) && /\.tool \.tool-head\{/.test(html), "tool rows open to Input/Output and complete on tool_result");
   assert.ok(html.includes('id="p-steer"') && /case 'steering':/.test(html) && /function renderSteering\(\)/.test(html), "steering indicator fed by the extension");
@@ -449,6 +464,16 @@ test("a host that reserves Kiro's mode ids: the refusal falls back to the prompt
   assert.equal(isReservedModeRefusal("Rename this crewmate's template: “spec” is reserved for a built-in agent, so …"), true);
   assert.equal(isReservedModeRefusal("'spec' is reserved by the KAS agent engine"), true);
   assert.equal(isReservedModeRefusal("HTTP 500 /chat"), false);
+  // KiroCrew 0.11's coat of the same refusal (the verbatim host text of 2026-11-03): the id it
+  // looked for was the wire alias `spec-crewmate`, which nothing registered. Only the four mode
+  // ids count; the identical sentence about any other agent is a genuinely missing file.
+  const v011 = "kiro_crew.acp.session_handle.AcpRuntimeError: Agent mode 'spec' is not available on this session (advertised modes: ['vibe', 'spec', 'quick-spec', 'bug-fix', 'plan', 'o3r_default']); its ~/.kiro/agents/spec.json is likely missing. Refusing to run the backend default mode vibe in its place. Run `kirocrew setup --agent-only` to materialize the agent config.";
+  assert.equal(isReservedModeRefusal(v011), true);
+  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'quick-spec'")), true);
+  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'bug-fix'")), true);
+  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'plan'")), true);
+  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'o3r_default'")), false, "a missing ordinary agent is not a reserved-mode refusal");
+  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'spec-crewmate'")), false);
   const calls = { sent: [], injected: [], slotAgent: [], posted: [] };
   let refuse = true;
   const sessions = {
@@ -633,7 +658,120 @@ test("chat webview: compact spacing, message font size scoped to the transcript"
   assert.ok(/\.log\{[^}]*font-size:var\(--kide-msg-size\)/.test(html), "applied on the transcript pane only");
   assert.ok(!/#compose\{[^}]*--kide-msg-size/.test(html) && !/#tabs\{[^}]*--kide-msg-size/.test(html), "UI keeps the workbench size");
   assert.ok(html.includes('id="p-font"'), "Aa picker in the bar");
-  assert.ok(/\.log\.on\{[^}]*padding:8px 8px 4px/.test(html) && /#compose\{[^}]*padding:5px 5px 4px/.test(html), "compact paddings");
+  // The reading column: the dashboard's presets (compact 800px/816px scaled by the font size,
+  // comfortable 84%/85%, full 92%/93%) as a gutter that is 8px (5px for the composer) in a
+  // narrow pane and grows with the pane past the column width.
+  assert.ok(/--kide-content-width:800px;--kide-input-width:816px/.test(html), "compact defaults");
+  assert.ok(/--kide-gutter:max\(8px,calc\(\(100% - var\(--kide-content-width\)\)\/2\)\)/.test(html), "gutter derives from the column");
+  assert.ok(/\.log\.on\{[^}]*padding:8px var\(--kide-gutter\) 4px/.test(html) && /#compose\{[^}]*padding:5px var\(--kide-input-gutter\) 4px/.test(html), "rows and composer use the gutters");
+  assert.ok(/\.pin\{[^}]*left:var\(--kide-gutter\);right:calc\(var\(--kide-gutter\) \+ var\(--kide-scrollbar\)\)/.test(html), "the pinned card follows the column (and the scrollbar)");
+  assert.ok(html.includes("const WIDTHS = { compact:['800px','816px'], comfortable:['84%','85%'], full:['92%','93%'] }"), "the dashboard's three presets");
+  assert.ok(html.includes("msgs=Math.round(800*r)+'px'; input=Math.round(816*r)+'px'"), "compact scales with the message font size, as the dashboard does");
+  assert.ok(/case 'width': applyWidth\(m\.preset\); pinSchedule\(\)/.test(html), "the extension pushes the preset");
+});
+
+test("mdToHtml: a markdown image is a picture — https loads as is, a local image path is a placeholder the page fetches, a non-image path stays a link", () => {
+  const { mdToHtml } = ext.__test;
+  assert.match(mdToHtml("see ![the chart](/tmp/out/chart.png) here"), /<img class="mdimg" data-path="\/tmp\/out\/chart\.png" alt="the chart" title="the chart">/);
+  assert.match(mdToHtml("![](shots/a-b.png)"), /<img class="mdimg" data-path="shots\/a-b\.png" alt="" title="shots\/a-b\.png">/, "a relative path, no alt: the path is the title");
+  assert.match(mdToHtml("![r](https://example.invalid/r.png)"), /<img class="mdimg" src="https:\/\/example\.invalid\/r\.png" alt="r" title="r">/);
+  assert.match(mdToHtml("![doc](/tmp/report.pdf)"), /<a class="path" data-path="\/tmp\/report\.pdf"[^>]*>doc<\/a>/, "not an image: the usual path link");
+  assert.match(mdToHtml("[a link](/tmp/out/chart.png)"), /<a class="path" data-path="\/tmp\/out\/chart\.png"/, "a plain link to an image file stays a link");
+  assert.ok(!/<img/.test(mdToHtml("`![x](/a.png)`")), "inside a code span nothing is rendered");
+});
+
+test("imageData reads an image on the gateway host as a data URL: mime by extension, capped, cached; a non-image or a missing file is an error", async () => {
+  const { imageData, IMAGE_PREVIEW_MAX } = ext.__test;
+  const reads = [];
+  const files = { "/home/u/.kiro/crew/uploads/x_shot.png": new Uint8Array([137, 80, 78, 71]), "/w/big.jpg": new Uint8Array(0), "/w/rel/pic.webp": new Uint8Array([1, 2, 3]) };
+  const sizes = { "/w/big.jpg": IMAGE_PREVIEW_MAX + 1 };
+  const saved = { fs: stub.workspace.fs, folders: stub.workspace.workspaceFolders, Uri: stub.Uri };
+  stub.workspace.workspaceFolders = [{ uri: { path: "/w", with: ({ path }) => ({ path }) } }];
+  stub.Uri = Object.assign({}, stub.Uri, { file: (p) => ({ path: p, file: true }) });
+  stub.workspace.fs = {
+    stat: async (uri) => { if (!(uri.path in files)) throw new Error("ENOENT " + uri.path); return { size: sizes[uri.path] != null ? sizes[uri.path] : files[uri.path].length }; },
+    readFile: async (uri) => { reads.push(uri.path); return files[uri.path]; },
+  };
+  try {
+    assert.deepEqual(await imageData("/home/u/.kiro/crew/uploads/x_shot.png"), { data: "data:image/png;base64," + Buffer.from([137, 80, 78, 71]).toString("base64") }, "an upload outside the workspace, read through the folder's remote fs");
+    assert.deepEqual(await imageData("/home/u/.kiro/crew/uploads/x_shot.png"), { data: "data:image/png;base64," + Buffer.from([137, 80, 78, 71]).toString("base64") });
+    assert.equal(reads.length, 1, "the second ask is served from the cache");
+    assert.deepEqual(await imageData("rel/pic.webp"), { data: "data:image/webp;base64," + Buffer.from([1, 2, 3]).toString("base64") }, "a relative path resolves against the workspace folder");
+    assert.deepEqual(await imageData("/w/big.jpg"), { error: "too large to preview (8.0 MB)" });
+    assert.deepEqual(await imageData("/w/notes.txt"), { error: "not an image file" });
+    const gone = await imageData("/gone/x.png");
+    assert.match(gone.error, /ENOENT/);
+  } finally { stub.workspace.fs = saved.fs; stub.workspace.workspaceFolders = saved.folders; stub.Uri = saved.Uri; }
+});
+
+test("chat webview: images — composer thumbnails, bubble attachments from markers + meta.files, markdown pictures, the lightbox, drop", () => {
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  assert.ok(/<div id="lightbox" role="dialog" aria-modal="true"/.test(html) && /class="lb-open">Open file</.test(html), "a lightbox with Open file");
+  assert.ok(/\.chip\.img img\{display:block;height:48px/.test(html), "a 48px thumbnail chip in the composer");
+  assert.ok(/\.user \.att img,\.md img\.mdimg\{[^}]*cursor:zoom-in/.test(html), "pictures in the bubble and in answers open on click");
+  assert.ok(html.includes("function attachmentsOf(content, files)") && html.includes("src.startsWith(f.path, end)"), "markers resolve losslessly against meta.files (a path with a space survives)");
+  assert.ok(html.includes("function userBubble(d, content, contexts, files)") && /const d=el\(st,'user'\); userBubble\(d, m\.text, m\.contexts, m\.files\)/.test(html) && /if\(cls==='user'\)\{userBubble\(d, r\.content, null, \(r\.meta&&r\.meta\.files\)\|\|\[\]\);\}/.test(html), "one bubble renderer for a live send and a history row");
+  assert.ok(html.includes("vscode.postMessage({type:'image', id:active, path})") && /case 'image': imgArrived\(m\)/.test(html), "a local image is fetched through the extension");
+  assert.ok(html.includes("const imgCache = new Map(), imgPending = new Set();"), "fetched images are cached per path, one request in flight per path");
+  assert.ok(/function renderMd\(node, s\)\{[^\n]*hydrateImages\(node\)/.test(html), "a rendered answer fetches its local images");
+  assert.ok(html.includes("composeEl.addEventListener('drop'") && html.includes("async function takeFile(st, f, name)"), "picker, paste and drop share one intake");
+  assert.ok(html.includes("if(e.key==='Escape' && lightbox.classList.contains('on'))"), "Esc closes the lightbox");
+});
+
+test("chat webview: your turn is drawn the instant you send; the extension's user message completes that bubble in place", () => {
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  assert.ok(/function sendText\(t\)\{[\s\S]*?const d=el\(st,'user'\); d\.dataset\.local=local;[\s\S]*?userBubble\(d, shown, contexts\.map/.test(html), "the page draws the bubble before posting the send");
+  assert.ok(/st\.running=true; setWork\(st\); scrollLog\(st, true\);\n  vscode\.postMessage\(\{type:'send', id:active, text:t, contexts, files, local\}\)/.test(html), "the pane goes to working at once; the send carries the local id");
+  assert.ok(html.includes("const shown = t || (files.length ? 'See the attached file(s).' : 'See the context provided.');"), "the stand-in text matches the extension's");
+  assert.ok(/case 'user': \{[\s\S]*?const own = m\.local \? st\.log\.querySelector\('\.row\.user\[data-local="'\+m\.local\+'"\]'\) : null;\n\s*if\(own\)\{ own\.innerHTML=''; userBubble\(own, m\.text, m\.contexts, m\.files\); break; \}/.test(html), "a user message naming the local id updates that bubble instead of appending");
+});
+
+test("ChatView.send: the user message carries the page's local id, and a failed send releases the pane the page already set to working", async () => {
+  const { ChatView } = ext.__test;
+  const calls = { posted: [], sent: [] };
+  const sessions = {
+    projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [],
+    create: async () => "k1", inject: async () => {}, setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, setSlotAgent: async () => {},
+    upload: async (name) => "/data/uploads/" + name,
+    send: async (key, text) => { if (/boom/.test(text)) throw new Error("host down"); calls.sent.push(text); },
+  };
+  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+  chat.post = (m) => calls.posted.push(m);
+  const t = chat.newTab(true);
+  await chat.onMessage({ type: "send", id: t.id, text: "hello", local: "l7", files: [{ name: "shot.png", mime: "image/png", data: "AAAA" }] });
+  const user = calls.posted.find((m) => m.type === "user");
+  assert.equal(user.local, "l7", "the bubble the page drew is the one completed");
+  assert.deepEqual(user.files.map((f) => f.path), ["/data/uploads/shot.png"], "with the uploaded paths");
+  assert.ok(!calls.posted.some((m) => m.type === "done"), "a send that went out does not release the pane (the turn is running)");
+  // A dispatch (Run all tasks) has no local id: the user row is appended as before.
+  await chat.dispatch(() => "Run all tasks for this spec.", { mode: "spec", kind: "spec", display: "Run all tasks" });
+  const disp = calls.posted.filter((m) => m.type === "user").pop();
+  assert.equal(disp.local, undefined);
+  assert.equal(disp.text, "Run all tasks");
+  // The host refuses the send: the error row lands and the page's pane is released with a done.
+  const before = calls.posted.length;
+  await chat.onMessage({ type: "send", id: t.id, text: "boom", local: "l8" });
+  const after = calls.posted.slice(before).map((m) => m.type);
+  assert.ok(after.includes("done") && after.includes("error"), "released and told: " + after.join(","));
+  assert.equal(calls.posted.slice(before).find((m) => m.type === "error").text, "host down");
+});
+
+test("chat webview: follow mode and the Jump-to-latest pill (the dashboard's scroll-to-bottom)", () => {
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  assert.ok(/<button type="button" id="jump" class="jump" hidden data-testid="jump-to-latest"/.test(html), "the pill is in the pane, hidden until the view is scrolled up");
+  assert.ok(/\.jump\{position:absolute;left:50%;bottom:10px;transform:translateX\(-50%\)/.test(html), "centred over the pane's bottom edge");
+  assert.ok(/\.jump\.new\{background:var\(--vscode-button-background\)/.test(html), "accented once new content arrived unseen");
+  assert.ok(html.includes("const FOLLOW_PX = 8;") && /function atBottom\(log\)\{ return log\.scrollHeight - log\.scrollTop - log\.clientHeight <= FOLLOW_PX; \}/.test(html), "at-bottom within 8px, as the dashboard's follow threshold");
+  assert.ok(/function scrollLog\(st, force\)\{[\s\S]*if\(st\.follow !== false\)\{ st\.log\.scrollTop = st\.log\.scrollHeight; st\.unseen = false; \}\n  else st\.unseen = true;/.test(html), "a new row scrolls only while following; otherwise it is noted as unseen");
+  assert.ok(/case 'scroll': scrollLog\(st, true\)/.test(html) && /st\.running=true; setWork\(st\); scrollLog\(st, true\); break; \}/.test(html), "a reload and your own turn always land at the bottom");
+  assert.ok(/case 'clear':[^\n]*st\.follow=true; st\.unseen=false; jumpUpdate\(st\)/.test(html), "a cleared pane follows again");
+  assert.ok(/log\.addEventListener\('scroll', \(\)=>\{ pinSchedule\(\); followUpdate\(state\.get\(id\)\); \}, \{ passive:true \}\)/.test(html), "the pane's own scroll re-judges following");
+  assert.ok(html.includes("jumpLabel.textContent = st.unseen ? 'New messages' : 'Jump to latest';"), "two labels");
+  assert.ok(/jump\.onclick = \(\)=>\{[\s\S]*st\.follow = true; st\.unseen = false; jumpUpdate\(st\);[\s\S]*scrollTo\(\{ top: st\.log\.scrollHeight, behavior: reduce \? 'auto' : 'smooth' \}\)/.test(html), "the click re-arms following and scrolls smoothly (instant under reduced motion)");
+  assert.ok(/function show\(id\)\{[^\n]*jump\.hidden=true; const st=state\.get\(id\); if\(st\) followUpdate\(st\);/.test(html), "the pill belongs to the active tab");
 });
 
 test("chat webview: KiroCrew's transcript shape — user bubble on the right, bare assistant text, small radii, four hopping foxes while working", () => {
@@ -658,6 +796,128 @@ test("chat webview: every inline script parses (it is JavaScript inside a templa
   for (const body of scripts) new vm.Script(body, { filename: "chat-webview.js" });
   const composer = scripts.find((s) => s.includes("p-agent"));
   assert.ok(composer && composer.includes("kind==='hint'") && composer.includes("type:'hint'"), "a hint row posts `hint` and changes no setting");
+});
+
+test("ChatView remembers which tab was in front: a restored window opens on it, not on the first tab", async () => {
+  const { ChatView } = ext.__test;
+  const feed = { on: () => ({ dispose() {} }) };
+  const sessions = { projectPath: () => "/w", slot: () => null, mine: () => [], onDidChange: () => ({ dispose() {} }), transcript: async () => [] };
+  const store = { saved: undefined };
+  const context = { workspaceState: { get: () => store.saved, update: (k, v) => { store.saved = v; } } };
+  const three = [{ key: "k1", title: "oldest" }, { key: "k2", title: "middle" }, { key: "k3", title: "newest" }];
+
+  // A record from before 0.30.8 (no `active`): the newest tab, not the oldest.
+  store.saved = { tabs: three };
+  let chat = new ChatView(context, sessions, feed);
+  chat.post = () => {};
+  assert.equal(chat.tab(chat.active).key, "k3", "no record of the front tab: the last (newest) one");
+
+  // A record naming the front tab: that one.
+  store.saved = { tabs: three, active: "k2" };
+  chat = new ChatView(context, sessions, feed);
+  chat.post = () => {};
+  assert.equal(chat.tab(chat.active).key, "k2");
+
+  // Selecting a tab (the webview's click) is persisted at once, so a reload comes back on it.
+  await chat.onMessage({ type: "select", id: chat.tabForKey("k1").id });
+  assert.equal(store.saved.active, "k1", "select saves the front tab");
+  assert.deepEqual(store.saved.tabs.map((t) => t.key), ["k1", "k2", "k3"], "the tabs themselves are unchanged");
+  // Opening a session from History selects and persists it too.
+  await chat.open("k3");
+  assert.equal(store.saved.active, "k3");
+  // Closing the front tab moves the selection and persists the move.
+  chat.closeTab(chat.tabForKey("k3").id);
+  assert.equal(chat.tab(chat.active).key, "k2");
+  assert.equal(store.saved.active, "k2");
+  // A draft tab in front has no key: the record says null, and a restore falls back to the newest chat.
+  chat.newTab(true);
+  chat.saveTabs();
+  assert.equal(store.saved.active, null);
+  chat = new ChatView(context, sessions, feed);
+  chat.post = () => {};
+  assert.equal(chat.tab(chat.active).key, "k2", "a draft in front at save time: the newest saved chat on restore");
+  // A stale key (the session was closed elsewhere and its tab dropped) falls back the same way.
+  store.saved = { tabs: three.slice(0, 2), active: "gone" };
+  chat = new ChatView(context, sessions, feed);
+  chat.post = () => {};
+  assert.equal(chat.tab(chat.active).key, "k2");
+  // An unknown id is ignored by select.
+  const before = chat.active;
+  chat.select(999);
+  assert.equal(chat.active, before);
+});
+
+test("chat webview: the host's inject rows parse into the dashboard's recovery card (its prefix table, wording, chip and severity)", async () => {
+  const vm = await import("node:vm");
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  const script = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map((m) => m[1]).find((s) => s.includes("function parseInject("));
+  assert.ok(script, "the parser lives in the webview script");
+  const start = script.indexOf("const INJECT_KINDS="), end = script.indexOf("// The dashboard's lucide icons");
+  assert.ok(start > 0 && end > start, "the parser block is self-contained");
+  const ctx = vm.createContext({});
+  vm.runInContext(script.slice(start, end) + "\nthis.parseInject = parseInject; this.INJECT_KINDS = INJECT_KINDS;", ctx);
+  const { parseInject, INJECT_KINDS } = ctx;
+  assert.equal(INJECT_KINDS.length, 15, "the dashboard's fifteen prefixes");
+  // The real thing: a blocked shell call, the first word after the prefix picks the detail, the pattern is the chip.
+  const blocked = "[Tool blocked — reason sent to the agent] policy\n[Kiro Crew host notice] The tool call you just made was blocked by a Kiro Crew safety policy. This was NOT a user action — the user did not cancel, reject, or interrupt anything.\n\nBlocked: cd ~/.kiro/crew && python - <<'EOF'\nprint(1)\nEOF: Blocked by security policy: (?:\\A|[;&|\\n`]|\\$\\()[\\s\"'(]*[\\w.:/\\\\-]*kiro[-.]?crew\\b[^|;&#>/*]*\\btoken\\b\nMatched structurally on the command's argv, not by the pattern text above.";
+  const c = parseInject(blocked, { mid: "m-1" });
+  assert.equal(c.kind, "tool_blocked");
+  assert.equal(c.severity, "attention");
+  assert.equal(c.title, "Tool call blocked");
+  assert.equal(c.detail, "safety policy blocked the call · the agent was told why, in this turn");
+  assert.equal(c.chip, "(?:\\A|[;&|\\n`]|\\$\\()[\\s\"'(]*[\\w.:/\\\\-]*kiro[-.]?crew\\b[^|;&#>/*]*\\btoken\\b", "the pattern after 'Blocked by security policy:' is the chip");
+  assert.ok(c.body.startsWith("[Kiro Crew host notice]") && !c.body.includes("reason sent to the agent] policy"), "the body is the notice without the prefix line");
+  assert.equal(parseInject("[Tool blocked — reason sent to the agent] invalid_name\nx", {}).detail, "tool name validation blocked the call · the agent was told why, in this turn");
+  assert.equal(parseInject("[Tool blocked — reason sent to the agent] hook_error\nx", {}).detail, "a hook faulted before the call · the agent was told why, in this turn");
+  // Several blocked calls: a bullet per call, the distinct patterns counted.
+  const multi = "[Tool refusal — automatic recovery]\n- a: Blocked by security policy: one\n- b: Blocked by security policy: two\n- c: Blocked by security policy: one";
+  const m = parseInject(multi, {});
+  assert.deepEqual([m.kind, m.title, m.chip, m.severity, m.detail], ["refusal", "3 tool calls blocked", "2 patterns", "attention", "safety policy blocked the call · continuation sent automatically"]);
+  assert.ok(m.body.startsWith("- a:"), "a refusal keeps the whole text after the prefix as its body");
+  // The routine kinds: title + detail from the table, no chip, the text after the prefix as the body.
+  const cont = parseInject("[Continue — requested by the user]\nThe previous turn was interrupted before it finished…", { injectKind: "recovery" });
+  assert.deepEqual([cont.kind, cont.title, cont.detail, cont.chip, cont.severity], ["manual", "Continued at your request", "resuming the interrupted turn", "", "routine"]);
+  assert.equal(cont.body, "The previous turn was interrupted before it finished…");
+  assert.deepEqual([parseInject("[Interrupted turn — automatic recovery]\nx", {}).title, parseInject("[Interrupted turn — automatic recovery]\nx", {}).detail], ["Turn interrupted", "backend error · continuation sent automatically"]);
+  assert.equal(parseInject("[Tool stall — automatic recovery]\nx", {}).severity, "attention");
+  assert.equal(parseInject("[Stalled turn — automatic recovery]\nx", {}).title, "Turn stalled");
+  assert.equal(parseInject("[SYSTEM] Sub-agent synthesis: all sub-agents returned", {}).title, "Sub-agents finished");
+  const halted = parseInject("[Stop-hook nudge cap reached] loop #7\nthe hook asked 7 times", {});
+  assert.deepEqual([halted.title, halted.chip, halted.body, halted.severity], ["Hook loop halted", "#7", "the hook asked 7 times", "attention"]);
+  // No known prefix: the generic card only for recovery/synthesis kinds; a cron or replayed turn is not a card.
+  const g = parseInject("something the gateway said", { injectKind: "recovery" });
+  assert.deepEqual([g.kind, g.title, g.detail, g.body, g.severity], ["generic", "System notice", "injected by the gateway", "something the gateway said", "routine"]);
+  assert.equal(parseInject('[Cron notification from "x"]\nhello', { injectKind: "cron" }), null);
+  assert.equal(parseInject("looks like its done now", { injectKind: "user_replay" }), null);
+  assert.equal(parseInject("plain", {}), null);
+  // The renderer: a card row with the chevron header and a hidden body; automation notices are not drawn.
+  assert.ok(/if\(r\.role==='inject'\)\{\s*const meta=r\.meta\|\|\{\}; if\(meta\.injectKind==='automation_notice'\) return;/.test(script), "an automation_notice row renders nothing");
+  assert.ok(script.includes("injectCard(el(st,'recov'), c)"), "a parsed row is the recovery card, not a tool row");
+  assert.ok(script.includes("d.dataset.testid='recovery-card'") && script.includes("ch.dataset.testid='recovery-card-chip'") && script.includes("body.dataset.testid='recovery-card-body'"), "the dashboard's test ids");
+  assert.ok(/\.recov\{[^}]*border-radius:6px/.test(html) && /\.recov\[data-severity="attention"\] \.rc-ico\{color:var\(--vscode-editorWarning-foreground/.test(html), "a squared card; the attention icon in the warning colour");
+});
+
+test("chat webview: Kiro's task_status bookkeeping rows name the task from the action id and explain themselves instead of '(no output)'", async () => {
+  const vm = await import("node:vm");
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  const script = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map((m) => m[1]).find((s) => s.includes("function taskStatusOf("));
+  const start = script.indexOf("const TASK_STATUS_NOTE="), end = script.indexOf("function toolRow(");
+  const ctx = vm.createContext({});
+  vm.runInContext(script.slice(start, end) + "\nthis.taskStatusOf = taskStatusOf;", ctx);
+  const taskStatusOf = (meta, title) => { const r = ctx.taskStatusOf(meta, title); return r === null ? null : JSON.parse(JSON.stringify(r)); };  // out of the vm realm for deepEqual
+  // The ids KAS emits: <model tool id>_taskStatus_<task line sanitized>, capped at 64 chars (17 left for the task).
+  assert.deepEqual(taskStatusOf({ tool_call_id: "toolu_bdrk_018Vex9cLiVXZq8nmRBxV3t5_taskStatus_1_1_Create__conne" }, "task_status"), { id: "1.1", text: "Create conne", label: "Task status · 1.1 Create conne…" }, "a dotted sub-task number and the title's start");
+  assert.deepEqual(taskStatusOf({ tool_call_id: "toolu_bdrk_01BuNqZR7F5Z7NQJXrd84GHx_taskStatus_3__S2___case_reco" }, "task_status"), { id: "3", text: "S2 case reco", label: "Task status · 3 S2 case reco…" }, "punctuation sanitized to underscores collapses to spaces");
+  assert.deepEqual(taskStatusOf({ tool_call_id: "x_taskStatus_12" }, "task_status"), { id: "12", text: "", label: "Task status · 12" });
+  assert.deepEqual(taskStatusOf({ tool_call_id: "x_taskStatus_" }, "task_status").label, "Task status", "a truncated-away task keeps the plain label");
+  assert.deepEqual(taskStatusOf({ tool_call_id: "toolu_1" }, "task_status").label, "Task status", "the title alone marks the row when the id carries nothing");
+  assert.equal(taskStatusOf({ tool_call_id: "toolu_1" }, "Read File"), null, "an ordinary tool row is untouched");
+  assert.equal(taskStatusOf({}, "execute_bash"), null);
+  assert.ok(script.includes("ic.textContent=ts ? '📋'") && script.includes("note: ts?TASK_STATUS_NOTE:''"), "the row gets the clipboard icon and the note in its body");
+  assert.ok(script.includes("else if(t.note){ t.outPre.textContent=t.note; k.textContent='Note'; }"), "an empty output on a bookkeeping row shows the note, not '(no output)'");
+  assert.ok(script.includes("if(title && !t.note){"), "a later tool_call update does not rename the decoded row back to task_status");
 });
 
 test("chat webview: thinking deltas accumulate into one collapsed block (KiroCrew's ThinkingBlock), never one row per delta", () => {
@@ -813,7 +1073,7 @@ test("chat view: nothing is pushed before the webview says ready; a silent visib
     onDidDispose() {}, onDidChangeVisibility() {},
   };
   const timers = [];
-  const realSetTimeout = globalThis.setTimeout;
+  const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
   globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
   globalThis.clearTimeout = (id) => { if (timers[id - 1]) timers[id - 1].fn = null; };
   const pending = () => timers.filter((t) => t.fn).length;
@@ -843,7 +1103,9 @@ test("chat view: nothing is pushed before the webview says ready; a silent visib
     chat.reload("command");
     assert.equal(htmls.length, 5);
   } finally {
+    // Both, or every later test's clearTimeout is this stub's no-op and real timers fire twice.
     globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
   }
 });
 
@@ -898,4 +1160,353 @@ test("a slot's served model is shown but never becomes a pick: new tabs do not i
   assert.deepEqual(calls.setModel, [], "no setModel call with a retired id");
   assert.equal(fresh.settings.model, "");
   assert.ok(posted.some((m) => m.type === "error" && /no longer offered/.test(m.text)), "the user is told why");
+});
+
+test("the host's turn-ceiling card is recognised in both row shapes, and only that card", () => {
+  const { isTurnLimitRow, turnLimitOf } = ext.__test;
+  const card = "⏱️ This turn hit the 4-hour limit and was stopped. Work already written to disk is still there — nothing was rolled back. Send a message to continue from where it stopped.";
+  assert.equal(isTurnLimitRow({ role: "error", cls: "msg msg-err", content: card }), true, "as the slot log writes it");
+  assert.equal(isTurnLimitRow({ role: "assistant", cls: "msg msg-err", content: card }), true, "as a msg-err assistant row");
+  assert.equal(isTurnLimitRow({ role: "error", content: "⏱️ This turn hit the 30-minute limit and was stopped. …" }), true, "a raised/lowered ceiling");
+  assert.equal(isTurnLimitRow({ role: "assistant", content: card }), true, "the ⏱ prefix alone marks the row as a failure");
+  assert.equal(isTurnLimitRow({ role: "error", content: "⏱️ A tool needed your approval and nothing came back within 2 hours, so I declined it…" }), false, "the approval-timeout card is a different thing");
+  assert.equal(isTurnLimitRow({ role: "assistant", content: "we hit the 4-hour limit and was stopped by the referee" }), false, "plain prose is not a failure row");
+  assert.equal(turnLimitOf(card), "4-hour");
+  assert.equal(turnLimitOf("⏱️ This turn hit the 30-minute limit and was stopped."), "30-minute");
+  assert.equal(turnLimitOf("something else"), "time");
+});
+
+/** A workspace with one spec whose tasks.md is partly ticked, for the resume tests. */
+function specWorkspace(tasksMd) {
+  const home = "/local/home/someone";
+  const spec = home + "/proj/.kiro/specs/thing";
+  const tree = { [home + "/proj/.kiro/specs"]: [["thing", 2]], [home + "/proj/.kiro/steering"]: [] , [home + "/.kiro/steering"]: [] };
+  const files = { [spec + "/requirements.md"]: "# R", [spec + "/design.md"]: "# D", [spec + "/tasks.md"]: tasksMd, [home + "/.kiro/crew/config.json"]: JSON.stringify({ acp_backend: "kas" }) };
+  const saved = { fs: stub.workspace.fs, folders: stub.workspace.workspaceFolders, FileType: stub.FileType, window: stub.window };
+  stub.FileType = { Directory: 2, File: 1 };
+  stub.workspace.workspaceFolders = [{ uri: { path: home + "/proj", with: ({ path }) => ({ path }) } }];
+  stub.workspace.fs = {
+    readDirectory: async (uri) => { if (!(uri.path in tree)) throw new Error("ENOENT " + uri.path); return tree[uri.path].map((e) => [...e]); },
+    readFile: async (uri) => { if (!(uri.path in files)) throw new Error("ENOENT " + uri.path); return new TextEncoder().encode(files[uri.path]); },
+  };
+  stub.window = { visibleTextEditors: [] };
+  ext.__test.invalidateSteeringCache(); // the steering inventory is cached between sends; this fixture's tree is new
+  return { home, spec, files, restore() { stub.workspace.fs = saved.fs; stub.workspace.workspaceFolders = saved.folders; stub.FileType = saved.FileType; stub.window = saved.window; } };
+}
+
+test("resumeRequest rebuilds the run's request from tasks.md as it is now, and says when nothing is left", async () => {
+  const { resumeRequest, RESUME_NOTE } = ext.__test;
+  const ws = specWorkspace(["- [x] 1. Done", "- [-] 2. Half way", "  - [x] 2.1 Part", "  - [ ] 2.2 Rest", "- [ ] 3. Next", "- [ ]* 4. Optional"].join("\n"));
+  try {
+    const all = { spec: "thing", dir: ws.spec, task: null, optional: false, display: "Run all tasks" };
+    const kiro = await resumeRequest(all, "spec");
+    assert.match(kiro.text, /^Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done, 2\.1 Part\] are already completed/, "Kiro's own request, with the ticked tasks to skip");
+    assert.ok(kiro.text.endsWith(RESUME_NOTE), "the note about the half-done [-] row rides along");
+    assert.equal(kiro.display, "Resume: Run all tasks (2 left)", "2.2 and 3; the optional one is not counted");
+    const para = await resumeRequest(all, null);
+    assert.match(para.text, /PHASE: EXECUTE REMAINING TASKS\. Run all tasks for this spec\. Resume from prior progress/, "the crew-agent paraphrase otherwise");
+    const withOptional = await resumeRequest(Object.assign({}, all, { optional: true, display: "Run all required and optional tasks" }), "spec");
+    assert.equal(withOptional.display, "Resume: Run all required and optional tasks (3 left)");
+    const one = await resumeRequest({ spec: "thing", dir: ws.spec, task: "3. Next", optional: false, display: "Execute Task: 3. Next" }, "spec");
+    assert.match(one.text, /^Execute the following task from the spec at .*\/tasks\.md:\n\n<task title="3\. Next">[\s\S]*Task ID: 3\. Next/, "a single task sends its own request again");
+    assert.equal(one.display, "Resume: Execute Task: 3. Next");
+    const ticked = await resumeRequest({ spec: "thing", dir: ws.spec, task: "1. Done", optional: false }, "spec");
+    assert.equal(ticked.text, null); assert.match(ticked.reason, /task 1\. Done is ticked/);
+    const gone = await resumeRequest({ spec: "other", dir: ws.spec, task: null, optional: false }, "spec");
+    assert.equal(gone.text, null); assert.match(gone.reason, /spec other is no longer in the workspace/);
+    // Every required task ticked: nothing to resume (the optional one does not count unless asked for).
+    ws.files[ws.spec + "/tasks.md"] = ["- [x] 1. Done", "- [x] 2. Done too", "- [ ]* 3. Optional"].join("\n");
+    const done = await resumeRequest(all, "spec");
+    assert.equal(done.text, null); assert.match(done.reason, /every required task in thing is ticked/);
+    const optLeft = await resumeRequest(Object.assign({}, all, { optional: true }), "spec");
+    assert.match(optLeft.display, /\(1 left\)$/);
+  } finally { ws.restore(); }
+});
+
+test("a task run resumes itself from tasks.md when the host's ceiling card arrives, up to the cap; a plain chat only gets the button", async () => {
+  const { ChatView, RESUME_NOTE, RESUME_CHAT_TEXT } = ext.__test;
+  const card = "⏱️ This turn hit the 4-hour limit and was stopped. Work already written to disk is still there — nothing was rolled back. Send a message to continue from where it stopped.";
+  const ws = specWorkspace(["- [x] 1. Done", "- [-] 2. Half way", "- [ ] 3. Next"].join("\n"));
+  const calls = { sent: [], posted: [], saved: [] };
+  const slots = { k1: { running: false } };
+  const sessions = {
+    projectPath: () => ws.home + "/proj", slot: (k) => slots[k] || null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }, { name: "o3r" }],
+    create: async () => "k1", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, inject: async () => {}, setSlotAgent: async () => {},
+    send: async (key, text, agent, meta) => { calls.sent.push({ key, text, agent, meta }); },
+  };
+  try {
+    const chat = new ChatView({ workspaceState: { get: () => undefined, update: (k, v) => calls.saved.push(v) } }, sessions, { on: () => ({ dispose() {} }) });
+    chat.post = (m) => calls.posted.push(m);
+    chat.settleMs = 0;
+    // Run all tasks, the way the Specs view dispatches it (Kiro's request on the Spec agent).
+    const key = await chat.dispatch((kiro) => (kiro ? "Run all tasks for this spec." : "paraphrase"), { mode: "spec", title: "Run all tasks", kind: "spec", display: "Run all tasks", autopilot: true, run: { spec: "thing", dir: ws.spec, task: null, optional: false, display: "Run all tasks" } });
+    assert.equal(key, "k1");
+    const t = chat.tabForKey("k1");
+    assert.deepEqual(t.run, { resumed: 0, spec: "thing", dir: ws.spec, task: null, optional: false, display: "Run all tasks" }, "the run record is kept on the tab");
+    assert.equal(calls.saved.at(-1).tabs[0].run.spec, "thing", "and persisted with it");
+    assert.equal(calls.sent.length, 1);
+    // The host cuts the turn: chat_done first, then the card.
+    chat.onFrame({ type: "chat_done", data: { slot: "k1" } });
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "error", cls: "msg msg-err", content: card, meta: { mid: "m1" } } });
+    for (let i = 0; i < 12 && calls.sent.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(calls.posted.some((m) => m.type === "row" && m.row.role === "error" && m.row.content === card), "the card itself is shown (the webview adds Continue)");
+    assert.match(calls.posted.filter((m) => m.type === "status").at(-1).text, /^The host stopped this turn at its 4-hour limit; resuming the run from tasks\.md \(1 of 3\)…$/);
+    assert.equal(calls.sent.length, 2, "resumed once");
+    assert.equal(calls.sent[1].agent, "spec", "on the same Spec agent");
+    assert.match(calls.sent[1].text, /^Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\] are already completed/, "Kiro's request rebuilt from the current tasks.md");
+    assert.ok(calls.sent[1].text.endsWith(RESUME_NOTE));
+    assert.equal(calls.posted.filter((m) => m.type === "user").at(-1).text, "Resume: Run all tasks (2 left)", "the transcript shows the short label, as Kiro does");
+    assert.equal(t.run.resumed, 1);
+    // A replay of the same card (history reload) does not resume again: the mid is seen by the webview, and the counter still moves only per card the extension sees — so feed a fresh one to reach the cap.
+    t.run.resumed = 3;
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "error", cls: "msg msg-err", content: card, meta: { mid: "m2" } } });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(calls.sent.length, 2, "past the cap nothing is sent");
+    assert.match(calls.posted.filter((m) => m.type === "error").at(-1).text, /Stopped at the host's 4-hour limit 4 times on this run; not resuming again on its own \(kirocrew\.specResumeLimit = 3\)\. Continue resumes it by hand; agent\.chat_turn_timeout_secs/);
+    // The button still works past the cap (the webview posts `resume`).
+    await chat.onMessage({ type: "resume", id: t.id });
+    assert.equal(calls.sent.length, 3, "Continue resumes by hand");
+    assert.match(calls.sent[2].text, /^Run all tasks for this spec\./);
+    // While the session runs, Continue sends nothing.
+    slots.k1.running = true;
+    await chat.onMessage({ type: "resume", id: t.id });
+    assert.equal(calls.sent.length, 3);
+    assert.match(calls.posted.filter((m) => m.type === "status").at(-1).text, /still running; nothing to resume/);
+    slots.k1.running = false;
+    // Every task ticked: the card arrives, nothing is sent, and the reason is said.
+    ws.files[ws.spec + "/tasks.md"] = "- [x] 1. Done\n- [x] 2. Done\n- [x] 3. Done";
+    t.run.resumed = 0;
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "error", cls: "msg msg-err", content: card, meta: { mid: "m3" } } });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(calls.sent.length, 3);
+    assert.match(calls.posted.filter((m) => m.type === "status").at(-1).text, /^Nothing to resume: every required task in thing is ticked\.$/);
+    // A plain chat tab: the card is shown, nothing automatic; Continue sends the continuation.
+    slots.k2 = { running: false };
+    sessions.create = async () => "k2";
+    const plain = chat.newTab(true); plain.settings.mode = "default"; plain.settings.agent = "o3r";
+    await chat.send(plain, { text: "hello" });
+    const before = calls.sent.length;
+    chat.onFrame({ type: "chat_message", data: { slot: "k2", role: "error", cls: "msg msg-err", content: card, meta: { mid: "m4" } } });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(calls.sent.length, before, "a chat does not resume on its own");
+    await chat.onMessage({ type: "resume", id: plain.id });
+    assert.equal(calls.sent.length, before + 1);
+    assert.equal(calls.sent.at(-1).text, RESUME_CHAT_TEXT);
+    assert.equal(calls.sent.at(-1).agent, "o3r");
+  } finally { ws.restore(); }
+});
+
+test("runState / describeLeft / looksLikeQuestion / isSpecTab: the run is judged from tasks.md marks", async () => {
+  const { runState, describeLeft, looksLikeQuestion, isSpecTab } = ext.__test;
+  const ws = specWorkspace(["- [x] 1. Done", "- [-] 2. Half way", "- [~] 3. Next", "- [~] 4. After", "- [ ] 5. Later", "- [~]* 6. Optional queued"].join("\n"));
+  try {
+    const all = { spec: "thing", dir: ws.spec, task: null, optional: false };
+    assert.deepEqual(await runState(all), { spec: "thing", queued: 2, partial: 1, remaining: 4 }, "required leaves only");
+    assert.deepEqual(await runState(Object.assign({}, all, { optional: true })), { spec: "thing", queued: 3, partial: 1, remaining: 5 });
+    assert.deepEqual(await runState({ spec: "thing", dir: ws.spec, task: "2. Half way" }), { spec: "thing", queued: 0, partial: 1, remaining: 1 }, "a single-task run reads its task");
+    assert.equal(await runState({ spec: "gone", dir: ws.spec, task: null }), null);
+    assert.equal(describeLeft({ partial: 1, queued: 10, remaining: 11 }), "1 task in progress and 10 queued");
+    assert.equal(describeLeft({ partial: 2, queued: 0, remaining: 3 }), "2 tasks in progress");
+    assert.equal(describeLeft({ partial: 0, queued: 0, remaining: 3 }), "3 tasks left");
+    assert.equal(describeLeft({ partial: 0, queued: 0, remaining: 0 }), "");
+    assert.equal(looksLikeQuestion("Tests fail on 16.1. Fix the fixture or skip it?"), true);
+    assert.equal(looksLikeQuestion("Which one?\n\n[OPTIONS: Fix it | Skip it]"), true);
+    assert.equal(looksLikeQuestion("Done with 16.1; moving to 17.1."), false);
+    assert.equal(looksLikeQuestion(""), false);
+    assert.equal(isSpecTab({ kind: "spec", key: "k" }), true);
+    assert.equal(isSpecTab({ key: "kirocrew-ide-spec-20261102085551" }), true, "a tab from before tabs carried a kind");
+    assert.equal(isSpecTab({ key: "kirocrew-ide-chat-1" }), false);
+    assert.equal(isSpecTab(null), false);
+  } finally { ws.restore(); }
+});
+
+test("a run that stops without the ceiling card is judged from tasks.md: Kiro's [-]/[~] marks left behind resume it; a question, a Stop or startup only offer the card", async () => {
+  const { ChatView } = ext.__test;
+  const ws = specWorkspace(["- [x] 1. Done", "- [-] 2. Half way", "- [~] 3. Next"].join("\n"));
+  const calls = { sent: [], posted: [] };
+  const slots = { k1: { running: false } };
+  const sessions = {
+    projectPath: () => ws.home + "/proj", slot: (k) => slots[k] || null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }, { name: "o3r" }],
+    create: async () => "k1", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, inject: async () => {}, setSlotAgent: async () => {}, stop: async () => {},
+    send: async (key, text, agent) => { calls.sent.push({ key, text, agent }); },
+  };
+  const settle = () => new Promise((r) => setTimeout(r, 25));
+  const lastOf = (type) => calls.posted.filter((m) => m.type === type).at(-1);
+  try {
+    const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+    chat.post = (m) => calls.posted.push(m);
+    chat.settleMs = 0;
+    await chat.dispatch(() => "Run all tasks for this spec.", { mode: "spec", title: "Run all tasks", kind: "spec", display: "Run all tasks", autopilot: true, run: { spec: "thing", dir: ws.spec, task: null, optional: false, display: "Run all tasks" } });
+    const t = chat.tabForKey("k1");
+    // 1. The turn ends with no error at all (the model simply stopped): the marks say the run is unfinished.
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "assistant", content: "Dispatching 2 and 3 in parallel.", meta: { mid: "a1" } } });
+    chat.onFrame({ type: "chat_done", data: { slot: "k1" } });
+    await settle();
+    assert.equal(calls.sent.length, 2, "resumed");
+    assert.equal(lastOf("status").text, "The turn ended with 1 task in progress and 1 queued, without finishing the run; resuming the run from tasks.md (1 of 3)…");
+    assert.match(calls.sent[1].text, /^Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\]/);
+    // 2. A non-terminal error row mid-turn ("⟳ Connection unstable — resuming…") arms nothing on its own.
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "error", content: "⟳ Connection unstable — resuming…", meta: { mid: "e1" } } });
+    await settle();
+    assert.equal(calls.sent.length, 2, "no resume while the host is still on the turn");
+    // 3. The turn then ends on a host error: the error is the reason, tasks.md the judge.
+    chat.onFrame({ type: "chat_done", data: { slot: "k1" } });
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "error", cls: "msg msg-err", content: "❌ Backend error: stream reset by peer\nmore detail", meta: { mid: "e2" } } });
+    await settle();
+    assert.equal(calls.sent.length, 3);
+    assert.equal(lastOf("status").text, "The turn ended on an error (❌ Backend error: stream reset by peer); resuming the run from tasks.md (2 of 3)…");
+    // 4. The turn ends on a question: nothing is sent, the card offers Resume run.
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "assistant", content: "The fixture for 2 is gitignored. Fix the fixture, or skip the test?", meta: { mid: "a2" } } });
+    chat.onFrame({ type: "chat_done", data: { slot: "k1" } });
+    await settle();
+    assert.equal(calls.sent.length, 3, "a question is not answered with a resume");
+    let card = lastOf("interrupted");
+    assert.ok(card && card.resume && /seems to be asking you something; answer it, or Resume run/.test(card.text), JSON.stringify(card));
+    // 5. A pending question card (ask_question) blocks too, without a Resume button.
+    chat.onFrame({ type: "question_card", data: { slot: "k1", ask_id: "q1", questions: [] } });
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "assistant", content: "Picking the next task.", meta: { mid: "a3" } } });
+    chat.onFrame({ type: "chat_done", data: { slot: "k1" } });
+    await settle();
+    assert.equal(calls.sent.length, 3);
+    card = lastOf("interrupted");
+    assert.ok(card && !card.resume && /waiting on your answer above \(1 task in progress and 1 queued\)/.test(card.text), JSON.stringify(card));
+    chat.onFrame({ type: "question_card_resolved", data: { slot: "k1", ask_id: "q1" } });
+    // 6. The user pressed Stop: not resumed on its own, the card says so.
+    await chat.onMessage({ type: "stop", id: t.id });
+    chat.onFrame({ type: "chat_done", data: { slot: "k1" } });
+    await settle();
+    assert.equal(calls.sent.length, 3);
+    card = lastOf("interrupted");
+    assert.ok(card && card.resume && /^Stopped with 1 task in progress and 1 queued\. Resume run continues from tasks\.md\.$/.test(card.text), JSON.stringify(card));
+    // 7. The cap counts every automatic resume, whatever ended the turn.
+    t.run.resumed = 3;
+    chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "assistant", content: "Continuing.", meta: { mid: "a4" } } });
+    chat.onFrame({ type: "chat_done", data: { slot: "k1" } });
+    await settle();
+    assert.equal(calls.sent.length, 3);
+    card = lastOf("interrupted");
+    assert.ok(card && card.resume && /4 times on this run; not resuming again on its own \(kirocrew\.specResumeLimit = 3\)\. Resume run continues it by hand\./.test(card.text), JSON.stringify(card));
+    // 8. The run finished: no marks left, every required task ticked → silence.
+    ws.files[ws.spec + "/tasks.md"] = "- [x] 1. Done\n- [x] 2. Done\n- [x] 3. Done";
+    const before = calls.posted.length;
+    chat.onFrame({ type: "chat_done", data: { slot: "k1" } });
+    await settle();
+    assert.deepEqual(calls.posted.slice(before).map((m) => m.type), ["done"], "a finished run posts nothing beyond the frame's own done");
+    assert.equal(calls.sent.length, 3);
+  } finally { ws.restore(); }
+});
+
+test("a Spec tab without a run record (an older tab, a dashboard-started run) adopts the one interrupted spec; startup only offers the card; a plain chat is left alone", async () => {
+  const { ChatView } = ext.__test;
+  const ws = specWorkspace(["- [x] 1. Done", "- [~] 2. Next", "- [~] 3. After"].join("\n"));
+  const calls = { sent: [], posted: [], saved: [] };
+  const slots = { "kirocrew-ide-spec-20261102085551": { running: false }, "kirocrew-ide-chat-7": { running: false } };
+  const sessions = {
+    projectPath: () => ws.home + "/proj", slot: (k) => slots[k] || null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }],
+    transcript: async () => [], inject: async () => {}, setSlotAgent: async () => {},
+    send: async (key, text, agent) => { calls.sent.push({ key, text, agent }); },
+  };
+  const settle = () => new Promise((r) => setTimeout(r, 25));
+  try {
+    // Restored from a 0.26 workspaceState: no `kind`, no `run`, the key says it was a spec run.
+    const saved = { tabs: [{ key: "kirocrew-ide-spec-20261102085551", title: "Run all tasks", settings: { mode: "spec", agent: "" } }, { key: "kirocrew-ide-chat-7", title: "chat", settings: { mode: "default", agent: "o3r" } }] };
+    const chat = new ChatView({ workspaceState: { get: () => saved, update: (k, v) => calls.saved.push(v) } }, sessions, { on: () => ({ dispose() {} }) });
+    chat.post = (m) => calls.posted.push(m);
+    chat.settleMs = 0;
+    const t = chat.tabForKey("kirocrew-ide-spec-20261102085551"), plain = chat.tabForKey("kirocrew-ide-chat-7");
+    assert.equal(t.run, null);
+    // Startup: judged once each, card only, never a send.
+    await chat.checkRestoredRuns();
+    assert.equal(calls.sent.length, 0, "nothing is sent at startup");
+    const card = calls.posted.filter((m) => m.type === "interrupted").at(-1);
+    assert.ok(card && card.id === t.id && card.resume && /^This run was interrupted: 2 queued, and the session is idle\. Resume run continues from tasks\.md\.$/.test(card.text), JSON.stringify(card));
+    assert.deepEqual(t.run, { resumed: 0, spec: "thing", dir: ws.spec, task: null, optional: false, display: "Run all tasks", derived: true }, "the run is adopted from tasks.md");
+    assert.ok(calls.saved.at(-1).tabs[0].run.derived, "and persisted");
+    assert.equal(plain.run, null, "a chat tab adopts nothing");
+    assert.ok(!calls.posted.some((m) => m.type === "interrupted" && m.id === plain.id));
+    // The dashboard's own Continue ran the turn in between; when it ends unfinished, this tab resumes it (a derived run counts only the marks, never bare open rows).
+    chat.onFrame({ type: "chat_message", data: { slot: t.key, role: "assistant", content: "Dispatching 2.", meta: { mid: "b1" } } });
+    chat.onFrame({ type: "chat_done", data: { slot: t.key } });
+    await settle();
+    assert.equal(calls.sent.length, 1);
+    assert.equal(calls.sent[0].key, t.key);
+    assert.match(calls.sent[0].text, /^Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\]/);
+    assert.equal(calls.sent[0].agent, "spec");
+    // Marks gone but rows still open: a derived run has no say (the spec may simply never have been run further).
+    ws.files[ws.spec + "/tasks.md"] = "- [x] 1. Done\n- [x] 2. Next\n- [ ] 3. After";
+    const before = calls.sent.length;
+    chat.onFrame({ type: "chat_done", data: { slot: t.key } });
+    await settle();
+    assert.equal(calls.sent.length, before, "no marks, no resume");
+  } finally { ws.restore(); }
+});
+
+test("resumeSpec (Specs view ⟳ / spec editor 'Resume run'): the tab that ran it when idle, 'running' while it goes, a fresh dispatch otherwise; continueAction routes an interrupted tasks.md there", async () => {
+  const { ChatView, continueAction, parseTaskTree, parseTasks } = ext.__test;
+  const ws = specWorkspace(["- [x] 1. Done", "- [-] 2. Half way", "- [ ] 3. Next"].join("\n"));
+  const calls = { sent: [], posted: [], dispatched: 0 };
+  const slots = { k1: { running: false } };
+  const sessions = {
+    projectPath: () => ws.home + "/proj", slot: (k) => slots[k] || null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }],
+    create: async () => "k1", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, inject: async () => {}, setSlotAgent: async () => {},
+    send: async (key, text) => { calls.sent.push({ key, text }); },
+  };
+  try {
+    const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+    chat.post = (m) => calls.posted.push(m);
+    chat.settleMs = 0;
+    const specs = await (async () => { const { listSpecs } = ext.__test; return listSpecs ? listSpecs() : null; })();
+    const spec = (specs && specs[0]) || { name: "thing", dir: { path: ws.spec } };
+    const dispatch = async () => { calls.dispatched += 1; };
+    // No tab yet: a fresh dispatch.
+    assert.equal(await chat.resumeSpec(spec, dispatch), "dispatched");
+    assert.equal(calls.dispatched, 1);
+    // The tab that ran it, idle: resumed there, made active.
+    await chat.dispatch(() => "Run all tasks for this spec.", { mode: "spec", kind: "spec", display: "Run all tasks", run: { spec: "thing", dir: ws.spec, task: null, optional: false, display: "Run all tasks" } });
+    const t = chat.tabForKey("k1");
+    chat.newTab(true); // another tab in front
+    assert.equal(await chat.resumeSpec(spec, dispatch), "resumed");
+    assert.equal(chat.active, t.id, "the run's tab is brought to the front");
+    assert.equal(calls.sent.length, 2); assert.match(calls.sent[1].text, /Resume from prior progress/);
+    assert.equal(calls.dispatched, 1, "no second session");
+    // Still running there: say so, send nothing.
+    slots.k1.running = true;
+    assert.equal(await chat.resumeSpec(spec, dispatch), "running");
+    assert.equal(calls.sent.length, 2);
+    // The spec editor's primary action on an interrupted tasks.md is "Resume run" through the same route.
+    const md = ws.files[ws.spec + "/tasks.md"];
+    const action = continueAction({ file: "tasks.md", label: "Tasks" }, { present: { "tasks.md": true }, taskTree: parseTaskTree(md), tasks: parseTasks(md) });
+    assert.deepEqual(action, { label: "Resume run (2 left)", command: "kirocrew.spec.resume", remaining: 2, interrupted: true });
+    const plainMd = "- [x] 1. Done\n- [ ] 2. Next";
+    const plain = continueAction({ file: "tasks.md", label: "Tasks" }, { present: { "tasks.md": true }, taskTree: parseTaskTree(plainMd), tasks: parseTasks(plainMd) });
+    assert.equal(plain.command, "kirocrew.spec.runAll", "ticked rows alone are not an interrupted run");
+    assert.equal(plain.label, "Resume tasks (1 left)");
+  } finally { ws.restore(); }
+});
+
+test("auto-resume off: the card is explained and nothing is sent until Continue", async () => {
+  const { ChatView } = ext.__test;
+  const card = "⏱️ This turn hit the 4-hour limit and was stopped. Work already written to disk is still there — nothing was rolled back. Send a message to continue from where it stopped.";
+  const ws = specWorkspace("- [ ] 1. Next");
+  const savedCfg = stub.workspace.getConfiguration;
+  stub.workspace.getConfiguration = () => ({ get: (k) => (k === "specAutoResume" ? false : undefined) });
+  const calls = { sent: [], posted: [] };
+  const sessions = {
+    projectPath: () => ws.home + "/proj", slot: () => ({ running: false }), onDidChange: () => ({ dispose() {} }), agents: [{ name: "o3r" }],
+    create: async () => "k3", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, inject: async () => {}, setSlotAgent: async () => {},
+    send: async (key, text, agent) => { calls.sent.push({ text, agent }); },
+  };
+  try {
+    const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+    chat.post = (m) => calls.posted.push(m);
+    chat.settleMs = 0;
+    await chat.dispatch(() => "paraphrase", { mode: "spec", agent: "o3r", title: "Run all tasks", kind: "spec", display: "Run all tasks", run: { spec: "thing", dir: ws.spec, task: null, optional: false, display: "Run all tasks" } });
+    chat.onFrame({ type: "chat_message", data: { slot: "k3", role: "error", cls: "msg msg-err", content: card, meta: { mid: "m5" } } });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(calls.sent.length, 1, "nothing automatic");
+    assert.match(calls.posted.filter((m) => m.type === "status").at(-1).text, /auto-resume is off \(kirocrew\.specAutoResume\)\. Continue resumes the run by hand\./);
+    await chat.onMessage({ type: "resume", id: chat.tabForKey("k3").id });
+    assert.equal(calls.sent.length, 2);
+    assert.match(calls.sent[1].text, /PHASE: EXECUTE REMAINING TASKS\. Run all tasks for this spec\./, "the paraphrase on the crew agent (no Spec agent on this host)");
+  } finally { ws.restore(); stub.workspace.getConfiguration = savedCfg; }
 });

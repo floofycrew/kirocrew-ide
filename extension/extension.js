@@ -384,17 +384,37 @@ class ChatView {
   defaultSettings() {
     return Object.assign({ agent: this.agent || "", model: "", effort: "", mode: "default", autopilot: false }, this.lastSettings || {});
   }
+  /**
+   * The tabs as they were when the window closed, and the one that was in front.
+   * The record carries `active` (the selected tab's session key) since 0.30.8;
+   * before that the first tab was selected on every restore, so a window with
+   * several chats always came back on the oldest one. A record without it (an
+   * older version's, or one saved while a draft tab was selected) opens on the
+   * LAST tab, the newest chat.
+   */
   restoreTabs() {
     const saved = this.context.workspaceState.get(this.storageKey());
     if (saved && Array.isArray(saved.tabs) && saved.tabs.length) {
-      this.tabs = saved.tabs.filter((t) => t && t.key).map((t) => ({ id: this.nextId++, key: t.key, title: t.title || t.key, settings: Object.assign(this.defaultSettings(), t.settings || {}) }));
-      this.active = this.tabs.length ? this.tabs[0].id : null;
+      this.tabs = saved.tabs.filter((t) => t && t.key).map((t) => ({ id: this.nextId++, key: t.key, title: t.title || t.key, settings: Object.assign(this.defaultSettings(), t.settings || {}), kind: t.kind || undefined, run: t.run && typeof t.run === "object" ? t.run : null }));
+      const front = (typeof saved.active === "string" && this.tabForKey(saved.active)) || this.tabs[this.tabs.length - 1] || null;
+      this.active = front ? front.id : null;
       if (this.tabs.length) this.lastSettings = Object.assign({}, this.tabs[this.tabs.length - 1].settings);
     }
     if (!this.tabs.length) this.newTab();
   }
   saveTabs() {
-    this.context.workspaceState.update(this.storageKey(), { tabs: this.tabs.filter((t) => t.key).map((t) => ({ key: t.key, title: t.title, settings: t.settings })) });
+    const front = this.tab(this.active);
+    this.context.workspaceState.update(this.storageKey(), {
+      tabs: this.tabs.filter((t) => t.key).map((t) => ({ key: t.key, title: t.title, settings: t.settings, kind: t.kind, run: t.run || null })),
+      active: (front && front.key) || null,
+    });
+  }
+  /** Bring a tab to the front and remember the choice for the next window. */
+  select(id) {
+    if (!this.tab(id)) return;
+    this.active = id;
+    this.saveTabs();
+    this.pushTabs();
   }
   tab(id) { return this.tabs.find((t) => t.id === id) || null; }
   tabForKey(key) { return this.tabs.find((t) => t.key === key) || null; }
@@ -447,7 +467,9 @@ class ChatView {
     log(`chat view ready${wasReady ? " (again)" : ""} after ${Date.now() - (this.resolvedAt || Date.now())}ms, reloads=${this.reloads}`);
     this.pushTabs();
     this.pushChoices().catch((error) => console.warn("[kirocrew] composer choices unavailable", error));
-    for (const t of this.tabs) if (t.key) this.load(t);
+    // Transcripts first, then one judgement per restored tab: an interrupted
+    // run gets its card under the history (never a send at startup).
+    Promise.all(this.tabs.filter((t) => t.key).map((t) => this.load(t))).then(() => this.checkRestoredRuns()).catch((e) => log("run check (startup): " + e.message));
   }
   armWatchdog(why) {
     this.disarmWatchdog();
@@ -489,6 +511,7 @@ class ChatView {
       efforts: [{ id: "", label: "default effort", description: "the model's default" }].concat(efforts.map((e) => ({ id: e, label: e[0].toUpperCase() + e.slice(1), description: "" }))),
     });
     this.post({ type: "fontSize", px: Number(cfg("chatFontSize", 0)) || 0 });
+    this.post({ type: "width", preset: String(cfg("chatWidth", "compact") || "compact") });
     this.post({ type: "composerHeight", px: Number(this.context.workspaceState.get("kirocrew.composerHeight")) || 0 });
     this.pushSteering().catch((error) => console.warn("[kirocrew] steering inventory unavailable", error));
   }
@@ -571,10 +594,8 @@ class ChatView {
       const slot = this.sessions.slot(key);
       t.title = (slot && (slot.title || slot.label)) || key;
       if (slot && slot.agent && slot.agent !== "default") t.settings.agent = slot.agent;
-      this.saveTabs();
     }
-    this.active = t.id;
-    this.pushTabs();
+    this.select(t.id);
     await this.load(t);
   }
   async load(t) {
@@ -587,7 +608,7 @@ class ChatView {
   async onMessage(msg) {
     try {
       if (msg.type === "ready") { this.onReady(); return; }
-      if (msg.type === "select") { this.active = msg.id; this.pushTabs(); return; }
+      if (msg.type === "select") { this.select(msg.id); return; }
       if (msg.type === "close") { this.closeTab(msg.id); return; }
       if (msg.type === "new") { this.newTab(); return; }
       if (msg.type === "history") { await vscode.commands.executeCommand("kirocrew.history"); return; }
@@ -614,8 +635,13 @@ class ChatView {
       } else if (msg.type === "pickContext") {
         const item = await pickContext(msg.kind, this.sessions.projectPath());
         if (item) this.post({ type: "context", id: t.id, item });
+      } else if (msg.type === "image" && msg.path) {
+        this.post(Object.assign({ type: "image", id: t.id, path: msg.path }, await imageData(msg.path)));
       } else if (msg.type === "stop" && t.key) {
+        t.stopped = true; // a run the user stopped is not resumed on its own
         await this.sessions.stop(t.key);
+      } else if (msg.type === "resume" && t.key) {
+        await this.resume(t, "button");
       } else if (msg.type === "approve" && t.key) {
         await this.sessions.approve(t.key, msg.requestId, msg.action);
       } else if (msg.type === "dashboard" && t.key) {
@@ -640,11 +666,21 @@ class ChatView {
    * contexts and the workflow frame as silent background context; then send.
    */
   async send(t, msg) {
-    const s = t.settings;
-    let text = String(msg.text || "");
+    const text = String(msg.text || "");
     const files = Array.isArray(msg.files) ? msg.files : [];
     const contexts = Array.isArray(msg.contexts) ? msg.contexts : [];
     if (!text.trim() && !files.length && !contexts.length) return;
+    // The page drew this turn's bubble already (`msg.local`) and set its pane to running;
+    // should anything below throw, the error row lands under it and the pane is released.
+    const release = () => { if (msg.local) this.post({ type: "done", id: t.id }); };
+    try { await this._send(t, msg, text, files, contexts); } catch (error) { release(); throw error; }
+  }
+  async _send(t, msg, text, files, contexts) {
+    const s = t.settings;
+    text = String(text || "");
+    // A new turn supersedes the judgement of the last one.
+    if (t.runCheck) { clearTimeout(t.runCheck); t.runCheck = null; }
+    t.turnError = ""; t.stopped = false; t.lastAssistant = "";
     // A Kiro Spec & Plan agent for this mode runs Kiro's real workflow; it
     // replaces both the agent pick and the frame — unless this host refuses the
     // mode ids (KiroCrew 0.8.0.9+ reserves KAS's bundled ids before the wire, see
@@ -678,7 +714,10 @@ class ChatView {
     for (const f of files) {
       const bytes = Uint8Array.from(atob(f.data || ""), (c) => c.charCodeAt(0));
       const path = await this.sessions.upload(f.name || "attachment", bytes, f.mime);
-      attached.push({ name: f.name, path, image: /^image\//.test(f.mime || "") });
+      const image = /^image\//.test(f.mime || "");
+      // The bytes are at hand: an image under the preview cap goes back to the page as a data URL
+      // for its thumbnail, so the bubble shows the picture without a round trip to the disk.
+      attached.push({ name: f.name, path, image, data: image && bytes.length <= IMAGE_PREVIEW_MAX ? "data:" + f.mime + ";base64," + f.data : undefined });
     }
     // Steering, Kiro's way: `fileMatch` documents whose pattern matches a file in
     // this turn's context (a `#` file/open-files pick, the editors on screen)
@@ -703,7 +742,8 @@ class ChatView {
     // A session's first turn says what steers it (Kiro's IDE shows the included steering as context).
     if (steered && steered.note) this.post({ type: "status", id: t.id, text: steered.note });
     // The transcript shows what was typed (the chips name the files); the markers are for the host.
-    this.post({ type: "user", id: t.id, text: msg.display || typed || text, contexts: contexts.map((c) => c.label), files: attached.map((a) => a.name) });
+    // `local` names the bubble the page drew at send time, which this message completes.
+    this.post({ type: "user", id: t.id, local: msg.local || undefined, text: msg.display || typed || text, contexts: contexts.map((c) => c.label), files: attached.map((a) => ({ name: a.name, path: a.path, image: a.image, data: a.data })) });
     const meta = attached.length ? { files: attached.map((a) => a.path) } : undefined;
     // The host accepts the turn (`/chat?ws=1` answers 200 at once) and runs it
     // asynchronously, so a refusal of Kiro's mode agent usually arrives later
@@ -802,17 +842,171 @@ class ChatView {
    * tool of the session, as Kiro's IDE does for task runs. Neither is
    * inherited by the next tab. Returns the session key.
    */
-  async dispatch(text, { mode, agent, title, kind, display, autopilot } = {}) {
+  async dispatch(text, { mode, agent, title, kind, display, autopilot, run } = {}) {
     const t = this.newTab(true);
     if (mode) t.settings.mode = mode;
     if (agent) t.settings.agent = agent;
     if (autopilot) t.settings.autopilot = true;
     t.kind = kind || "spec";
+    // A task run remembers what it runs, so the host's turn ceiling can be
+    // resumed from tasks.md (see onTurnLimit); `resumed` counts those resumes.
+    t.run = run ? Object.assign({ resumed: 0 }, run) : null;
     t.pendingTitle = title;
     this.pushTabs();
     const body = typeof text === "function" ? text(kasAgentFor(t.settings.mode, this.sessions.agents)) : text;
     await this.send(t, { text: body, display });
     return t.key;
+  }
+  /**
+   * Continue a tab whose turn the host cut at its ceiling: a task run re-reads
+   * tasks.md and sends the run's own request again (Kiro's engine request on
+   * the Spec agent, the paraphrase otherwise), skipping what is ticked; a plain
+   * chat sends a continuation. `why` is "limit" (automatic) or "button".
+   * Nothing is sent while the session is still running or when nothing is left.
+   */
+  async resume(t, why) {
+    if (!t.key) return false;
+    const slot = this.sessions.slot(t.key);
+    if (slot && slot.running) { this.post({ type: "status", id: t.id, text: "The session is still running; nothing to resume." }); return false; }
+    if (t.run) {
+      const kas = this.modeAgentsRefused ? null : kasAgentFor(t.settings.mode, this.sessions.agents);
+      const r = await resumeRequest(t.run, kas);
+      if (!r.text) { this.post({ type: "status", id: t.id, text: "Nothing to resume: " + r.reason + "." }); return false; }
+      log("resume (" + why + ") " + t.key + ": " + r.display);
+      await this.send(t, { text: r.text, display: r.display });
+      return true;
+    }
+    log("resume (" + why + ") " + t.key + ": plain continuation");
+    await this.send(t, { text: RESUME_CHAT_TEXT });
+    return true;
+  }
+  /**
+   * A turn on this tab ended (`chat_done`), or the host posted a failure row.
+   * Whether the task run is finished is judged a moment later from tasks.md
+   * (see checkRun), not from the error text: the ⏱ card, "Connection
+   * unstable", a backend error and a model that simply stopped all leave the
+   * same evidence in the file, and only the file says whether work is left. A
+   * failure row records the reason for the message; the turn-ceiling card is
+   * the one row the host guarantees is terminal (it follows the turn's
+   * `chat_done`), so it arms the check itself; any other error row only joins
+   * a check that `chat_done` already armed, since the host also posts
+   * non-terminal ones mid-turn ("⟳ Connection unstable — resuming…").
+   */
+  noteTurnEnd(t, { done, error } = {}) {
+    if (error) t.turnError = String(error);
+    if (!done && !t.runCheck && !(error && isTurnLimitRow({ role: "error", content: error }))) return;
+    if (t.runCheck) clearTimeout(t.runCheck);
+    t.runCheck = setTimeout(() => {
+      t.runCheck = null;
+      this.checkRun(t, "turn").catch((e) => this.post({ type: "error", id: t.id, text: "resume: " + e.message }));
+    }, this.settleMs != null ? this.settleMs : RESUME_SETTLE_MS);
+  }
+  /**
+   * The run this tab carries: the record `dispatch` kept, or, for a Spec tab
+   * without one (a tab from before the record existed, a run the dashboard
+   * started, a window reloaded mid-run), the one spec of the project whose
+   * tasks.md still carries Kiro's `[~]` / `[-]` marks — the orchestrator writes
+   * those as it goes and leaves none behind when it finishes, so they are the
+   * run's own trace. Adopted onto the tab (`derived`), so later checks and the
+   * resume count see the same run. Several such specs: none is guessed.
+   */
+  async runOf(t) {
+    if (t.run) return t.run;
+    if (!isSpecTab(t)) return null;
+    const specs = await listSpecs();
+    const interrupted = specs.filter((s) => s.tasks.some((x) => x.leaf && (x.queued || x.partial)));
+    if (interrupted.length !== 1) return interrupted.length ? { several: interrupted.map((s) => s.name) } : null;
+    const s = interrupted[0];
+    t.run = { resumed: 0, spec: s.name, dir: s.dir.path, task: null, optional: s.tasks.some((x) => x.leaf && (x.queued || x.partial) && x.optional), display: "Run all tasks", derived: true };
+    this.saveTabs();
+    return t.run;
+  }
+  /**
+   * Judge the tab's run against tasks.md and act. Unfinished means: the run's
+   * spec still has queued (`[~]`) or in-progress (`[-]`) rows, or — for a run
+   * this IDE dispatched, which asked for every remaining task — required rows
+   * still open; and the session is idle. Then, unless the user stopped it, a
+   * question is waiting, or the turn ended on what reads as a question, the
+   * run resumes itself (`kirocrew.specAutoResume`, up to `specResumeLimit`);
+   * otherwise, and at startup, a card with a Resume button says what is left.
+   * `when` is "turn" or "startup".
+   */
+  async checkRun(t, when) {
+    if (!t.key) return false;
+    const error = t.turnError || ""; t.turnError = "";
+    const stopped = Boolean(t.stopped); t.stopped = false;
+    const run = await this.runOf(t);
+    if (!run) return false;
+    if (run.several) {
+      this.post({ type: "interrupted", id: t.id, text: "Several specs carry an interrupted run (" + run.several.join(", ") + "); resume the right one from the Specs view (its ⟳ Resume run)." });
+      return false;
+    }
+    const slot = this.sessions.slot(t.key);
+    if (slot && slot.running) return false;
+    const limit = isTurnLimitRow({ role: "error", content: error });
+    const state = await runState(run);
+    const unfinished = state && (state.queued || state.partial || (!run.derived && state.remaining));
+    // The ceiling card is explicit: even with nothing left, resume() says so (as before).
+    if (!unfinished && !limit) return false;
+    const left = state ? describeLeft(state) : "";
+    const cause = limit ? "The host stopped this turn at its " + turnLimitOf(error) + " limit"
+      : error ? "The turn ended on an error (" + clip(error.split("\n")[0], 120) + ")"
+      : "The turn ended" + (left ? " with " + left : "") + ", without finishing the run";
+    if (stopped) { this.post({ type: "interrupted", id: t.id, text: "Stopped" + (left ? " with " + left : "") + ". Resume run continues from tasks.md.", resume: true }); return false; }
+    if (t.questions && t.questions.size) { this.post({ type: "interrupted", id: t.id, text: "The run is waiting on your answer above" + (left ? " (" + left + ")" : "") + "." }); return false; }
+    if (!limit && looksLikeQuestion(t.lastAssistant)) { this.post({ type: "interrupted", id: t.id, text: cause + " and seems to be asking you something; answer it, or Resume run to carry on from tasks.md.", resume: true }); return false; }
+    if (when === "startup") { this.post({ type: "interrupted", id: t.id, text: "This run was interrupted" + (left ? ": " + left : "") + ", and the session is idle. Resume run continues from tasks.md.", resume: true }); return false; }
+    if (cfg("specAutoResume", true) === false) {
+      this.post({ type: "status", id: t.id, text: cause + "; auto-resume is off (kirocrew.specAutoResume). " + (limit ? "Continue" : "Resume run") + " resumes the run by hand." });
+      if (!limit) this.post({ type: "interrupted", id: t.id, text: left ? "Left in tasks.md: " + left + "." : "The run did not finish.", resume: true });
+      return false;
+    }
+    const cap = Math.max(0, Math.floor(Number(cfg("specResumeLimit", 3))) || 0);
+    const resumed = Number(run.resumed) || 0;
+    if (resumed >= cap) {
+      const times = (resumed + 1) + " time" + (resumed ? "s" : "");
+      if (limit) this.post({ type: "error", id: t.id, text: "Stopped at the host's " + turnLimitOf(error) + " limit " + times + " on this run; not resuming again on its own (kirocrew.specResumeLimit = " + cap + "). Continue resumes it by hand; agent.chat_turn_timeout_secs in ~/.kiro/crew/config.json raises the host's limit (up to 24 h)." });
+      else this.post({ type: "interrupted", id: t.id, text: cause + ", " + times + " on this run; not resuming again on its own (kirocrew.specResumeLimit = " + cap + "). Resume run continues it by hand.", resume: true });
+      return false;
+    }
+    run.resumed = resumed + 1;
+    this.saveTabs();
+    this.post({ type: "status", id: t.id, text: cause + "; resuming the run from tasks.md (" + run.resumed + " of " + cap + ")…" });
+    try {
+      return await this.resume(t, limit ? "limit" : error ? "error" : "unfinished");
+    } catch (e) {
+      this.post({ type: "error", id: t.id, text: "resume: " + e.message });
+      return false;
+    }
+  }
+  /** Kept for callers of the 0.27 name: the ceiling card is one cause the check reads. */
+  async onTurnLimit(t, row) { this.noteTurnEnd(t, { error: row.content }); }
+  /**
+   * Resume the run of `spec` from the Specs view or the spec editor: in the
+   * tab that ran it when there is one and it is idle (the orchestrator keeps
+   * its context), else in a fresh Spec tab the way Run all tasks starts one.
+   * Returns "resumed", "running", or "dispatched".
+   */
+  async resumeSpec(spec, dispatch) {
+    let t = this.tabs.find((x) => x.key && x.run && x.run.spec === spec.name && (!x.run.dir || sameDir(x.run.dir, spec.dir.path)));
+    if (!t) {
+      // A Spec tab without a record adopts the interrupted spec if it is the one.
+      for (const x of this.tabs) if (x.key && !x.run && isSpecTab(x) && (await this.runOf(x)) && x.run && x.run.spec === spec.name) { t = x; break; }
+    }
+    if (t) {
+      const slot = this.sessions.slot(t.key);
+      this.select(t.id);
+      if (slot && slot.running) { this.post({ type: "status", id: t.id, text: "The run is still going in this session." }); return "running"; }
+      t.turnError = ""; t.stopped = false;
+      await this.resume(t, "button");
+      return "resumed";
+    }
+    await dispatch();
+    return "dispatched";
+  }
+  /** Startup: every restored tab is judged once (card only, never a send) after its history is in. */
+  async checkRestoredRuns() {
+    for (const t of this.tabs) if (t.key) await this.checkRun(t, "startup").catch((e) => log("run check (startup) " + t.key + ": " + e.message));
   }
   /** A composer pick changed: remember it on the tab (and as the default for new tabs), apply it live when the session exists. */
   async setSetting(t, key, value) {
@@ -870,8 +1064,8 @@ class ChatView {
     if (!t) return;
     const id = t.id;
     switch (frame.type) {
-      case "question_card": this.post({ type: "question", id, card: frame.data }); break;
-      case "question_card_resolved": this.post({ type: "questionResolved", id, qid: frame.data.ask_id || frame.data.card_id }); break;
+      case "question_card": (t.questions || (t.questions = new Set())).add(frame.data.ask_id || frame.data.card_id || "q"); this.post({ type: "question", id, card: frame.data }); break;
+      case "question_card_resolved": if (t.questions) t.questions.delete(frame.data.ask_id || frame.data.card_id || "q"); this.post({ type: "questionResolved", id, qid: frame.data.ask_id || frame.data.card_id }); break;
       case "chat_chunk": this.post({ type: "chunk", id, text: frame.data.content || "", seq: frame.data.seq }); break;
       case "chat_segment": this.post({ type: "segment", id }); break;
       case "chat_thinking": this.post({ type: "thinking", id, text: frame.data.content || frame.data.text || "" }); break;
@@ -885,9 +1079,14 @@ class ChatView {
           break;
         }
         this.post({ type: "row", id, row });
+        // The answer's text decides later whether a stop was a question; a
+        // failure row (the ceiling card included) is the reason the run check
+        // reads once the turn is judged from tasks.md.
+        if (row.role === "assistant" && !isErrorRow(row)) t.lastAssistant = row.content || "";
+        if (isErrorRow(row)) this.noteTurnEnd(t, { error: row.content });
         break;
       }
-      case "chat_done": this.post({ type: "done", id }); break;
+      case "chat_done": this.post({ type: "done", id }); this.noteTurnEnd(t, { done: true }); break;
       // The tool row itself arrives as a chat_message; its result and any
       // refined title/arguments come as separate frames keyed by tool_call_id.
       case "tool_result": this.post({ type: "toolResult", id, tcid: frame.data.tool_call_id || "", output: frame.data.output }); break;
@@ -946,6 +1145,52 @@ async function installFromMarketplace(prefill) {
  * Accepts absolute paths, workspace-relative paths (`src/a.py`, `./a.py`) and
  * `path:line[:col]`. Relative paths are tried against every workspace folder.
  */
+/** Largest image the transcript previews inline (bytes); past it the card names the file and opens it on click. */
+const IMAGE_PREVIEW_MAX = 8 * 1024 * 1024;
+const IMAGE_MIME = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml", avif: "image/avif" };
+const imageCache = new Map(); // path -> data URL, the last few the page asked for
+/**
+ * The bytes of an image on the gateway host as a data URL, for the page to show.
+ * A webview cannot reach the disk, and the dashboard's uploads live outside the
+ * workspace (`~/.kiro/crew/uploads/`), so the extension reads them the way it
+ * reads `~/.kiro/crew/config.json`: through the workbench's remote fs, which sees
+ * the same disk the sessions write to. Returns `{ data }` or `{ error }`.
+ */
+async function imageData(rawPath) {
+  const path = String(rawPath || "");
+  const ext = (path.match(/\.(\w+)$/) || [, ""])[1].toLowerCase();
+  const mime = IMAGE_MIME[ext];
+  if (!mime) return { error: "not an image file" };
+  if (imageCache.has(path)) return { data: imageCache.get(path) };
+  const folders = vscode.workspace.workspaceFolders || [];
+  const candidates = [];
+  if (path.startsWith("/")) {
+    if (folders.length) candidates.push(folders[0].uri.with({ path }));
+    candidates.push(vscode.Uri.file(path));
+  } else {
+    for (const folder of folders) candidates.push(vscode.Uri.joinPath(folder.uri, path.replace(/^\.\//, "")));
+  }
+  let lastError = "not found";
+  for (const uri of candidates) {
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.size > IMAGE_PREVIEW_MAX) return { error: "too large to preview (" + (stat.size / 1048576).toFixed(1) + " MB)" };
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const data = "data:" + mime + ";base64," + bytesToBase64(bytes);
+      imageCache.set(path, data);
+      while (imageCache.size > 24) imageCache.delete(imageCache.keys().next().value);
+      return { data };
+    } catch (e) { lastError = (e && e.message) || String(e); }
+  }
+  return { error: lastError };
+}
+function bytesToBase64(bytes) {
+  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
 async function openPathLink(rawPath, line, column) {
   const folders = vscode.workspace.workspaceFolders || [];
   const candidates = [];
@@ -1144,7 +1389,21 @@ const STEERING_MAX_DEPTH = 8;
  * `steering/amazon-builder/git.md` is named `amazon-builder/git` and labelled by
  * that relative path; `#name` accepts the path or, when unique, the bare name.
  */
+// The steering inventory is read on every send (and for the compass). Each directory and
+// each file is an RPC through the workbench's remote fs, so the result is kept for a short
+// while: a save under .kiro/steering invalidates it at once (the Steering view's watcher),
+// and STEERING_CACHE_MS bounds how stale an edit to ~/.kiro/steering can look.
+const STEERING_CACHE_MS = 20000;
+let steeringCache = null; // { key, at, docs }
+function invalidateSteeringCache() { steeringCache = null; }
 async function listSteering(root) {
+  const key = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.path).join("|");
+  if (steeringCache && steeringCache.key === key && Date.now() - steeringCache.at < STEERING_CACHE_MS) return steeringCache.docs;
+  const docs = await scanSteering(root);
+  steeringCache = { key, at: Date.now(), docs };
+  return docs;
+}
+async function scanSteering(root) {
   const out = [];
   const scan = async (base, scope, rel, depth) => {
     let entries = [];
@@ -1300,7 +1559,14 @@ function chatHtml(foxUri) {
   // menus are in-page popovers (window.confirm & co. do nothing in the desktop app).
   return `<!doctype html><html><head><meta charset="utf-8">
 <style>
- :root{color-scheme:light dark;--kide-msg-size:inherit}
+ :root{color-scheme:light dark;--kide-msg-size:inherit;
+   /* The reading column, as the dashboard's Chat settings have it: Compact is a
+      centred 800px (816px for the composer) scaled by the message font size, so a
+      wide pane gets margins instead of 200-character lines; a narrow pane keeps
+      its 8px. Comfortable / Full are percentages (84% / 92%). */
+   --kide-content-width:800px;--kide-input-width:816px;--kide-scrollbar:0px;
+   --kide-gutter:max(8px,calc((100% - var(--kide-content-width))/2));
+   --kide-input-gutter:max(5px,calc((100% - var(--kide-input-width))/2))}
  body{margin:0;padding:0;font:13px/1.45 var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-sideBar-background);display:flex;flex-direction:column;height:100vh}
  #tabs{display:flex;align-items:stretch;overflow-x:auto;border-bottom:1px solid var(--vscode-panel-border);background:var(--vscode-editorGroupHeader-tabsBackground,transparent);min-height:30px;scrollbar-width:none}
  .tab{display:flex;align-items:center;gap:5px;padding:0 6px 0 8px;font-size:12px;white-space:nowrap;cursor:pointer;border-right:1px solid var(--vscode-tab-border,transparent);color:var(--vscode-tab-inactiveForeground);background:var(--vscode-tab-inactiveBackground,transparent);max-width:180px}
@@ -1317,7 +1583,7 @@ function chatHtml(foxUri) {
  /* Message rows follow KiroCrew's own transcript: the user's turn is a bubble
     on the right (its card colour, small radius), the assistant's is bare text
     on the surface, tool/status lines are a quiet mono row with a hairline. */
- .log.on{display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:8px 8px 4px}
+ .log.on{display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:8px var(--kide-gutter) 4px}
  .log>*{flex:none}
  .row{margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;line-height:1.55;min-width:0}
  .user{align-self:flex-end;width:fit-content;max-width:92%;background:var(--vscode-input-background);color:var(--vscode-input-foreground,inherit);border:1px solid var(--vscode-input-border,var(--vscode-widget-border,transparent));padding:6px 10px;border-radius:6px}
@@ -1327,7 +1593,7 @@ function chatHtml(foxUri) {
     card in the bubble's own colours (three lines on hover, the whole prompt on
     ⌄); clicking it scrolls back to where the turn starts. The wrapper lets the
     transcript take every click around the card. */
- .pin{position:absolute;top:0;left:8px;right:8px;z-index:3;display:flex;justify-content:flex-end;padding:4px 0 0;pointer-events:none;font-size:var(--kide-msg-size)}
+ .pin{position:absolute;top:0;left:var(--kide-gutter);right:calc(var(--kide-gutter) + var(--kide-scrollbar));z-index:3;display:flex;justify-content:flex-end;padding:4px 0 0;pointer-events:none;font-size:var(--kide-msg-size)}
  .pin[hidden]{display:none}
  .pin-card{pointer-events:auto;display:flex;align-items:flex-start;gap:4px;max-width:92%;min-width:0;background:var(--vscode-input-background);color:var(--vscode-input-foreground,inherit);border:1px solid var(--vscode-input-border,var(--vscode-widget-border,transparent));border-radius:6px;padding:4px 6px 4px 10px;box-shadow:0 2px 8px rgba(0,0,0,.22);will-change:transform;transition:transform .08s linear}
  .pin-text{flex:1;min-width:0;margin:0;padding:0;border:0;background:transparent;color:inherit;font:inherit;line-height:1.55;text-align:left;cursor:pointer;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:1;overflow:hidden;white-space:normal;word-break:break-word;overflow-wrap:anywhere}
@@ -1337,6 +1603,16 @@ function chatHtml(foxUri) {
  .pin.more .pin-more{display:inline-block}.pin-more:hover{opacity:1}.pin.open .pin-more{transform:rotate(180deg)}
  .pin-text:focus-visible,.pin-more:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:1px}
  @media (prefers-reduced-motion:reduce){.pin-card{transition:none}}
+ /* Jump to latest: a pill over the pane's bottom edge while the transcript is scrolled up
+    (the dashboard's scroll-to-bottom), in the widget colours, accented once new content
+    arrived unseen. */
+ .jump{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);z-index:3;display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 12px;border-radius:6px;border:1px solid var(--vscode-input-border,var(--vscode-widget-border,transparent));background:var(--vscode-editorWidget-background,var(--vscode-input-background));color:var(--vscode-foreground);font:inherit;font-size:12px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+ .jump[hidden]{display:none}
+ .jump:hover{background:var(--vscode-toolbar-hoverBackground,var(--vscode-button-secondaryHoverBackground,var(--vscode-editorWidget-background)))}
+ .jump:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:1px}
+ .jump.new{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border-color:transparent}
+ .jump.new:hover{background:var(--vscode-button-hoverBackground,var(--vscode-button-background))}
+ .jump .ja{font-size:13px;line-height:1}
  .assistant,.streaming{padding:0 2px}
  .tool,.status,.thinking{color:var(--vscode-descriptionForeground);font-size:12px;font-family:var(--vscode-editor-font-family);padding:3px 8px;border-radius:4px;background:var(--vscode-editorWidget-background,transparent);box-shadow:inset 0 0 0 1px var(--vscode-widget-border,var(--vscode-panel-border))}
  .status{background:transparent;box-shadow:none;padding:0 2px}
@@ -1397,6 +1673,27 @@ function chatHtml(foxUri) {
     host's failure rows (cls "msg-err", or a ❌/⏱-prefixed assistant row). */
  .error,.row.err{color:var(--vscode-errorForeground,#e5484d);background:color-mix(in srgb,var(--vscode-errorForeground,#e5484d) 10%,transparent);border:1px solid color-mix(in srgb,var(--vscode-errorForeground,#e5484d) 40%,transparent);border-radius:6px;padding:6px 10px;white-space:pre-wrap}
  .row.err .md a,.error a{color:inherit}
+ .row.err button.resume,.row.pause button.resume{display:block;margin:8px 0 2px;background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+ .row.err button.resume[disabled],.row.pause button.resume[disabled]{opacity:.6;cursor:default}
+ /* An interrupted run (judged from tasks.md, not from an error): the warning tint, not the red. */
+ .row.pause{color:var(--vscode-foreground);background:color-mix(in srgb,var(--vscode-editorWarning-foreground,#d9a300) 10%,transparent);border:1px solid color-mix(in srgb,var(--vscode-editorWarning-foreground,#d9a300) 45%,transparent);border-radius:6px;padding:6px 10px;white-space:pre-wrap}
+ /* The host's injected rows (a tool call a safety policy stopped, a turn the gateway
+    resumed, a Continue you asked for): the dashboard's recovery card — a one-line header
+    (chevron, icon, bold title, muted detail, the matched pattern as a mono chip) and the
+    whole notice under it on click. Attention kinds get the warning tint on the icon. */
+ .recov{padding:0;white-space:normal;font-size:12px;color:var(--vscode-descriptionForeground);background:var(--vscode-editorWidget-background,transparent);border:1px solid var(--vscode-widget-border,var(--vscode-panel-border,rgba(128,128,128,.35)));border-radius:6px}
+ .recov .rc-head{display:flex;align-items:center;gap:6px;width:100%;min-width:0;margin:0;padding:5px 10px;border:0;border-radius:6px;background:transparent;color:inherit;font:inherit;font-size:13px;line-height:20px;text-align:left;cursor:pointer}
+ .recov .rc-head:hover{color:var(--vscode-foreground)}
+ .rc-chev{flex:none;opacity:.6;font-size:13px;line-height:1;transition:transform .2s}
+ .recov[data-open="true"] .rc-chev{transform:rotate(90deg)}
+ .rc-ico{flex:none;display:inline-flex;width:13px;height:13px}
+ .rc-ico svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+ .recov[data-severity="attention"] .rc-ico{color:var(--vscode-editorWarning-foreground,#d9a300)}
+ .rc-title{flex:none;font-weight:600;color:var(--vscode-foreground)}
+ .rc-detail{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;opacity:.75}
+ .rc-chip{flex:0 1 auto;min-width:40px;max-width:45%;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--vscode-editor-font-family);font-size:11px;line-height:16px;padding:0 5px;border:1px solid var(--vscode-widget-border,var(--vscode-panel-border,rgba(128,128,128,.35)));border-radius:4px;background:var(--vscode-editor-background);color:var(--vscode-foreground)}
+ .rc-body{margin:0;padding:6px 10px 8px;border-top:1px solid var(--vscode-widget-border,var(--vscode-panel-border,rgba(128,128,128,.35)));font-family:var(--vscode-editor-font-family);font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;color:var(--vscode-foreground)}
+ .rc-body[hidden]{display:none}
  a.path,a.link{color:var(--vscode-textLink-foreground);text-decoration:none;cursor:pointer}a.path:hover,a.link:hover{text-decoration:underline}
  .assistant{white-space:normal}
  .md p{margin:0 0 6px}.md p:last-child{margin-bottom:0}
@@ -1412,9 +1709,29 @@ function chatHtml(foxUri) {
  .md th,.md td{border:1px solid var(--vscode-panel-border);padding:2px 6px;vertical-align:top}.md th{background:var(--vscode-editorWidget-background);font-weight:600}
  .md hr{border:0;border-top:1px solid var(--vscode-panel-border);margin:6px 0}
  .md del{opacity:.7}.md .box{opacity:.8}.md .box.on{color:var(--vscode-charts-green,inherit)}
- #compose{display:flex;flex-direction:column;gap:4px;padding:5px 5px 4px;border-top:1px solid var(--vscode-panel-border)}
+ #compose{display:flex;flex-direction:column;gap:4px;padding:5px var(--kide-input-gutter) 4px;border-top:1px solid var(--vscode-panel-border)}
  #chips{display:none;flex-wrap:wrap;gap:4px}#chips.has{display:flex}
  .chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:1px 6px;border-radius:10px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);max-width:100%}
+ /* Images in the chat. A pasted or attached image is a thumbnail in the composer's chip row
+    (× at its corner); in the user's bubble it is a picture under the text; a markdown image
+    in an answer is drawn in place. Every one opens full size in the lightbox on click. */
+ .chip.img{position:relative;padding:0;background:transparent;border-radius:4px;overflow:visible}
+ .chip.img img{display:block;height:48px;max-width:140px;object-fit:cover;border-radius:4px;border:1px solid var(--vscode-widget-border,var(--vscode-panel-border));cursor:zoom-in}
+ .chip.img .rm{position:absolute;top:-6px;right:-6px;width:16px;height:16px;line-height:14px;border-radius:50%;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);border:1px solid var(--vscode-widget-border,transparent);padding:0;text-align:center;opacity:1}
+ .user .att{display:flex;flex-wrap:wrap;align-items:flex-start;gap:6px;margin:4px 0 2px}
+ .user .att img,.md img.mdimg{display:block;max-width:min(100%,360px);max-height:220px;object-fit:contain;border-radius:4px;border:1px solid var(--vscode-widget-border,var(--vscode-panel-border));cursor:zoom-in;background:var(--vscode-editor-background)}
+ .md img.mdimg{margin:6px 0;max-width:min(100%,560px);max-height:360px}
+ .imgph{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border:1px dashed var(--vscode-widget-border,var(--vscode-panel-border));border-radius:4px;font-size:11px;color:var(--vscode-descriptionForeground);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .imgph.err{border-style:solid}.imgph a.path{color:inherit}
+ .user .file{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:1px 6px;border-radius:10px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);cursor:pointer;max-width:100%}
+ #lightbox{position:fixed;inset:0;z-index:20;display:none;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(0,0,0,.78);padding:16px;box-sizing:border-box}
+ #lightbox.on{display:flex}
+ #lightbox img{max-width:100%;max-height:calc(100vh - 80px);object-fit:contain;box-shadow:0 6px 30px rgba(0,0,0,.5);background:var(--vscode-editor-background)}
+ #lightbox .lb-bar{display:flex;align-items:center;gap:10px;color:#eee;font-size:12px;max-width:100%}
+ #lightbox .lb-name{opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60vw}
+ #lightbox button{border:1px solid rgba(255,255,255,.35);background:rgba(255,255,255,.08);color:#fff;border-radius:4px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer}
+ #lightbox button:hover{background:rgba(255,255,255,.18)}
+ #compose.drop{outline:2px dashed var(--vscode-focusBorder);outline-offset:-3px}
  .chip b{font-weight:600;opacity:.8}.chip .rm{cursor:pointer;opacity:.7;border:0;background:transparent;color:inherit;padding:0;font-size:12px;line-height:1}
  /* The input box grows with its text (up to ~45% of the pane) and has a drag grip
     on its top edge for a height of your own; the chosen height is remembered.
@@ -1453,6 +1770,8 @@ function chatHtml(foxUri) {
 <div id="tabs"></div>
 <div id="panes">
  <div id="pin" class="pin" hidden data-testid="pinned-prompt"><div class="pin-card"><button type="button" class="pin-text" title="Jump to this turn"></button><button type="button" class="pin-more" title="Show the whole prompt" aria-expanded="false">⌄</button></div></div>
+ <button type="button" id="jump" class="jump" hidden data-testid="jump-to-latest" title="Scroll to the newest message"><span class="jl">Jump to latest</span><span class="ja" aria-hidden="true">↓</span></button>
+ <div id="lightbox" role="dialog" aria-modal="true" aria-label="Image preview" data-testid="lightbox"><img alt=""><div class="lb-bar"><span class="lb-name"></span><button type="button" class="lb-open">Open file</button><button type="button" class="lb-close" title="Close (Esc)">Close</button></div></div>
 </div>
 <div id="compose">
  <div id="grip" title="Drag to resize the input box; double-click for automatic height" role="separator" aria-orientation="horizontal" aria-label="Resize input box"></div>
@@ -1483,6 +1802,7 @@ const vscode = acquireVsCodeApi();
 const FOX = ${JSON.stringify(foxUri || "")};
 const $ = (id) => document.getElementById(id);
 const tabsEl = $('tabs'), panes = $('panes'), text = $('text'), menu = $('menu'), chipsEl = $('chips');
+const jump = $('jump'), jumpLabel = jump.querySelector('.jl');
 const PATH_RE = new RegExp(${JSON.stringify(PATH_RE.source)}, 'g');
 const state = new Map(); // tab id -> {log, streaming, buf, seen, cards, key, contexts, files, running, settings}
 let active = null;
@@ -1490,7 +1810,7 @@ let choices = { agents: [], models: [], efforts: [] };
 function pane(id){
   let st = state.get(id);
   if(!st){
-    const log=document.createElement('div'); log.className='log'; log.dataset.id=id; panes.appendChild(log); log.addEventListener('scroll', pinSchedule, { passive:true });
+    const log=document.createElement('div'); log.className='log'; log.dataset.id=id; panes.appendChild(log); log.addEventListener('scroll', ()=>{ pinSchedule(); followUpdate(state.get(id)); }, { passive:true });
     const empty=document.createElement('div'); empty.className='empty';
     if(FOX){const im=document.createElement('img'); im.src=FOX; im.alt=''; empty.appendChild(im);}
     const tx=document.createElement('div'); tx.textContent='New chat — pick an agent and a workflow below, then say something.'; empty.appendChild(tx); log.appendChild(empty);
@@ -1499,19 +1819,53 @@ function pane(id){
     const work=document.createElement('div'); work.className='work'+(FOX?'':' nofox'); work.style.order='1'; work.dataset.testid='working'; work.setAttribute('role','status'); work.setAttribute('aria-label','Agent working');
     for(let i=0;i<4;i++){ if(FOX){const im=document.createElement('img'); im.src=FOX; im.alt=''; work.appendChild(im);} else {const sp=document.createElement('span'); sp.className='fallback'; work.appendChild(sp);} }
     log.appendChild(work);
-    st={log, empty, work, streaming:null, buf:'', seen:new Set(), cards:new Map(), key:null, contexts:[], files:[], running:false, settings:{}, think:null}; state.set(id, st);
+    st={log, empty, work, streaming:null, buf:'', seen:new Set(), cards:new Map(), key:null, contexts:[], files:[], running:false, settings:{}, think:null, follow:true, unseen:false}; state.set(id, st);
   }
   return st;
 }
 // Foxes hop while the turn runs and no answer text is on its way (reasoning,
 // tool calls, the wait before the first token); streaming text replaces them.
 function setWork(st){ if(!st||!st.work) return; const on=Boolean(st.running && !st.streaming && !st.empty); st.work.classList.toggle('on', on); if(on) scrollLog(st); }
-function show(id){ active=id; for(const [tid,st] of state) st.log.classList.toggle('on', tid===id); renderCompose(); pinSchedule(); }
+function show(id){ active=id; for(const [tid,st] of state) st.log.classList.toggle('on', tid===id); renderCompose(); pinSchedule(); jump.hidden=true; const st=state.get(id); if(st) followUpdate(st); }
 function el(st, cls, content){ if(st.empty){st.empty.remove(); st.empty=null;} const d=document.createElement('div');d.className='row '+cls;if(content!==undefined)d.textContent=content;st.log.appendChild(d);return d;}
 // Named scrollLog, NOT scroll: a global \`scroll\` shadows window.scroll(),
 // which the webview host calls during setInitialScrollPosition — the resulting
 // TypeError aborted the host's onLoad chain and left the whole pane blank.
-function scrollLog(st){ if(!st || !st.log) return; st.log.scrollTop = st.log.scrollHeight; }
+// Follow mode, as the dashboard's transcript has it: the pane keeps the newest row in
+// view only while it is at the bottom (within FOLLOW_PX of the end). Scrolled up to read,
+// new content lands without yanking the view, and the ↓ button over the pane (with a
+// "new" note once something arrived) jumps back; reaching the bottom again, by hand or by
+// the button, re-arms following. \`force\` (your own turn, a reload) always scrolls.
+const FOLLOW_PX = 8;
+function atBottom(log){ return log.scrollHeight - log.scrollTop - log.clientHeight <= FOLLOW_PX; }
+function scrollLog(st, force){
+  if(!st || !st.log) return;
+  if(force) st.follow = true;
+  if(st.follow !== false){ st.log.scrollTop = st.log.scrollHeight; st.unseen = false; }
+  else st.unseen = true;
+  jumpUpdate(st);
+}
+function followUpdate(st){
+  if(!st || !st.log) return;
+  const was = st.follow !== false;
+  st.follow = atBottom(st.log);
+  if(st.follow) st.unseen = false;
+  if(st.follow !== was || !st.follow) jumpUpdate(st);
+}
+function jumpUpdate(st){
+  if(!st || active==null || state.get(active)!==st) return;
+  const show = st.follow === false && st.log.classList.contains('on') && !st.empty;
+  jump.hidden = !show;
+  if(!show) return;
+  jump.classList.toggle('new', Boolean(st.unseen));
+  jumpLabel.textContent = st.unseen ? 'New messages' : 'Jump to latest';
+}
+jump.onclick = ()=>{
+  const st = active!=null ? state.get(active) : null; if(!st) return;
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  st.follow = true; st.unseen = false; jumpUpdate(st);
+  if(typeof st.log.scrollTo==='function') st.log.scrollTo({ top: st.log.scrollHeight, behavior: reduce ? 'auto' : 'smooth' }); else st.log.scrollTop = st.log.scrollHeight;
+};
 // ---- the pinned prompt (KiroCrew's pinned-prompt, in the webview's own terms)
 // The pinned turn is the last user row whose top has scrolled above the fold
 // (the card's top edge, 4px under the pane's top); it shows once the bubble
@@ -1536,6 +1890,8 @@ function pinSchedule(){ if(pinRaf) return; pinRaf=requestAnimationFrame(()=>{ pi
 function pinUpdate(){
   const st = active!=null ? state.get(active) : null; const log = st && st.log;
   if(!log || !log.classList.contains('on') || st.empty){ pinSet(null); pin.hidden=true; pinCard.style.transform=''; return; }
+  // The card's right edge lines up with the bubbles', which sit left of the pane's scrollbar.
+  panes.style.setProperty('--kide-scrollbar', Math.max(0, log.offsetWidth - log.clientWidth)+'px');
   const fold = log.getBoundingClientRect().top + PIN_GAP;
   let cur=null, next=null;
   for(const u of log.querySelectorAll('.row.user')){ if(u.getBoundingClientRect().top < fold){ cur=u; } else { if(cur) next=u; break; } }
@@ -1601,14 +1957,30 @@ function toolInputText(input){
   }
   try{ return JSON.stringify(v,null,2); }catch{ return String(v); }
 }
+/* Kiro's task orchestrator announces every status change it writes into tasks.md ([~] queued,
+   [-] in progress, [x] done) as a task_status action with no input, no output and no title:
+   kiro-cli relays it as a completed tool call named task_status, and the host persists that
+   (410 of one spec run's 698 tool rows). The only trace of WHICH task is the action id,
+   <tool id>_taskStatus_<the task's line, sanitized to [A-Za-z0-9_-], the whole id capped at
+   64 chars>; decode it into the task number and the start of its title, and say in the body
+   what the row is instead of "(no output)". */
+const TASK_STATUS_NOTE="Kiro's task orchestrator recorded a status change for this task in tasks.md ([~] queued, [-] in progress, [x] done). This bookkeeping event carries no input or output; the tasks.md marks and the Specs view show the current state.";
+function taskStatusOf(meta, title){
+  const m=/_taskStatus_(.*)$/.exec(String((meta&&meta.tool_call_id)||''));
+  if(!m && title!=='task_status') return null;
+  const raw=m?m[1]:''; const num=/^(\\d+(?:_\\d+)*)(?=_|$)/.exec(raw);
+  const id=num?num[1].replace(/_/g,'.'):''; const text=raw.slice(num?num[0].length:0).replace(/_+/g,' ').trim();
+  return { id, text, label:'Task status'+(id?' · '+id:'')+(text?' '+text+'…':'') };
+}
 function toolRow(st, d, r){
   const meta=r.meta||{}; const content=String(r.content||''); const lines=content.split('\\n'); const first=lines[0];
   const em=/^(\\p{Extended_Pictographic}\\uFE0F?)\\s*/u.exec(first);
-  const title=(typeof meta.purpose==='string' && meta.purpose) || (em ? first.slice(em[0].length) : first) || meta.tool_name || 'tool';
+  let title=(typeof meta.purpose==='string' && meta.purpose) || (em ? first.slice(em[0].length) : first) || meta.tool_name || 'tool';
+  const ts=taskStatusOf(meta, title); if(ts){ title=ts.label; d.classList.add('task'); d.dataset.taskId=ts.id; }
   d.classList.add('call'); d.dataset.tcid=meta.tool_call_id||''; d.dataset.open='false';
-  d._tool={ input: meta.input, output: meta.output, done: Boolean(meta.done), extra: lines.length>1 ? lines.slice(1).join('\\n') : '', body:null };
-  const head=document.createElement('button'); head.type='button'; head.className='tool-head'; head.setAttribute('aria-expanded','false'); head.title="Show this call's input and output";
-  const ic=document.createElement('span'); ic.className='tool-ico'; ic.textContent=em ? em[1] : '🔧';
+  d._tool={ input: meta.input, output: meta.output, done: Boolean(meta.done), extra: lines.length>1 ? lines.slice(1).join('\\n') : '', body:null, note: ts?TASK_STATUS_NOTE:'' };
+  const head=document.createElement('button'); head.type='button'; head.className='tool-head'; head.setAttribute('aria-expanded','false'); head.title=ts?TASK_STATUS_NOTE:"Show this call's input and output";
+  const ic=document.createElement('span'); ic.className='tool-ico'; ic.textContent=ts ? '📋' : (em ? em[1] : '🔧');
   const tt=document.createElement('span'); tt.className='tool-title'; tt.textContent=title;
   const live=document.createElement('span'); live.className='tool-live'; live.title='running';
   const chev=document.createElement('span'); chev.className='tool-chev'; chev.textContent='›';
@@ -1628,7 +2000,10 @@ function toolFill(d){
   const inText = toolInputText(t.input) || t.extra || '';
   t.inPre.parentElement.hidden = !inText; if(inText) linkify(t.inPre, clipText(inText, TOOL_PRE_MAX));
   const out = t.output===undefined||t.output===null ? '' : String(t.output);
-  if(out){ linkify(t.outPre, clipText(out, TOOL_PRE_MAX)); } else { t.outPre.textContent = t.done ? '(no output)' : 'running…'; }
+  const k=t.outPre.parentElement.querySelector('.tool-k');
+  if(out){ linkify(t.outPre, clipText(out, TOOL_PRE_MAX)); k.textContent='Output'; }
+  else if(t.note){ t.outPre.textContent=t.note; k.textContent='Note'; }
+  else { t.outPre.textContent = t.done ? '(no output)' : 'running…'; k.textContent='Output'; }
   t.outPre.classList.toggle('muted', !out);
 }
 function toolToggle(d, open){ const body=toolBody(d); const o = open===undefined ? body.hidden : Boolean(open); body.hidden=!o; d.dataset.open=String(o); d.querySelector('.tool-head').setAttribute('aria-expanded', String(o)); pinSchedule(); }
@@ -1637,7 +2012,7 @@ function toolRows(st, tcid){ return tcid ? [...st.log.querySelectorAll('.row.too
 // still marks it done — the host sends that for tools that print nothing).
 function toolResult(st, tcid, output){ for(const d of toolRows(st, tcid)){ const t=d._tool; if(output!==undefined && output!==null && (String(output) || !t.output)) t.output=String(output); t.done=true; toolLive(st, d); toolFill(d); } }
 // tool_call (is_update): the refined title/arguments of a call already shown.
-function toolUpdate(st, m){ for(const d of toolRows(st, m.tcid)){ const t=d._tool; const title=(typeof m.purpose==='string' && m.purpose) || m.title; if(title){ const tt=d.querySelector('.tool-title'); if(tt) tt.textContent=String(title).replace(/^\\p{Extended_Pictographic}\\uFE0F?\\s*/u,''); } if(m.input && (t.input===undefined||t.input===null||t.input==='')) t.input=m.input; toolFill(d); } }
+function toolUpdate(st, m){ for(const d of toolRows(st, m.tcid)){ const t=d._tool; const title=(typeof m.purpose==='string' && m.purpose) || m.title; if(title && !t.note){ const tt=d.querySelector('.tool-title'); if(tt) tt.textContent=String(title).replace(/^\\p{Extended_Pictographic}\\uFE0F?\\s*/u,''); } if(m.input && (t.input===undefined||t.input===null||t.input==='')) t.input=m.input; toolFill(d); } }
 // The turn ended: nothing is running any more, whatever rows never got a result.
 function toolsSettle(st){ for(const d of st.log.querySelectorAll('.row.tool.call')){ if(d._tool){ d._tool.done=true; toolLive(st, d); toolFill(d); } } }
 function assistant(st, node, s){
@@ -1653,7 +2028,85 @@ function assistant(st, node, s){
 ${mdToHtml.toString()}
 // Assistant text: markdown -> DOM (the renderer escapes everything and emits only
 // data-* anchors; the click delegation below turns them into editor/external opens).
-function renderMd(node, s){ node.classList.add('md'); node.innerHTML = mdToHtml(s); }
+function renderMd(node, s){ node.classList.add('md'); node.innerHTML = mdToHtml(s); hydrateImages(node); }
+// ---- Images. The page cannot read the disk, so a local image (an upload the host kept
+// under ~/.kiro/crew/uploads, a screenshot the agent saved, a markdown image in an answer)
+// is a placeholder until the extension answers an 'image' request with a data URL; the
+// answer is cached per path for the window. A thumbnail or picture opens the lightbox.
+const IMG_EXT = /\\.(?:png|jpe?g|gif|webp|bmp|svg|avif)$/i;
+const imgCache = new Map(), imgPending = new Set();
+function isImagePath(p){ return IMG_EXT.test(String(p||'')); }
+function baseName(p){ return String(p||'').split('/').pop()||String(p||''); }
+function imgRequest(path){ if(imgCache.has(path) || imgPending.has(path)) return; imgPending.add(path); vscode.postMessage({type:'image', id:active, path}); }
+/* An <img> for \`path\`: shown at once from \`data\` or the cache, else a placeholder that the
+   'image' answer swaps for the picture (or an error note naming the file as a link). */
+function imageEl(path, name, data){
+  const src = data || imgCache.get(path);
+  if(src){ const im=document.createElement('img'); im.src=src; im.alt=name||baseName(path); im.title=name||baseName(path); im.dataset.path=path; im.dataset.name=name||baseName(path); return im; }
+  const ph=document.createElement('span'); ph.className='imgph'; ph.dataset.path=path; ph.dataset.name=name||baseName(path); ph.textContent='🖼 '+ph.dataset.name+' …'; ph.title='loading '+path; imgRequest(path); return ph;
+}
+function imgPlace(ph, data, error){
+  const path=ph.dataset.path, name=ph.dataset.name||ph.getAttribute('alt')||baseName(path);
+  if(data){ const im=document.createElement('img'); im.src=data; im.alt=name; im.title=name; im.dataset.path=path; im.dataset.name=name; if(ph.classList.contains('mdimg')) im.className='mdimg'; ph.replaceWith(im); return; }
+  const err=document.createElement('span'); err.className='imgph err'; err.dataset.path=path;
+  const a=document.createElement('a'); a.className='path'; a.dataset.path=path; a.textContent=name; a.title='Open '+path; err.appendChild(document.createTextNode('🖼 ')); err.appendChild(a); err.appendChild(document.createTextNode(' — '+(error||'no preview'))); ph.replaceWith(err);
+}
+/* After a markdown render: every <img data-path> the renderer left is a local image to fetch. */
+function hydrateImages(node){ node.querySelectorAll('img.mdimg[data-path]:not([src])').forEach((im)=>{ const p=im.dataset.path; if(imgCache.has(p)){ im.src=imgCache.get(p); im.dataset.name=im.getAttribute('alt')||baseName(p); } else imgRequest(p); }); }
+function imgArrived(m){
+  imgPending.delete(m.path);
+  if(m.data) imgCache.set(m.path, m.data);
+  document.querySelectorAll('.imgph[data-path], img.mdimg[data-path]:not([src])').forEach((el)=>{ if(el.dataset.path!==m.path) return; if(el.tagName==='IMG'){ if(m.data){ el.src=m.data; el.dataset.name=el.getAttribute('alt')||baseName(m.path); } else imgPlace(el, null, m.error); } else imgPlace(el, m.data, m.error); });
+  pinSchedule();
+}
+/* The user's attachments, from a live send (objects with name/path/image/data) or a history
+   row (the \`[attached_file N] path\` markers in the text plus meta.files, resolved losslessly
+   against that list as the dashboard does; a marker with no list falls back to the path text). */
+function attachmentsOf(content, files){
+  const list = Array.isArray(files) ? files.map((f)=>typeof f==='string'?{path:f}:f).filter((f)=>f&&(f.path||f.name)) : [];
+  const items=[]; const seen=new Set();
+  const add=(f)=>{ const path=f.path||''; const key=path||f.name; if(seen.has(key)) return; seen.add(key); items.push({ name:f.name||baseName(path), path, image: f.image!=null ? Boolean(f.image) : isImagePath(path||f.name), data:f.data }); };
+  // A marker's path is consumed whole when meta.files names it (a path with a space survives);
+  // without the list the whitespace-bounded text after the marker is the best guess.
+  const src=String(content||''); const re=/\\[attached_file (\\d+)\\][ \\t]*/g; let text='', last=0, mm;
+  while((mm=re.exec(src))){
+    text+=src.slice(last, mm.index); let end=re.lastIndex; const f=list[Number(mm[1])-1];
+    if(f && f.path && src.startsWith(f.path, end)){ end+=f.path.length; add(f); }
+    else { const tail=/^\\S*/.exec(src.slice(end))[0]; end+=tail.length; if(f) add(f); else if(tail) add({path:tail}); }
+    last=end; re.lastIndex=end;
+  }
+  text=(text+src.slice(last)).replace(/\\n{3,}/g,'\\n\\n').trim();
+  for(const f of list) add(f);
+  return { text, items };
+}
+/* The user's bubble: # context chips, the typed text (markers stripped; the full prompt is kept
+   for the pinned card), then the attachment strip. One renderer for a live send and a history row. */
+function userBubble(d, content, contexts, files){
+  const { text, items } = attachmentsOf(content, files);
+  d.dataset.prompt = String(text||'');
+  if(contexts && contexts.length){ const c=document.createElement('div'); c.className='ctx'; contexts.forEach((x)=>{ const ch=document.createElement('span'); ch.className='chip'; ch.textContent='#'+x; c.appendChild(ch); }); d.appendChild(c); }
+  if(text) d.appendChild(document.createTextNode(text));
+  if(items.length) d.appendChild(attachmentStrip(items));
+}
+/* The bubble's attachment strip: a picture per image (thumbnail from its data or fetched), a 📎 chip per other file; each opens the file. */
+function attachmentStrip(items){
+  const box=document.createElement('div'); box.className='att';
+  for(const it of items){
+    // An image with its bytes shows at once (a just-sent paste has no path yet); one with only a path is fetched.
+    if(it.image && (it.data || it.path)){ box.appendChild(imageEl(it.path||'', it.name, it.data)); continue; }
+    const ch=document.createElement('span'); ch.className='file'; ch.textContent='📎 '+it.name; if(it.path){ ch.title='Open '+it.path; ch.dataset.path=it.path; ch.onclick=()=>vscode.postMessage({type:'open', id:active, path:it.path}); }
+    box.appendChild(ch);
+  }
+  return box;
+}
+// The lightbox: full size, the file name, Open file (an editor tab), Esc or a click outside closes.
+const lightbox=$('lightbox'), lbImg=lightbox.querySelector('img'), lbName=lightbox.querySelector('.lb-name'), lbOpen=lightbox.querySelector('.lb-open');
+function lightboxShow(src, name, path){ lbImg.src=src; lbImg.alt=name||''; lbName.textContent=name||baseName(path)||''; lbOpen.hidden=!path; lbOpen.dataset.path=path||''; lightbox.classList.add('on'); lightbox.querySelector('.lb-close').focus(); }
+function lightboxHide(){ lightbox.classList.remove('on'); lbImg.removeAttribute('src'); }
+lightbox.addEventListener('click', (e)=>{ if(e.target===lightbox || e.target.classList.contains('lb-close')) lightboxHide(); });
+lbOpen.onclick=()=>{ if(lbOpen.dataset.path) vscode.postMessage({type:'open', id:active, path:lbOpen.dataset.path}); };
+document.addEventListener('keydown', (e)=>{ if(e.key==='Escape' && lightbox.classList.contains('on')){ e.preventDefault(); lightboxHide(); } });
+document.addEventListener('click', (e)=>{ const im=e.target.closest && e.target.closest('.user .att img, .md img.mdimg, .chip.img img'); if(!im || !im.src) return; e.preventDefault(); lightboxShow(im.src, im.dataset.name||im.getAttribute('alt')||'', im.dataset.path||''); });
 document.addEventListener('click', (e)=>{
   const a = e.target.closest && e.target.closest('a.path, a.link, button.copy');
   if(!a) return;
@@ -1701,6 +2154,50 @@ function thinkDelta(st, text){
 }
 function thinkQuiet(t){ t.timer=null; t.box.classList.remove('live'); t.label.textContent='Thought process'; }
 function thinkClose(st){ if(!st||!st.think) return; const t=st.think; clearTimeout(t.timer); thinkQuiet(t); st.think=null; }
+/* The host's injected rows (role "inject"): a tool call a safety policy stopped, a turn the
+   gateway resumed on its own, a Continue the user asked for, a sub-agent synthesis. The
+   dashboard folds each into a collapsed recovery card — a title, a muted detail, the matched
+   policy pattern as a mono chip, the whole notice a click away — and the IDE draws the same
+   card, with the dashboard's own prefix table and wording. A row with no known prefix gets
+   the generic System notice card when its injectKind is recovery or synthesis; an
+   automation_notice row is not shown at all; any other inject row (a cron notification, a
+   replayed user turn) stays the quiet mono row it was. */
+const INJECT_KINDS=[['refusal','[Tool refusal — automatic recovery]'],['tool_blocked','[Tool blocked — reason sent to the agent]'],['stalled','[Stalled turn — automatic recovery]'],['tool_stall','[Tool stall — automatic recovery]'],['connection','[Connection lost — automatic recovery]'],['busy','[Session busy — automatic recovery]'],['posttoken','[Interrupted turn — automatic recovery]'],['empty','[Empty response — automatic recovery]'],['promise_only','[Unfinished action — automatic recovery]'],['compaction','[Context compacted — automatic recovery]'],['manual','[Continue — requested by the user]'],['refusal_fallback','[Content filter — continuing on the fallback model]'],['hook','[Hook continuation — automatic]'],['hook_halted','[Stop-hook nudge cap reached]'],['synthesis','[SYSTEM] Sub-agent synthesis:']];
+const INJECT_TEXT={stalled:['Turn stalled','continuation sent automatically'],tool_stall:['Tool stopped responding','stalled tool call cancelled · continuation sent automatically'],connection:['Turn interrupted','backend error · continuation sent automatically'],posttoken:['Turn interrupted','backend error · continuation sent automatically'],busy:['Turn interrupted','session busy · continuation sent automatically'],empty:['No response returned','agent returned no output · continuation sent automatically'],promise_only:['Action not taken','announced but not done · continuation sent automatically'],compaction:['Context compacted','summarized mid-turn · continuation sent automatically'],manual:['Continued at your request','resuming the interrupted turn'],refusal_fallback:['Content filter declined the turn','switched to the fallback model · continuation sent automatically'],hook:['Continued by a hook','requested by a hook · continuing'],hook_halted:['Hook loop halted','nudge cap reached'],synthesis:['Sub-agents finished','consolidated summary requested'],generic:['System notice','injected by the gateway']};
+const BLOCK_DETAIL={policy:'safety policy blocked the call · the agent was told why, in this turn',invalid_name:'tool name validation blocked the call · the agent was told why, in this turn',hook_error:'a hook faulted before the call · the agent was told why, in this turn'};
+const INJECT_ROUTINE=new Set(['connection','busy','posttoken','empty','promise_only','compaction','manual','refusal_fallback','hook','synthesis','generic']);
+const POLICY_RE=/Blocked by security policy:\\s*(.+?)\\s*$/gm;
+function parseInject(content, meta){
+  const text=String(content||''); const hit=INJECT_KINDS.find(([,p])=>text.startsWith(p));
+  const card=(kind,title,detail,chip,body)=>({kind,title,detail,chip:chip||'',body:body||'',severity:INJECT_ROUTINE.has(kind)?'routine':'attention'});
+  if(!hit){ const k=meta&&meta.injectKind; if(k!=='recovery'&&k!=='synthesis') return null; const t=INJECT_TEXT.generic; return card('generic',t[0],t[1],'',text); }
+  const [kind,prefix]=hit; const rest=text.slice(prefix.length); const after=rest.trim();
+  const nl=rest.indexOf('\\n'); const firstLine=(nl===-1?rest:rest.slice(0,nl)).trim(); const tail=nl===-1?'':rest.slice(nl+1).trim();
+  if(kind==='hook_halted'){ const m=/#(\\d+)/.exec(firstLine); const t=INJECT_TEXT.hook_halted; return card(kind,t[0],t[1],m?'#'+m[1]:'',tail); }
+  if(INJECT_TEXT[kind]){ const t=INJECT_TEXT[kind]; return card(kind,t[0],t[1],'',after); }
+  // refusal / tool_blocked: one "- " bullet per blocked call, the policy pattern(s) as the chip;
+  // a tool_blocked row's first word (policy | invalid_name | hook_error) picks the detail.
+  const calls=after.split('\\n').filter((l)=>/^\\s*-\\s+\\S/.test(l)).length;
+  const pats=new Set(); for(const m of after.matchAll(POLICY_RE)) pats.add(m[1]);
+  const chip=pats.size===1?[...pats][0]:pats.size>1?pats.size+' patterns':'';
+  const title=calls>1?calls+' tool calls blocked':'Tool call blocked';
+  if(kind==='tool_blocked') return card(kind,title,BLOCK_DETAIL[firstLine]||BLOCK_DETAIL.policy,chip,tail);
+  return card(kind,title,'safety policy blocked the call · continuation sent automatically',chip,after);
+}
+// The dashboard's lucide icons for the card: triangle-alert (attention), rotate-ccw (a resumed turn), layers (synthesis), info (generic).
+const RC_ICONS={alert:'<svg viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>',rotate:'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>',layers:'<svg viewBox="0 0 24 24"><path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z"/><path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12"/><path d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17"/></svg>',info:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>'};
+function injectCard(d, c){
+  d.classList.add('recov'); d.dataset.testid='recovery-card'; d.dataset.kind=c.kind; d.dataset.severity=c.severity; d.dataset.open='false';
+  const head=document.createElement('button'); head.type='button'; head.className='rc-head'; head.setAttribute('aria-expanded','false'); head.title=c.title+' · '+c.detail;
+  const chev=document.createElement('span'); chev.className='rc-chev'; chev.textContent='›'; head.appendChild(chev);
+  const ico=document.createElement('span'); ico.className='rc-ico'; ico.innerHTML=RC_ICONS[c.kind==='synthesis'?'layers':c.kind==='generic'?'info':c.severity==='attention'?'alert':'rotate']; head.appendChild(ico);
+  const tt=document.createElement('span'); tt.className='rc-title'; tt.textContent=c.title; head.appendChild(tt);
+  const dt=document.createElement('span'); dt.className='rc-detail'; dt.textContent=c.detail; head.appendChild(dt);
+  if(c.chip){ const ch=document.createElement('code'); ch.className='rc-chip'; ch.dataset.testid='recovery-card-chip'; ch.textContent=c.chip; ch.title=c.chip; head.appendChild(ch); }
+  d.appendChild(head);
+  const body=document.createElement('div'); body.className='rc-body'; body.dataset.testid='recovery-card-body'; body.hidden=true; linkify(body, c.body); d.appendChild(body);
+  head.onclick=()=>{ const open=body.hidden; body.hidden=!open; d.dataset.open=String(open); head.setAttribute('aria-expanded',String(open)); pinSchedule(); };
+}
 function row(id, r){
   const st=pane(id);
   if(r.meta && r.meta.mid){ if(st.seen.has(r.meta.mid)) return; st.seen.add(r.meta.mid); }
@@ -1715,9 +2212,41 @@ function row(id, r){
     box.appendChild(document.createElement('br'));box.appendChild(a);box.appendChild(j);scrollLog(st);return;
   }
   if(r.role==='thinking'){ if(r.content){ thinkDelta(st, r.content); thinkClose(st); scrollLog(st); } return; }
-  const cls = ['user','assistant','tool','status'].includes(r.role)?r.role:'tool';
-  const isErr = cls==='assistant' && (/\\bmsg-err\\b/.test(r.cls||'') || /^\\s*[❌⏱]/.test(r.content||''));
-  const d = el(st,cls+(isErr?' err':'')); if(cls==='user'){d.textContent=r.content; d.dataset.prompt=String(r.content||'');} else if(cls==='assistant'){assistant(st, d, r.content);} else if(cls==='tool' && r.role==='tool' && isToolCall(r)){toolRow(st, d, r);} else {linkify(d, r.content);} scrollLog(st);
+  if(r.role==='inject'){
+    const meta=r.meta||{}; if(meta.injectKind==='automation_notice') return;
+    const c=parseInject(r.content, meta); if(c){ injectCard(el(st,'recov'), c); scrollLog(st); return; }
+  }
+  // The host's failure rows: the error role (its turn-ceiling card, a refused
+  // turn) or a msg-err / ❌ ⏱ assistant row — all the red box.
+  const isErr = r.role==='error' || (r.role==='assistant' && (/\\bmsg-err\\b/.test(r.cls||'') || /^\\s*[❌⏱]/.test(r.content||'')));
+  const cls = isErr ? 'assistant' : (['user','assistant','tool','status'].includes(r.role)?r.role:'tool');
+  if(cls==='user') dropResume(st);
+  const d = el(st,cls+(isErr?' err':'')); if(cls==='user'){userBubble(d, r.content, null, (r.meta&&r.meta.files)||[]);} else if(cls==='assistant'){assistant(st, d, r.content);} else if(cls==='tool' && r.role==='tool' && isToolCall(r)){toolRow(st, d, r);} else {linkify(d, r.content);}
+  if(isErr && isTurnLimit(r.content)) resumeButton(st, d, id);
+  scrollLog(st);
+}
+/* The extension judged the tab's task run from tasks.md (an interrupted run, a stop, a
+   question in the way): a quiet card under the last row, with Resume run when a resume
+   would do something. Gone like the Continue button once a later user turn exists. */
+function interrupted(id, m){
+  const st=pane(id); dropResume(st);
+  const d = el(st,'assistant pause'); d.dataset.testid='run-card'; linkify(d, m.text||'');
+  if(m.resume) resumeButton(st, d, id, 'Resume run', 'Re-read tasks.md and send the run\\'s request again from the next unfinished task.');
+  scrollLog(st);
+}
+/* The host's turn-ceiling card ("⏱️ This turn hit the 4-hour limit and was stopped … Send a
+   message to continue from where it stopped."): one Continue button does that. A task run
+   resumes itself too (the extension re-sends from tasks.md); the button stays for a run past
+   its cap and for a plain chat, and goes once a later user turn exists. */
+function isTurnLimit(s){ return /hit the \\S+ limit and was stopped/i.test(String(s||'')); }
+function dropButtons(st){ st.log.querySelectorAll('button.resume').forEach((b)=>b.remove()); }
+function dropResume(st){ dropButtons(st); st.log.querySelectorAll('.row.pause').forEach((p)=>p.remove()); }
+function resumeButton(st, d, id, label, title){
+  dropButtons(st);
+  const b=document.createElement('button'); b.className='resume'; b.textContent=label||'Continue from where it stopped';
+  b.title=title||'Send the continuation for this turn. A task run re-reads tasks.md and resumes from the next unfinished task.';
+  b.onclick=()=>{ b.disabled=true; b.textContent=(label?label.replace(/run$/,'running'):'Continuing')+'…'; vscode.postMessage({type:'resume', id}); };
+  d.appendChild(b);
 }
 function question(id, card){
   const st=pane(id); const qid = card.ask_id||card.card_id; if(!qid||st.cards.has(qid)) return;
@@ -1777,10 +2306,13 @@ function renderCompose(){
   pick('p-effort', labelOf(choices.efforts, s.effort, 'default effort'));
   $('auto').classList.toggle('on', Boolean(s.autopilot));
   const send=$('send'); send.classList.toggle('stop', Boolean(st && st.running)); send.textContent = st && st.running ? '■' : '↑'; send.title = st && st.running ? 'Stop the running turn' : 'Send (Enter)';
-  chipsEl.innerHTML=''; const items = st ? st.contexts.map((c,i)=>({kind:'ctx', label:c.label, i})).concat(st.files.map((f,i)=>({kind:'file', label:f.name, i}))) : [];
+  chipsEl.innerHTML=''; const items = st ? st.contexts.map((c,i)=>({kind:'ctx', label:c.label, i})).concat(st.files.map((f,i)=>({kind:'file', label:f.name, i, file:f}))) : [];
   chipsEl.classList.toggle('has', items.length>0);
-  for(const it of items){ const ch=document.createElement('span'); ch.className='chip'; const b=document.createElement('b'); b.textContent = it.kind==='ctx' ? '#' : '📎'; ch.appendChild(b); ch.appendChild(document.createTextNode(it.label));
-    const rm=document.createElement('button'); rm.className='rm'; rm.textContent='×'; rm.title='Remove'; rm.onclick=()=>{ if(it.kind==='ctx') st.contexts.splice(it.i,1); else st.files.splice(it.i,1); renderCompose(); }; ch.appendChild(rm); chipsEl.appendChild(ch); }
+  for(const it of items){ const ch=document.createElement('span'); ch.className='chip';
+    const img = it.kind==='file' && /^image\\//.test(it.file.mime||'') && it.file.data;
+    if(img){ ch.classList.add('img'); const im=document.createElement('img'); im.src='data:'+it.file.mime+';base64,'+it.file.data; im.alt=it.label; im.title=it.label+' — click to preview'; im.dataset.name=it.label; ch.appendChild(im); }
+    else { const b=document.createElement('b'); b.textContent = it.kind==='ctx' ? '#' : '📎'; ch.appendChild(b); ch.appendChild(document.createTextNode(it.label)); }
+    const rm=document.createElement('button'); rm.className='rm'; rm.textContent='×'; rm.title='Remove'; rm.onclick=(e)=>{ e.stopPropagation(); if(it.kind==='ctx') st.contexts.splice(it.i,1); else st.files.splice(it.i,1); renderCompose(); }; ch.appendChild(rm); chipsEl.appendChild(ch); }
   renderHint();
 }
 function renderHint(){ const st=state.get(active); $('hint').textContent = st&&st.key ? 'session '+st.key+' — runs in the gateway; find it again under History.' : 'Sessions run in the KiroCrew gateway and keep going if this window disconnects.'; }
@@ -1817,8 +2349,17 @@ $('p-agent').onclick=(e)=>{ const st=state.get(active); if(!choices.agents.lengt
     renderCompose(); vscode.postMessage({type:'setting', id:active, key:'pick', value:it.id}); }); };
 $('auto').onclick=()=>{ const st=state.get(active); setting('autopilot', !(st&&st.settings.autopilot)); };
 // Message font size: the transcript only (a CSS variable on .log); the tabs, bar and composer keep the workbench size.
-let fontSize = 0;
-function applyFont(px){ fontSize = Number(px)||0; document.documentElement.style.setProperty('--kide-msg-size', fontSize ? fontSize+'px' : 'inherit'); }
+let fontSize = 0, chatWidth = 'compact';
+function applyFont(px){ fontSize = Number(px)||0; document.documentElement.style.setProperty('--kide-msg-size', fontSize ? fontSize+'px' : 'inherit'); applyWidth(chatWidth); }
+/* The dashboard's three presets (ChatSettings): compact = 800px / 816px scaled by the message
+   font size over its 14px default; comfortable = 84% / 85%; full = 92% / 93%. */
+const WIDTHS = { compact:['800px','816px'], comfortable:['84%','85%'], full:['92%','93%'] };
+function applyWidth(preset){
+  chatWidth = WIDTHS[preset] ? preset : 'compact';
+  let [msgs, input] = WIDTHS[chatWidth];
+  if(chatWidth==='compact' && fontSize>0 && fontSize!==14){ const r=fontSize/14; msgs=Math.round(800*r)+'px'; input=Math.round(816*r)+'px'; }
+  const rs=document.documentElement.style; rs.setProperty('--kide-content-width', msgs); rs.setProperty('--kide-input-width', input);
+}
 const FONT_SIZES = [{id:0,label:'Default',description:'the workbench font size'}].concat([11,12,13,14,15,16,17,18,20,22,24].map(n=>({id:n,label:n+' px',description:''})));
 $('p-font').onclick=(e)=>openMenu(e.currentTarget, 'Message font size', FONT_SIZES, fontSize, (it)=>{ applyFont(it.id); vscode.postMessage({type:'fontSize', px: it.id}); });
 // Steering indicator: the count of always-included files (they load with the agent) and a menu of
@@ -1851,10 +2392,39 @@ renderSteering(); autoGrow();
 const CONTEXT_KINDS = ${JSON.stringify(CONTEXT_KINDS.map((k) => ({ id: k.kind, label: k.label })))};
 $('ctx').onclick=(e)=>openMenu(e.currentTarget, 'Select context type', CONTEXT_KINDS, null, (it)=>vscode.postMessage({type:'pickContext', id:active, kind:it.id}));
 $('att').onclick=()=>$('file').click();
-$('file').onchange=async ()=>{ const st=state.get(active); if(!st) return; for(const f of $('file').files){ const buf=await f.arrayBuffer(); let bin=''; const bytes=new Uint8Array(buf); for(let i=0;i<bytes.length;i+=0x8000) bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+0x8000)); st.files.push({name:f.name, mime:f.type||'', data:btoa(bin)}); } $('file').value=''; renderCompose(); };
-text.addEventListener('paste', (e)=>{ const st=state.get(active); if(!st||!e.clipboardData) return; let took=false; for(const item of e.clipboardData.items){ if(item.kind==='file' && /^image\\//.test(item.type)){ const f=item.getAsFile(); if(!f) continue; took=true; f.arrayBuffer().then((buf)=>{ let bin=''; const bytes=new Uint8Array(buf); for(let i=0;i<bytes.length;i+=0x8000) bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+0x8000)); st.files.push({name:'pasted-image-'+Date.now()+'.'+(item.type.split('/')[1]||'png'), mime:item.type, data:btoa(bin)}); renderCompose(); }); } } if(took) e.preventDefault(); });
+// Files reach the composer three ways (the 📎 picker, a paste, a drop on the composer) and
+// land in the same list: name, mime, base64 — the bytes travel to the extension on send.
+async function takeFile(st, f, name){
+  const buf=await f.arrayBuffer(); let bin=''; const bytes=new Uint8Array(buf); for(let i=0;i<bytes.length;i+=0x8000) bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+0x8000));
+  st.files.push({name:name||f.name||'attachment', mime:f.type||'', data:btoa(bin)}); renderCompose();
+}
+function pastedName(type){ return 'pasted-image-'+Date.now()+'.'+((type||'').split('/')[1]||'png').replace(/^jpeg$/,'jpg').replace(/\\+xml$/,''); }
+$('file').onchange=async ()=>{ const st=state.get(active); if(!st) return; for(const f of $('file').files) await takeFile(st, f); $('file').value=''; };
+text.addEventListener('paste', (e)=>{ const st=state.get(active); if(!st||!e.clipboardData) return; let took=false; for(const item of e.clipboardData.items){ if(item.kind==='file' && /^image\\//.test(item.type)){ const f=item.getAsFile(); if(!f) continue; took=true; takeFile(st, f, pastedName(item.type)); } } if(took) e.preventDefault(); });
+const composeEl=$('compose');
+composeEl.addEventListener('dragover', (e)=>{ if(e.dataTransfer && [...e.dataTransfer.types].includes('Files')){ e.preventDefault(); e.dataTransfer.dropEffect='copy'; composeEl.classList.add('drop'); } });
+composeEl.addEventListener('dragleave', (e)=>{ if(!composeEl.contains(e.relatedTarget)) composeEl.classList.remove('drop'); });
+composeEl.addEventListener('drop', (e)=>{ composeEl.classList.remove('drop'); const st=state.get(active); if(!st||!e.dataTransfer||!e.dataTransfer.files||!e.dataTransfer.files.length) return; e.preventDefault(); for(const f of e.dataTransfer.files) takeFile(st, f); });
 text.addEventListener('keydown',(e)=>{ if(e.key==='Enter' && !e.shiftKey){e.preventDefault();send();} if(e.key==='#' && !text.value.trim()){ e.preventDefault(); $('ctx').click(); } });
-function sendText(t){ const st=state.get(active); if(active==null) return; vscode.postMessage({type:'send', id:active, text:t, contexts: st?st.contexts.splice(0):[], files: st?st.files.splice(0):[]}); renderCompose(); }
+// Your turn shows the instant you send it. The extension still has to create the session,
+// apply the picks, upload the files, scan steering and inject contexts (each a round trip to
+// the host) before the message goes out; the bubble used to wait for all of that. The page
+// draws it now from what it already holds (text, chip labels, image bytes), tagged with a
+// local id, and the extension's own 'user' message for the turn updates that bubble in place
+// (the uploaded paths arrive with it) instead of adding a second one.
+let localSeq=0;
+function sendText(t){
+  const st=state.get(active); if(active==null||!st) return;
+  const contexts=st.contexts.splice(0), files=st.files.splice(0);
+  const local='l'+(++localSeq);
+  const shown = t || (files.length ? 'See the attached file(s).' : 'See the context provided.');
+  thinkClose(st); dropResume(st);
+  const d=el(st,'user'); d.dataset.local=local;
+  userBubble(d, shown, contexts.map((c)=>c.label), files.map((f)=>{ const image=/^image\\//.test(f.mime||''); return { name:f.name, image, data: image&&f.data ? 'data:'+f.mime+';base64,'+f.data : undefined }; }));
+  st.running=true; setWork(st); scrollLog(st, true);
+  vscode.postMessage({type:'send', id:active, text:t, contexts, files, local});
+  renderCompose();
+}
 function send(){ const st=state.get(active); if(st && st.running){ vscode.postMessage({type:'stop', id:active}); return; } const t=text.value.trim(); if((!t && !(st&&(st.contexts.length||st.files.length)))||active==null) return; text.value=''; autoGrow(); sendText(t); }
 $('send').onclick=send;
 
@@ -1864,13 +2434,19 @@ window.addEventListener('message', (e)=>{
     case 'tabs': renderTabs(m.tabs, m.active); break;
     case 'choices': choices = { agents:m.agents||[], models:m.models||[], efforts:m.efforts||[] }; renderCompose(); break;
     case 'fontSize': applyFont(m.px); break;
+    case 'width': applyWidth(m.preset); pinSchedule(); break;
     case 'composerHeight': setManualHeight(m.px); break;
     case 'steering': steering = Array.isArray(m.items) ? m.items : []; renderSteering(); break;
     case 'closed': { const s=state.get(m.id); if(s){ s.log.remove(); state.delete(m.id);} break; }
-    case 'clear': st.log.innerHTML=''; st.log.appendChild(st.work); st.streaming=null; st.buf=''; st.seen=new Set(); st.cards.clear(); st.empty=null; thinkClose(st); st.think=null; setWork(st); pinSchedule(); break;
+    case 'clear': st.log.innerHTML=''; st.log.appendChild(st.work); st.streaming=null; st.buf=''; st.seen=new Set(); st.cards.clear(); st.empty=null; thinkClose(st); st.think=null; setWork(st); st.follow=true; st.unseen=false; jumpUpdate(st); pinSchedule(); break;
     case 'session': st.key=m.key; if(m.id===active) renderHint(); break;
     case 'context': st.contexts.push(m.item); if(m.id===active) renderCompose(); break;
-    case 'user': { thinkClose(st); const d=el(st,'user'); d.dataset.prompt=String(m.text||''); if((m.contexts&&m.contexts.length)||(m.files&&m.files.length)){ const c=document.createElement('div'); c.className='ctx'; [...(m.contexts||[]).map(x=>'#'+x), ...(m.files||[]).map(x=>'📎'+x)].forEach((x)=>{ const ch=document.createElement('span'); ch.className='chip'; ch.textContent=x; c.appendChild(ch); }); d.appendChild(c); } d.appendChild(document.createTextNode(m.text)); st.running=true; setWork(st); scrollLog(st); break; }
+    case 'user': {
+      // The turn the page already drew (same local id): fill in what the extension resolved
+      // (file paths for the lightbox's Open file), in place. Anything else is a new row.
+      const own = m.local ? st.log.querySelector('.row.user[data-local="'+m.local+'"]') : null;
+      if(own){ own.innerHTML=''; userBubble(own, m.text, m.contexts, m.files); break; }
+      thinkClose(st); dropResume(st); const d=el(st,'user'); userBubble(d, m.text, m.contexts, m.files); st.running=true; setWork(st); scrollLog(st, true); break; }
     case 'chunk': if(!st.streaming){st.streaming=el(st,'streaming cursor','');} st.buf+=m.text; st.streaming.textContent=st.buf; setWork(st); scrollLog(st); break;
     case 'segment': finishStream(st); thinkClose(st); break;
     case 'row': thinkClose(st); row(m.id, m.row); break;
@@ -1882,7 +2458,9 @@ window.addEventListener('message', (e)=>{
     case 'toolResult': toolResult(st, m.tcid, m.output); break;
     case 'toolUpdate': toolUpdate(st, m); break;
     case 'error': el(st,'error', m.text); scrollLog(st); break;
-    case 'scroll': scrollLog(st); break;
+    case 'image': imgArrived(m); break;
+    case 'interrupted': interrupted(m.id, m); break;
+    case 'scroll': scrollLog(st, true); break;
   }
 });
 // Hello to the extension: it pushes tabs, choices and transcripts only once this ran
@@ -1926,7 +2504,7 @@ class AssetTree {
     const watcher = vscode.workspace.createFileSystemWatcher("**/.kiro/" + this.spec.dir + "/**");
     context.subscriptions.push(watcher, watcher.onDidChange(() => this.refresh()), watcher.onDidCreate(() => this.refresh()), watcher.onDidDelete(() => this.refresh()));
   }
-  refresh() { this._change.fire(); }
+  refresh() { if (this.kind === "steering") invalidateSteeringCache(); this._change.fire(); }
   roots() {
     const out = [];
     for (const folder of vscode.workspace.workspaceFolders || []) out.push({ label: "Workspace", uri: vscode.Uri.joinPath(folder.uri, ".kiro", this.spec.dir), scope: "workspace" });
@@ -2246,15 +2824,21 @@ class SpecsTree {
       return specs.map((spec) => {
         const done = spec.tasks.filter((t) => t.done).length;
         const item = new vscode.TreeItem(spec.name, vscode.TreeItemCollapsibleState.Expanded);
-        item.contextValue = "spec";
+        // Kiro's `[~]` / `[-]` marks left in tasks.md are an interrupted run; the row
+        // says so and offers ⟳ Resume run (the context value keeps the `spec` prefix
+        // so every spec menu still applies).
+        const partial = spec.tasks.filter((t) => t.leaf && t.partial).length, queued = spec.tasks.filter((t) => t.leaf && t.queued).length;
+        const interrupted = partial + queued > 0;
+        item.contextValue = interrupted ? "spec-interrupted" : "spec";
         item.spec = spec;
         const phase = !spec.present["requirements.md"] ? "needs requirements" : !spec.present["design.md"] ? "needs design" : !spec.present["tasks.md"] ? "needs tasks" : done + "/" + spec.tasks.length + " tasks";
-        item.description = phase;
-        item.iconPath = new vscode.ThemeIcon("notebook");
+        item.description = interrupted ? phase + " · interrupted: " + describeLeft({ partial, queued, remaining: 0 }) : phase;
+        item.tooltip = interrupted ? spec.name + ": a run left " + describeLeft({ partial, queued, remaining: 0 }) + " in tasks.md. ⟳ Resume run continues it in the session that ran it (or a new one)." : undefined;
+        item.iconPath = new vscode.ThemeIcon(interrupted ? "debug-pause" : "notebook");
         return item;
       });
     }
-    if (node.contextValue === "spec") {
+    if (node.contextValue === "spec" || node.contextValue === "spec-interrupted") {
       const spec = node.spec;
       const files = SPEC_FILES.map((file) => {
         const item = new vscode.TreeItem(file.replace(".md", ""), vscode.TreeItemCollapsibleState.None);
@@ -2430,10 +3014,20 @@ const MODE_AGENTS = { spec: "spec", "quick-spec": "quick-spec", "bug-fix": "bug-
  * protection against a crewmate being silently replaced by a built-in is
  * exactly the substitution kiro-spec-plan's handles rely on. The refusal text
  * is the host's; matched loosely so a reworded message still counts.
+ *
+ * KiroCrew 0.11 refuses differently: a reserved id is renamed on the wire
+ * (`spec` registers as `spec-crewmate`) and, when nothing registers under that
+ * alias (kiro-spec-plan before 0.2.2 strips the entry), the start fails with
+ * "Agent mode 'spec' is not available on this session (advertised modes: [...
+ * 'spec' ...]); its ~/.kiro/agents/spec.json is likely missing". The same
+ * sentence names a genuinely missing agent of any other name, so only the four
+ * mode ids count here: for them the file is there and the id looked for was
+ * the alias, which is the reserved-id refusal in a new coat.
  */
 function isReservedModeRefusal(message) {
   const m = String(message || "");
-  return /reserved for a built-in agent/i.test(m) || /reserved by the KAS agent engine/i.test(m) || /template_name_reserved_by_engine/.test(m);
+  if (/reserved for a built-in agent/i.test(m) || /reserved by the KAS agent engine/i.test(m) || /template_name_reserved_by_engine/.test(m)) return true;
+  return /Agent mode ['"“]?(spec|quick-spec|bug-fix|plan)['"”]? is not available on this session/i.test(m);
 }
 
 /** A host failure row: the `error` role the session log writes, or the
@@ -2442,6 +3036,96 @@ function isErrorRow(row) {
   if (!row) return false;
   if (row.role === "error") return true;
   return row.role === "assistant" && (/\bmsg-err\b/.test(row.cls || "") || /^\s*[❌⏱]/.test(row.content || ""));
+}
+
+/**
+ * The host's turn-ceiling card. KiroCrew bounds every dashboard turn at
+ * `agent.chat_turn_timeout_secs` (4 h by default, 24 h at most); at the ceiling
+ * it cancels the turn, broadcasts `chat_done`, then appends
+ * "⏱️ This turn hit the 4-hour limit and was stopped. Work already written to
+ * disk is still there — nothing was rolled back. Send a message to continue
+ * from where it stopped." as an `error` row (turn_dispatch.format_turn_timeout_card).
+ * Matched loosely on the one phrase a reword is least likely to touch.
+ */
+function isTurnLimitRow(row) {
+  return isErrorRow(row) && /hit the \S+ limit and was stopped/i.test(String(row.content || ""));
+}
+function turnLimitOf(content) {
+  const m = /hit the (\S+) limit/i.exec(String(content || ""));
+  return m ? m[1] : "time";
+}
+
+/** Milliseconds a resume waits after the card: the host has finished the cut turn (chat_done came first) but is still settling the slot. */
+const RESUME_SETTLE_MS = 1500;
+/** Appended to a task run's resume request: the engine must not trust a `[-]` row the cut turn left half done. */
+const RESUME_NOTE = "\n\nThe previous turn on this spec ended before the run finished (the host's turn time limit, a dropped connection, or an error); nothing was rolled back. Re-read tasks.md first: a task marked `[-]` may be partly done, so check its state before carrying on, then continue from the next unfinished task.";
+/** A plain chat's continuation, when the user presses Continue on the card. */
+const RESUME_CHAT_TEXT = "Continue from where you stopped. The previous turn ended before it finished (the host's turn time limit, a dropped connection, or an error); work already written to disk is still there, so re-check its state first and then finish what was left.";
+
+/** A tab the IDE opened for a spec run or phase: the kind `dispatch` sets, or the key prefix it used before tabs carried a kind. */
+function isSpecTab(t) {
+  return Boolean(t) && (t.kind === "spec" || /^kirocrew-ide-spec-/.test(String(t.key || "")));
+}
+/**
+ * What tasks.md says about a run right now: how many of its leaf tasks are
+ * queued (`[~]`), in progress (`[-]`) and still open at all (`remaining`,
+ * required ones unless the run asked for the optional ones too). A
+ * single-task run reads its one task. `null` when the spec is gone.
+ */
+async function runState(run) {
+  const specs = await listSpecs();
+  const spec = specs.find((s) => s.name === run.spec && (!run.dir || sameDir(s.dir.path, run.dir))) || null;
+  if (!spec) return null;
+  let leaves;
+  if (run.task) {
+    const task = findTask(spec.taskTree || [], run.task);
+    if (!task) return null;
+    leaves = flattenTasks([task]).filter((t) => t.leaf); // the task itself when it has no sub-tasks
+  } else {
+    leaves = spec.tasks.filter((t) => t.leaf && (run.optional || !t.optional));
+  }
+  return {
+    spec: spec.name,
+    queued: leaves.filter((t) => t.queued).length,
+    partial: leaves.filter((t) => t.partial).length,
+    remaining: leaves.filter((t) => !t.done).length,
+  };
+}
+/** "1 task in progress and 10 queued" — the marks Kiro's orchestrator left in tasks.md. */
+function describeLeft(state) {
+  const parts = [];
+  if (state.partial) parts.push(state.partial + " task" + (state.partial === 1 ? "" : "s") + " in progress");
+  if (state.queued) parts.push(state.queued + " queued");
+  if (!parts.length && state.remaining) parts.push(state.remaining + " task" + (state.remaining === 1 ? "" : "s") + " left");
+  return parts.join(" and ");
+}
+/** The answer ended on a question to the user: an `[OPTIONS:` line or a trailing question mark. */
+function looksLikeQuestion(text) {
+  const s = String(text || "").trim();
+  return /\[OPTIONS:/i.test(s) || /\?\s*$/.test(s);
+}
+
+/**
+ * The request that resumes a task run the host cut at its ceiling, built from
+ * tasks.md as it is NOW (so the done list the engine skips is current), in the
+ * same two flavours the run itself used (`kiro`: Kiro's own engine request for
+ * the Spec agent, else the crew-agent paraphrase). `run` is the record
+ * `dispatch` kept on the tab: { spec, dir, task, optional, display }. Returns
+ * { text, display } or { text: null, reason } when there is nothing left to do.
+ */
+async function resumeRequest(run, kiro) {
+  const specs = await listSpecs();
+  const spec = specs.find((s) => s.name === run.spec && (!run.dir || sameDir(s.dir.path, run.dir))) || null;
+  if (!spec) return { text: null, reason: "spec " + run.spec + " is no longer in the workspace" };
+  if (run.task) {
+    const task = findTask(spec.taskTree || [], run.task);
+    if (!task) return { text: null, reason: "task " + run.task + " is no longer in tasks.md" };
+    if (task.status === "completed") return { text: null, reason: "task " + run.task + " is ticked" };
+    return { text: (kiro ? kiroTaskRequest(spec, task) : taskPrompt(spec, task)) + RESUME_NOTE, display: "Resume: " + (run.display || "Execute Task: " + task.text) };
+  }
+  const remaining = spec.tasks.filter((t) => !t.done && t.leaf && (run.optional || !t.optional)).length;
+  if (!remaining) return { text: null, reason: "every " + (run.optional ? "" : "required ") + "task in " + spec.name + " is ticked" };
+  return { text: (kiro ? kiroRunAllRequest(spec) : runAllPrompt(spec)) + RESUME_NOTE, display: "Resume: " + (run.display || "Run all tasks") + " (" + remaining + " left)", remaining };
 }
 function kasAgentFor(mode, agents) {
   const name = MODE_AGENTS[mode];
@@ -2530,6 +3214,40 @@ function specNameOf(uriPath) {
   return m ? m[1] : "spec";
 }
 
+/** True for `.kiro/specs/<name>/{requirements,design,tasks}.md`. */
+function isSpecDocument(uriPath) {
+  return /[\\/]\.kiro[\\/]specs[\\/][^\\/]+[\\/](requirements|design|tasks)\.md$/.test(String(uriPath || ""));
+}
+
+/**
+ * "Open Preview" for a spec file: the Kiro spec editor (beside the source when
+ * asked, as Ctrl+K V does for markdown). A URI that is not a spec file goes to
+ * the built-in preview, so the shared keys keep their meaning everywhere else.
+ */
+async function openSpecPreview(uri, beside) {
+  const active = vscode.window.activeTextEditor;
+  const target = uri && uri.path ? uri : active && active.document.uri;
+  if (!target) return;
+  if (!isSpecDocument(target.path)) {
+    return vscode.commands.executeCommand(beside ? "markdown.showPreviewToSide" : "markdown.showPreview", target);
+  }
+  await vscode.commands.executeCommand("vscode.openWith", target, "kirocrew.spec", beside ? vscode.ViewColumn.Beside : undefined);
+}
+
+/**
+ * While a spec file's SOURCE is the active editor, the built-in markdown
+ * extension's own "Open Preview" button steps aside (`hasCustomMarkdownPreview`
+ * is the context key it checks for exactly this) and the spec editor's button
+ * takes its place. Cleared on any other text editor; a webview becoming active
+ * (no text editor) leaves the keys alone.
+ */
+function markSpecEditor(editor) {
+  if (!editor || !editor.document) return;
+  const spec = isSpecDocument(editor.document.uri.path);
+  void vscode.commands.executeCommand("setContext", "hasCustomMarkdownPreview", spec);
+  void vscode.commands.executeCommand("setContext", "kirocrew.specFile", spec ? editor.document.uri.path.split("/").pop() : "");
+}
+
 /** Minimal markdown → HTML for the spec docs: headings, fences, lists (with checkboxes), bold/italic/inline code, quotes, rules. */
 /**
  * Markdown -> HTML for assistant replies and spec documents. GFM-shaped, the
@@ -2571,7 +3289,12 @@ function mdToHtml(md) {
     const slots = [];
     const hold = (html) => { slots.push(html); return "\u0000" + (slots.length - 1) + "\u0000"; };
     let s = t.replace(/`([^`\n]+)`/g, (_, c) => hold(codeSpan(c)));
-    s = s.replace(/!?\[([^\]\n]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, label, url) => {
+    s = s.replace(/(!?)\[([^\]\n]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, bang, label, url) => {
+      // An image: an https URL loads as is; a local path is a placeholder the webview fills
+      // in through the extension (it reads the bytes; the page cannot reach the disk). A
+      // path without an image extension is a link like any other.
+      if (bang && /^https?:\/\//.test(url)) return hold('<img class="mdimg" src="' + esc(url) + '" alt="' + esc(label) + '" title="' + esc(label || url) + '">');
+      if (bang && /\.(?:png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(url) && !/^[a-z][a-z0-9+.-]*:/i.test(url)) return hold('<img class="mdimg" data-path="' + esc(url) + '" alt="' + esc(label) + '" title="' + esc(label || url) + '">');
       if (/^https?:\/\//.test(url) || /^mailto:/.test(url)) return hold('<a class="link" data-url="' + esc(url) + '" title="' + esc(url) + '">' + esc(label || url) + "</a>");
       const pm = url.match(/^([^:#]+)(?::(\d+))?(?::(\d+))?$/);
       return hold(pm ? pathAnchor(label || url, pm[1], pm[2], pm[3]) : esc(label || url));
@@ -2680,81 +3403,281 @@ function mdToHtml(md) {
   return out.join("\n");
 }
 
-function specEditorHtml(specName, stage, present) {
+/**
+ * The spec editor page. The document body arrives by message, rendered by the
+ * engine's OWN markdown renderer (`markdown.api.render`: the built-in preview's
+ * markdown-it, GFM, highlight.js code colours) or, when that command is not
+ * around, by `mdToHtml`. The page then adds what the built-in preview does not
+ * have: a language label and Copy on every code block, Kiro's task boxes with
+ * a ▶ Start task per open row, and mermaid diagrams drawn in place with the
+ * library the hook vendors in (`assets.mermaid`, null when it is not there —
+ * the fence then stays a code block).
+ */
+function specEditorHtml(specName, stage, present, assets) {
   const crumbs = STAGES.map((s) => {
     const here = s.file === stage.file;
     const missing = !present[s.file];
     return "<button class='stage" + (here ? " on" : "") + (missing ? " missing" : "") + "' data-file='" + s.file + "'" + (missing ? " title='not written yet'" : "") + "><span class='n'>" + s.n + "</span>" + s.label + "</button>";
   }).join("<span class='sep'>›</span>");
+  const mermaidTag = assets && assets.mermaid ? '<script src="' + String(assets.mermaid).replace(/"/g, "&quot;") + '"></script>' : "";
   return `<!doctype html><html><head><meta charset="utf-8">
 <style>
  :root{color-scheme:light dark}
  body{margin:0;font:13px/1.55 var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-editor-background)}
- #banner{position:sticky;top:0;display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--vscode-editorWidget-background);border-bottom:1px solid var(--vscode-panel-border);z-index:2;flex-wrap:wrap}
+ #banner{position:sticky;top:0;display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--vscode-editorWidget-background);border-bottom:1px solid var(--vscode-widget-border,var(--vscode-panel-border));z-index:2;flex-wrap:wrap}
  #banner .name{font-weight:600;margin-right:4px}
- .stage{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--vscode-button-secondaryBackground);background:transparent;color:inherit;border-radius:6px;padding:3px 10px;cursor:pointer;font:inherit}
+ .stage{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--vscode-button-secondaryBackground);background:transparent;color:inherit;border-radius:3px;padding:3px 10px;cursor:pointer;font:inherit}
  .stage.on{background:var(--vscode-button-secondaryBackground)}
  .stage.missing{opacity:.5}
- .stage .n{background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);border-radius:4px;padding:0 5px;font-size:11px}
+ .stage .n{background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);border-radius:2px;padding:0 5px;font-size:11px}
  .sep{opacity:.4}
  #actions{margin-left:auto;display:flex;gap:8px}
- #actions button{border:0;border-radius:6px;padding:4px 12px;cursor:pointer;font:inherit;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+ #actions button{border:0;border-radius:3px;padding:4px 12px;cursor:pointer;font:inherit;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
  #actions #continue{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
- #doc{max-width:920px;margin:0 auto;padding:16px 22px 60px}
- #doc h1{font-size:1.5em}#doc h2{font-size:1.25em;border-bottom:1px solid var(--vscode-panel-border);padding-bottom:4px}#doc h3{font-size:1.1em}
- #doc code{background:var(--vscode-textCodeBlock-background);border-radius:3px;padding:1px 5px;font-family:var(--vscode-editor-font-family)}
- #doc pre{background:var(--vscode-textCodeBlock-background);border-radius:6px;padding:10px 12px;overflow:auto}
- #doc pre code{background:transparent;padding:0}
- #doc .codeblock{margin:8px 0;border-radius:6px;background:var(--vscode-textCodeBlock-background);border:1px solid var(--vscode-panel-border)}#doc .codeblock pre{border-radius:0;margin:0}
- #doc .codebar{display:flex;justify-content:space-between;padding:2px 10px;font-size:11px;opacity:.7;border-bottom:1px solid var(--vscode-panel-border)}#doc .codebar .copy{border:0;background:transparent;color:inherit;cursor:pointer;font:inherit}
- #doc table{border-collapse:collapse;margin:8px 0;display:block;overflow:auto}#doc th,#doc td{border:1px solid var(--vscode-panel-border);padding:3px 8px;vertical-align:top}#doc th{background:var(--vscode-editorWidget-background)}
- #doc ol{padding-left:22px}#doc del{opacity:.7}#doc a.link,#doc a.path{color:var(--vscode-textLink-foreground);text-decoration:none;cursor:pointer}#doc a.link:hover,#doc a.path:hover{text-decoration:underline}
- #doc ul{padding-left:22px}#doc li{margin:2px 0}
+ #doc{max-width:920px;margin:0 auto;padding:16px 22px 60px;word-wrap:break-word}
+ #doc h1{font-size:1.5em}#doc h2{font-size:1.25em;border-bottom:1px solid var(--vscode-widget-border,var(--vscode-panel-border));padding-bottom:4px}#doc h3{font-size:1.1em}
+ #doc code{background:var(--vscode-textCodeBlock-background);border-radius:2px;padding:1px 5px;font-family:var(--vscode-editor-font-family);font-size:.92em}
+ #doc pre{margin:0;padding:10px 12px;overflow:auto;background:var(--vscode-textCodeBlock-background);font-family:var(--vscode-editor-font-family);font-size:var(--vscode-editor-font-size,13px);line-height:1.45}
+ #doc pre code{background:transparent;padding:0;font-size:inherit;display:block}
+ #doc pre code > div{display:inline}
+ #doc .codeblock{margin:8px 0;border-radius:3px;background:var(--vscode-textCodeBlock-background);border:1px solid var(--vscode-widget-border,var(--vscode-panel-border));overflow:hidden}
+ #doc .codebar{display:flex;align-items:center;justify-content:space-between;padding:2px 10px;font-size:11px;color:var(--vscode-descriptionForeground);border-bottom:1px solid var(--vscode-widget-border,var(--vscode-panel-border))}
+ #doc .codebar .copy{border:0;background:transparent;color:inherit;cursor:pointer;font:inherit;padding:0 4px;margin:0}#doc .codebar .copy:hover{text-decoration:underline;color:var(--vscode-foreground)}
+ #doc table{border-collapse:collapse;margin:8px 0;display:block;overflow:auto}#doc th,#doc td{border:1px solid var(--vscode-widget-border,var(--vscode-panel-border));padding:3px 8px;vertical-align:top}#doc th{background:var(--vscode-editorWidget-background)}
+ #doc ol{padding-left:22px}#doc del{opacity:.7}#doc a{color:var(--vscode-textLink-foreground);text-decoration:none;cursor:pointer}#doc a:hover{text-decoration:underline}
+ #doc ul{padding-left:22px}#doc li{margin:2px 0}#doc img{max-width:100%}
  #doc blockquote{border-left:3px solid var(--vscode-focusBorder);margin:8px 0;padding:2px 12px;opacity:.85}
+ #doc hr{border:0;border-top:1px solid var(--vscode-widget-border,var(--vscode-panel-border))}
  .box{opacity:.8}.box.on{color:var(--vscode-charts-green,inherit)}.box.part{opacity:.6}.box.queued{opacity:.7}.box.optional{opacity:.55}
- .start{margin-left:8px;border:1px solid var(--vscode-button-secondaryBackground);background:transparent;color:var(--vscode-textLink-foreground);border-radius:4px;padding:0 7px;cursor:pointer;font:inherit;font-size:11px;line-height:18px;vertical-align:middle;opacity:.6}
+ .start{margin-left:8px;border:1px solid var(--vscode-button-secondaryBackground);background:transparent;color:var(--vscode-textLink-foreground);border-radius:3px;padding:0 7px;cursor:pointer;font:inherit;font-size:11px;line-height:18px;vertical-align:middle;opacity:.6}
  #doc li:hover>.start,.start:focus,.start:hover{opacity:1}
  .start.state{cursor:default;color:var(--vscode-descriptionForeground);border-color:transparent;opacity:1}
  .start.state.part::before{content:'';display:inline-block;width:8px;height:8px;margin-right:5px;border-radius:50%;background:var(--vscode-focusBorder);animation:kide-pulse 1.1s ease-in-out infinite;vertical-align:middle}
  @keyframes kide-pulse{0%,100%{opacity:.35}50%{opacity:1}}
  .path{opacity:.7;font-family:var(--vscode-editor-font-family);font-size:12px}
  #stale{display:none;position:sticky;top:44px;text-align:center;font-size:12px;padding:3px;background:var(--vscode-inputValidation-infoBackground);border-bottom:1px solid var(--vscode-inputValidation-infoBorder)}
+ /* Find in the document (Ctrl/Cmd+F): a row of the sticky banner, like the editor's find widget.
+    Every match is marked, the current one stronger; on tasks.md a Filter hides the task rows
+    that do not match (a row stays when its parent or a sub-task matches). */
+ #find{flex:1 0 100%;display:flex;align-items:center;gap:6px;margin-top:6px;padding-top:6px;border-top:1px solid var(--vscode-widget-border,var(--vscode-panel-border))}
+ #find[hidden]{display:none}
+ #find input{flex:0 1 260px;min-width:120px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,transparent);border-radius:2px;padding:3px 6px;font:inherit}
+ #find input:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
+ #find.none input{outline:1px solid var(--vscode-inputValidation-errorBorder,#be1100);outline-offset:-1px}
+ #find .count{font-size:11px;color:var(--vscode-descriptionForeground);min-width:64px;white-space:nowrap}
+ #find button{border:1px solid transparent;background:transparent;color:inherit;border-radius:3px;padding:2px 6px;cursor:pointer;font:inherit;line-height:1.2}
+ #find button:hover{background:var(--vscode-toolbar-hoverBackground,var(--vscode-button-secondaryBackground))}
+ #find button[aria-pressed="true"]{background:var(--vscode-inputOption-activeBackground,var(--vscode-button-secondaryBackground));border-color:var(--vscode-inputOption-activeBorder,transparent);color:var(--vscode-inputOption-activeForeground,inherit)}
+ #find button:disabled{opacity:.4;cursor:default}
+ #find .close{margin-left:auto}
+ #find .filter[hidden]{display:none}
+ mark.hit{background:var(--vscode-editor-findMatchHighlightBackground,rgba(234,92,0,.33));color:inherit;border-radius:2px;padding:0}
+ mark.hit.cur{background:var(--vscode-editor-findMatchBackground,rgba(168,172,148,.6));outline:1px solid var(--vscode-editor-findMatchBorder,transparent)}
+ #doc li.find-hide{display:none}
+ .mermaid{margin:8px 0 16px;overflow-x:auto}.mermaid>svg{max-width:100%;height:auto}
+ .mermaid-error{padding:4px 8px;font-family:var(--vscode-editor-font-family);font-size:12px;color:var(--vscode-errorForeground);border-left:3px solid var(--vscode-errorForeground)}
+ /* highlight.js token colours, one palette per theme kind (the body carries vscode-light / vscode-dark / vscode-high-contrast). */
+ .hljs-comment,.hljs-quote{color:#6a9955}.hljs-keyword,.hljs-selector-tag,.hljs-literal,.hljs-name,.hljs-tag{color:#569cd6}
+ .hljs-string,.hljs-meta .hljs-string,.hljs-addition{color:#ce9178}.hljs-number,.hljs-regexp{color:#b5cea8}
+ .hljs-title,.hljs-function .hljs-title,.hljs-section{color:#dcdcaa}.hljs-type,.hljs-class .hljs-title,.hljs-built_in,.hljs-title.class_{color:#4ec9b0}
+ .hljs-attr,.hljs-attribute,.hljs-variable,.hljs-template-variable,.hljs-params,.hljs-property{color:#9cdcfe}
+ .hljs-meta,.hljs-doctag,.hljs-selector-id,.hljs-selector-class{color:#c586c0}.hljs-symbol,.hljs-bullet,.hljs-link{color:#d7ba7d}
+ .hljs-deletion{color:#f44747}.hljs-emphasis{font-style:italic}.hljs-strong{font-weight:600}
+ body.vscode-light .hljs-comment,body.vscode-light .hljs-quote{color:#008000}body.vscode-light .hljs-keyword,body.vscode-light .hljs-selector-tag,body.vscode-light .hljs-literal,body.vscode-light .hljs-name,body.vscode-light .hljs-tag{color:#0000ff}
+ body.vscode-light .hljs-string,body.vscode-light .hljs-meta .hljs-string,body.vscode-light .hljs-addition{color:#a31515}body.vscode-light .hljs-number,body.vscode-light .hljs-regexp{color:#098658}
+ body.vscode-light .hljs-title,body.vscode-light .hljs-function .hljs-title,body.vscode-light .hljs-section{color:#795e26}body.vscode-light .hljs-type,body.vscode-light .hljs-class .hljs-title,body.vscode-light .hljs-built_in,body.vscode-light .hljs-title.class_{color:#267f99}
+ body.vscode-light .hljs-attr,body.vscode-light .hljs-attribute,body.vscode-light .hljs-variable,body.vscode-light .hljs-template-variable,body.vscode-light .hljs-params,body.vscode-light .hljs-property{color:#001080}
+ body.vscode-light .hljs-meta,body.vscode-light .hljs-doctag,body.vscode-light .hljs-selector-id,body.vscode-light .hljs-selector-class{color:#af00db}body.vscode-light .hljs-symbol,body.vscode-light .hljs-bullet,body.vscode-light .hljs-link{color:#0451a5}
+ body.vscode-light .hljs-deletion{color:#a31515}
+ body.vscode-high-contrast .hljs-keyword,body.vscode-high-contrast .hljs-literal,body.vscode-high-contrast .hljs-tag{font-weight:600}
 </style></head><body>
 <div id="noscript-hint" style="padding:10px 12px;font-size:12px;opacity:.7">Loading the spec editor&hellip; If this line never disappears, scripts inside webviews are blocked &mdash; screenshot this and report it. The markdown source is available via right-click &rarr; Reopen Editor With &rarr; Text Editor.</div>
 <div id="banner"><span class="name">${specName}</span>${crumbs}
- <span id="actions"><button id="edit" title="Open the markdown source in a text editor">Edit source</button><button id="sync" title="Reload this document from disk">⟳ Sync Files</button><button id="continue" title="">→ Continue</button></span></div>
+ <span id="actions"><button id="findbtn" title="Find in this document (Ctrl+F / ⌘F)">🔍 Find</button><button id="edit" title="Open the markdown source in a text editor">Edit source</button><button id="sync" title="Reload this document from disk">⟳ Sync Files</button><button id="continue" title="">→ Continue</button></span>
+ <div id="find" role="search" hidden><input id="findtext" type="text" placeholder="Find" spellcheck="false" aria-label="Find in document"><span class="count" id="findcount" aria-live="polite"></span><button type="button" id="findprev" title="Previous match (Shift+Enter)" aria-label="Previous match">↑</button><button type="button" id="findnext" title="Next match (Enter)" aria-label="Next match">↓</button><button type="button" id="findcase" title="Match case" aria-pressed="false">Aa</button><button type="button" id="findfilter" class="filter" title="Show only the task rows that match" aria-pressed="false" hidden>Filter tasks</button><button type="button" class="close" id="findclose" title="Close (Esc)" aria-label="Close find">✕</button></div></div>
 <div id="stale">updated on disk — synced</div>
 <div id="doc"></div>
+${mermaidTag}
 <script>
 document.getElementById('noscript-hint').remove();
 const vscode = acquireVsCodeApi();
 const STAGE_FILE = ${JSON.stringify(stage.file)};
+const BOX = { ' ': ['open', '☐'], 'x': ['on', '☑'], '-': ['part', '◪'], '~': ['queued', '◷'] };
+let tasks = [];
 document.querySelectorAll('.stage').forEach(b=>b.onclick=()=>vscode.postMessage({type:'stage', file:b.dataset.file}));
-document.addEventListener('click', (e)=>{ const a=e.target.closest && e.target.closest('a.path, a.link, button.copy, button.start'); if(!a) return; e.preventDefault();
-  if(a.classList.contains('start')){ if(!a.classList.contains('state')) vscode.postMessage({type:'startTask', line:Number(a.dataset.line)}); return; }
-  if(a.classList.contains('copy')){ const pre=a.closest('.codeblock').querySelector('pre'); vscode.postMessage({type:'copy', text: pre?pre.textContent:''}); a.textContent='Copied'; setTimeout(()=>{a.textContent='Copy';},1200); return; }
-  if(a.dataset.url) vscode.postMessage({type:'link', url:a.dataset.url}); else vscode.postMessage({type:'open', path:a.dataset.path, line:a.dataset.line?Number(a.dataset.line):undefined, column:a.dataset.col?Number(a.dataset.col):undefined}); });
+document.addEventListener('click', (e)=>{ const a=e.target.closest && e.target.closest('a, button.copy, button.start'); if(!a) return;
+  if(a.classList.contains('start')){ e.preventDefault(); if(!a.classList.contains('state')) vscode.postMessage({type:'startTask', line:Number(a.dataset.line)}); return; }
+  if(a.classList.contains('copy')){ e.preventDefault(); const pre=a.closest('.codeblock').querySelector('pre'); vscode.postMessage({type:'copy', text: pre?pre.textContent:''}); a.textContent='Copied'; setTimeout(()=>{a.textContent='Copy';},1200); return; }
+  if(a.tagName!=='A') return;
+  e.preventDefault();
+  if(a.dataset.url) return void vscode.postMessage({type:'link', url:a.dataset.url});
+  if(a.dataset.path) return void vscode.postMessage({type:'open', path:a.dataset.path, line:a.dataset.line?Number(a.dataset.line):undefined, column:a.dataset.col?Number(a.dataset.col):undefined});
+  const href=a.getAttribute('href')||'';
+  if(href.startsWith('#')){ const id=decodeURIComponent(href.slice(1)); const t=document.getElementById(id)||document.querySelector('[name="'+id+'"]'); if(t) t.scrollIntoView(); return; }
+  if(/^[a-z][a-z0-9+.-]*:/i.test(href)) vscode.postMessage({type:'link', url:href}); else vscode.postMessage({type:'open', path:href.split('#')[0], relative:true}); });
 document.getElementById('sync').onclick=()=>vscode.postMessage({type:'sync'});
 document.getElementById('continue').onclick=()=>vscode.postMessage({type:'continue'});
 document.getElementById('edit').onclick=()=>vscode.postMessage({type:'edit'});
+// Every fenced block gets the bar the editor has always had: the language and a Copy.
+// The built-in renderer emits <pre><code class="language-x">; mdToHtml already wraps its own.
+function dressCode(){
+  document.querySelectorAll('#doc pre > code').forEach((code)=>{
+    const pre=code.parentElement; if(pre.closest('.codeblock')) return;
+    const m=(code.className||'').match(/(?:^|\\s)(?:language|lang)-([\\w+#.-]+)/); const lang=m?m[1]:'';
+    if(lang==='mermaid'||lang==='mmd') return; // drawn by drawMermaid, or left as a block there
+    const wrap=document.createElement('div'); wrap.className='codeblock';
+    const bar=document.createElement('div'); bar.className='codebar';
+    const l=document.createElement('span'); l.className='lang'; l.textContent=lang||'text';
+    const c=document.createElement('button'); c.type='button'; c.className='copy'; c.title='Copy'; c.textContent='Copy';
+    bar.appendChild(l); bar.appendChild(c); pre.parentNode.insertBefore(wrap, pre); wrap.appendChild(bar); wrap.appendChild(pre);
+  });
+}
+// Kiro's task rows. The built-in renderer prints the bracket text as is; each such row becomes a
+// .box with the task's SOURCE LINE (the k-th task row of the document is the k-th task the
+// extension parsed from the same text), which is what a Start click sends back.
+function dressTasks(){
+  if(document.querySelector('#doc .box[data-line]')) return; // mdToHtml output: already boxed
+  let k=0;
+  document.querySelectorAll('#doc li').forEach((li)=>{
+    let node=li.firstChild; while(node && node.nodeType===1 && node.tagName==='P' && node.firstChild) node=node.firstChild;
+    if(!node || node.nodeType!==3) return;
+    const m=node.nodeValue.match(/^\\[([ xX\\-~])\\](\\*?)[ \\t]+/); if(!m) return;
+    const task=tasks[k++]; const st=BOX[m[1].toLowerCase()]||BOX[' '];
+    const box=document.createElement('span'); box.className='box '+st[0]+(m[2]?' optional':''); box.dataset.line=String(task?task.line:-1); if(m[2]) box.title='optional task'; box.textContent=st[1];
+    node.nodeValue=node.nodeValue.slice(m[0].length); node.parentNode.insertBefore(box, node); node.parentNode.insertBefore(document.createTextNode(' '), node);
+  });
+}
 // tasks.md: like Kiro's IDE, every task row that is not done gets its own "Start task"
 // (one task, one session); a queued or running row shows its state instead.
 function decorateTasks(){
   if(STAGE_FILE!=='tasks.md') return;
   document.querySelectorAll('#doc .box[data-line]').forEach((box)=>{
-    if(box.classList.contains('on')) return;
+    if(box.classList.contains('on') || Number(box.dataset.line)<0) return;
     const b=document.createElement('button'); b.type='button'; b.className='start'; b.dataset.line=box.dataset.line;
     if(box.classList.contains('part')){ b.classList.add('state','part'); b.textContent='In progress'; }
     else if(box.classList.contains('queued')){ b.classList.add('state','queued'); b.textContent='Queued'; }
     else { b.textContent='▶ Start task'; b.title='Run this task in its own KiroCrew session'; }
-    const li=box.parentElement; const anchor=Array.from(li.children).find((c)=>c.tagName==='UL'||c.tagName==='OL');
+    const li=box.closest('li'); const anchor=Array.from(li.children).find((c)=>c.tagName==='UL'||c.tagName==='OL');
     if(anchor) li.insertBefore(b, anchor); else li.appendChild(b);
   });
 }
+// mermaid fences, drawn in place when the vendored library is on the page; otherwise they stay code.
+let mermaidSeq=0;
+async function drawMermaid(){
+  const blocks=Array.from(document.querySelectorAll('#doc pre > code')).filter((c)=>/(?:^|\\s)(?:language|lang)-(?:mermaid|mmd)(?:\\s|$)/.test(c.className||''));
+  if(!blocks.length) return;
+  if(!window.mermaid){ blocks.forEach((c)=>{ c.className='language-text'; }); dressCode(); return; }
+  const dark=document.body.classList.contains('vscode-dark')||(document.body.classList.contains('vscode-high-contrast')&&!document.body.classList.contains('vscode-high-contrast-light'));
+  window.mermaid.initialize({ startOnLoad:false, securityLevel:'strict', theme: dark?'dark':'default', suppressErrorRendering:true });
+  for(const code of blocks){
+    const pre=code.parentElement; const host=document.createElement('div'); host.className='mermaid'; host.id='mermaid-'+(++mermaidSeq);
+    pre.parentNode.insertBefore(host, pre);
+    try{ const out=await window.mermaid.render(host.id+'-svg', code.textContent||''); host.innerHTML=out.svg; if(typeof out.bindFunctions==='function') out.bindFunctions(host); pre.remove(); }
+    catch(err){ host.className='mermaid-error'; host.textContent='mermaid: '+String((err&&err.message)||err).split('\\n')[0]; code.className='language-text'; dressCode(); }
+  }
+}
+// ---- Find in the document. Matches are text-node local (like most in-page finds: a
+// phrase split by inline markup is two nodes and is not matched across them); each becomes
+// <mark class="hit">, the current one .cur. Code is searched, labels (code bars, Start
+// buttons, box glyphs) and drawn diagrams are not. The host swallows Ctrl+F before the
+// browser sees it and forwards the key to the workbench, so the bar opens from this page's
+// own keydown and from the extension's 'find' message (its keybinding), idempotently.
+const FIND_CAP = 2000;
+const find = { bar: document.getElementById('find'), input: document.getElementById('findtext'), count: document.getElementById('findcount'), cs: false, filter: false, hits: [], cur: -1 };
+const findBtn = (id)=>document.getElementById(id);
+if(STAGE_FILE==='tasks.md') findBtn('findfilter').hidden=false;
+function findOpen(){
+  const was = !find.bar.hidden;
+  find.bar.hidden=false;
+  const sel = window.getSelection ? String(window.getSelection()).trim() : '';
+  if(sel && sel.length<200 && !sel.includes('\\n') && !find.bar.contains(window.getSelection().anchorNode)) find.input.value=sel;
+  find.input.focus(); find.input.select();
+  if(!was || sel) findRun(); else findCount();
+}
+function findClose(){ find.bar.hidden=true; findClear(); findFilter(); find.input.blur(); }
+function findClear(){
+  document.querySelectorAll('#doc mark.hit').forEach((m)=>{ const p=m.parentNode; if(!p) return; p.replaceChild(document.createTextNode(m.textContent), m); p.normalize(); });
+  find.hits=[]; find.cur=-1;
+}
+function findEscape(s){ return s.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&'); }
+function findNodes(){
+  const out=[]; const root=document.getElementById('doc');
+  const w=document.createTreeWalker(root, NodeFilter.SHOW_TEXT, { acceptNode(n){ const p=n.parentElement; if(!p || p.closest('svg, script, style, .codebar, button.start, .box, .mermaid-error')) return NodeFilter.FILTER_REJECT; return n.nodeValue && n.nodeValue.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP; } });
+  let n; while((n=w.nextNode())) out.push(n);
+  return out;
+}
+function findRun(keep){
+  const prev = keep && find.cur>=0 ? find.cur : -1;
+  findClear();
+  const q=find.input.value;
+  if(!q){ find.bar.classList.remove('none'); findCount(); findFilter(); return; }
+  const re=new RegExp(findEscape(q), find.cs ? 'g' : 'gi');
+  const hits=[];
+  outer: for(const node of findNodes()){
+    const text=node.nodeValue; let rest=node, off=0;
+    for(const m of text.matchAll(re)){
+      if(!m[0]) break;
+      const hit=rest.splitText(m.index-off); rest=hit.splitText(m[0].length); off=m.index+m[0].length;
+      const mark=document.createElement('mark'); mark.className='hit'; hit.parentNode.insertBefore(mark, hit); mark.appendChild(hit); hits.push(mark);
+      if(hits.length>=FIND_CAP) break outer;
+    }
+  }
+  find.hits=hits;
+  find.bar.classList.toggle('none', !hits.length);
+  if(hits.length){
+    // Start at the first match on or below the fold (the banner's bottom), as an editor does from its cursor.
+    let start = prev>=0 && prev<hits.length ? prev : -1;
+    if(start<0){ const fold=document.getElementById('banner').getBoundingClientRect().bottom; start=hits.findIndex((h)=>h.getBoundingClientRect().top>=fold); if(start<0) start=0; }
+    findGo(start, true);
+  }
+  findCount(); findFilter();
+}
+function findGo(index, absolute){
+  const n=find.hits.length; if(!n){ findCount(); return; }
+  if(find.cur>=0 && find.hits[find.cur]) find.hits[find.cur].classList.remove('cur');
+  find.cur = absolute ? ((index%n)+n)%n : (((find.cur<0?0:find.cur)+index)%n+n)%n;
+  const h=find.hits[find.cur]; h.classList.add('cur');
+  const row=h.closest('li'); if(row && row.classList.contains('find-hide')) row.classList.remove('find-hide');
+  h.scrollIntoView({ block:'center', inline:'nearest' });
+  findCount();
+}
+function findCount(){
+  const n=find.hits.length;
+  find.count.textContent = !find.input.value ? '' : !n ? 'No results' : (find.cur+1)+' of '+n+(n>=FIND_CAP?'+':'');
+  findBtn('findprev').disabled=findBtn('findnext').disabled=!n;
+}
+// tasks.md: with Filter on, a task row stays when it, a parent task or a sub-task matches.
+function findFilter(){
+  const rows=document.querySelectorAll('#doc li');
+  rows.forEach((li)=>li.classList.remove('find-hide'));
+  if(!find.filter || find.bar.hidden || !find.input.value || !find.hits.length) return;
+  const own=new Set(); find.hits.forEach((h)=>{ const li=h.closest('li'); if(li) own.add(li); });
+  rows.forEach((li)=>{
+    if(li.querySelector('mark.hit')) return;
+    for(let a=li.parentElement && li.parentElement.closest('li'); a; a=a.parentElement && a.parentElement.closest('li')) if(own.has(a)) return;
+    li.classList.add('find-hide');
+  });
+}
+find.input.addEventListener('input', ()=>findRun());
+find.input.addEventListener('keydown', (e)=>{
+  if(e.key==='Enter'){ e.preventDefault(); findGo(e.shiftKey?-1:1); }
+  else if(e.key==='Escape'){ e.preventDefault(); findClose(); }
+});
+findBtn('findnext').onclick=()=>findGo(1); findBtn('findprev').onclick=()=>findGo(-1);
+findBtn('findclose').onclick=findClose;
+findBtn('findbtn').onclick=findOpen;
+findBtn('findcase').onclick=(e)=>{ find.cs=!find.cs; e.currentTarget.setAttribute('aria-pressed', String(find.cs)); findRun(); find.input.focus(); };
+findBtn('findfilter').onclick=(e)=>{ find.filter=!find.filter; e.currentTarget.setAttribute('aria-pressed', String(find.filter)); findFilter(); find.input.focus(); };
+document.addEventListener('keydown', (e)=>{
+  if((e.ctrlKey||e.metaKey) && !e.altKey && (e.key==='f'||e.key==='F')){ e.preventDefault(); findOpen(); return; }
+  if(e.key==='F3'){ e.preventDefault(); if(find.bar.hidden) findOpen(); else findGo(e.shiftKey?-1:1); return; }
+  if(e.key==='Escape' && !find.bar.hidden){ findClose(); }
+});
 window.addEventListener('message',(e)=>{
   const m=e.data;
-  if(m.type==='doc'){ document.getElementById('doc').innerHTML=m.html; decorateTasks(); if(m.synced){const s=document.getElementById('stale'); s.style.display='block'; setTimeout(()=>{s.style.display='none';},1500);} }
+  if(m.type==='doc'){ tasks=Array.isArray(m.tasks)?m.tasks:[]; document.getElementById('doc').innerHTML=m.html; dressTasks(); dressCode(); decorateTasks(); drawMermaid(); if(!find.bar.hidden) findRun(true); if(m.synced){const s=document.getElementById('stale'); s.style.display='block'; setTimeout(()=>{s.style.display='none';},1500);} }
   if(m.type==='continueLabel'){ const b=document.getElementById('continue'); b.textContent='→ '+m.label; b.title=m.title||''; }
+  if(m.type==='find'){ findOpen(); }
 });
 vscode.postMessage({type:'ready'});
 </script></body></html>`;
@@ -2780,7 +3703,11 @@ function continueAction(stage, spec) {
   const leaves = tasks.filter((t) => t.leaf !== false && !t.optional);
   const remaining = leaves.filter((t) => !t.done);
   if (remaining.length) {
-    const started = leaves.length > remaining.length || remaining.some((t) => t.partial || t.queued);
+    // Kiro's `[~]` / `[-]` marks are a run's own trace: the orchestrator writes
+    // them as it goes and leaves none when it finishes, so their presence means
+    // an interrupted run, resumed in the session that ran it when it still exists.
+    if (remaining.some((t) => t.partial || t.queued)) return { label: "Resume run (" + remaining.length + " left)", command: "kirocrew.spec.resume", remaining: remaining.length, interrupted: true };
+    const started = leaves.length > remaining.length;
     return { label: (started ? "Resume tasks" : "Run all tasks") + " (" + remaining.length + " left)", command: "kirocrew.spec.runAll", remaining: remaining.length };
   }
   const optional = tasks.filter((t) => t.leaf !== false && t.optional && !t.done).length;
@@ -2788,9 +3715,60 @@ function continueAction(stage, spec) {
   return { label: "All tasks done", command: null };
 }
 
+/**
+ * Render a spec document the way the built-in Markdown preview does.
+ * `markdown.api.render` is the command the engine's markdown extension exposes
+ * (its own markdown-it: GFM, highlight.js colours on fences, the `data-line`
+ * attributes); it lives in the engine's extension host, so it is reached as a
+ * command, never as a module. When it is missing (extension disabled, an engine
+ * without it) `mdToHtml` renders instead. `{html, engine: "builtin" | "own"}`.
+ */
+let _builtinRender; // undefined: not probed; false: absent; true: available
+async function renderMarkdown(text) {
+  if (_builtinRender === undefined) {
+    try { _builtinRender = (await vscode.commands.getCommands(true)).includes("markdown.api.render"); } catch { _builtinRender = false; }
+  }
+  if (_builtinRender) {
+    try {
+      const html = await vscode.commands.executeCommand("markdown.api.render", String(text || ""));
+      if (typeof html === "string") return { html, engine: "builtin" };
+    } catch (error) {
+      console.warn("[kirocrew] markdown.api.render failed, using the built-in-free renderer", error);
+    }
+  }
+  return { html: mdToHtml(text), engine: "own" };
+}
+
+/** Relative `<img src>` in a spec document points at the spec's own directory; the webview needs the resource URI. */
+function localizeImages(html, dir, webview) {
+  // The own renderer leaves a local image as `<img data-path>` for the chat page to fetch; the
+  // spec editor has resource roots instead, so the path becomes an ordinary src here.
+  html = String(html).replace(/<img\b([^>]*)\sdata-path="([^"]+)"([^>]*)>/gi, (all, before, path, after) => "<img" + before + ' src="' + path + '"' + after + ">");
+  return String(html).replace(/(<img\b[^>]*\ssrc=")([^"]+)(")/gi, (all, before, src, after) => {
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/|#|data:)/i.test(src)) return all;
+    try { return before + webview.asWebviewUri(vscode.Uri.joinPath(dir, decodeURIComponent(src))).toString() + after; } catch { return all; }
+  });
+}
+
 class SpecEditorProvider {
-  constructor(context) { this.context = context; }
+  constructor(context) { this.context = context; this.panels = new Set(); }
+  /** The spec editor the user is in (the active panel), or null. */
+  activePanel() { return [...this.panels].find((p) => p.active) || null; }
+  /**
+   * Ctrl/Cmd+F: open the active spec editor's find bar. The webview host swallows
+   * the key before the page sees it only to forward it to the workbench, where
+   * this command's keybinding runs while a spec editor is active; the page's
+   * own keydown opens the bar too, and opening twice is harmless.
+   */
+  findInActive() {
+    const panel = this.activePanel();
+    if (!panel) return false;
+    panel.webview.postMessage({ type: "find" });
+    return true;
+  }
   async resolveCustomTextEditor(document, panel) {
+    this.panels.add(panel);
+    panel.onDidDispose(() => this.panels.delete(panel));
     try {
       await this._resolve(document, panel);
     } catch (error) {
@@ -2807,14 +3785,22 @@ class SpecEditorProvider {
     for (const s of STAGES) {
       try { await vscode.workspace.fs.stat(vscode.Uri.joinPath(dir, s.file)); present[s.file] = true; } catch { present[s.file] = false; }
     }
-    panel.webview.options = { enableScripts: true };
-    panel.webview.html = specEditorHtml(specName, stage, present);
+    // The spec dir is a resource root so relative images in design.md load.
+    panel.webview.options = { enableScripts: true, localResourceRoots: [this.context.extensionUri, dir] };
+    const mermaidUri = vscode.Uri.joinPath(this.context.extensionUri, "media", "mermaid.min.js");
+    let mermaid = null;
+    try { await vscode.workspace.fs.stat(mermaidUri); mermaid = panel.webview.asWebviewUri(mermaidUri).toString(); } catch { mermaid = null; }
+    panel.webview.html = specEditorHtml(specName, stage, present, { mermaid });
     const specObj = async () => {
       const specs = await listSpecs();
       return specs.find((x) => x.name === specName && sameDir(x.dir.path, dir.path)) || { name: specName, dir, present, tasks: [], workspace: (vscode.workspace.workspaceFolders || [])[0] };
     };
     const push = async (synced) => {
-      panel.webview.postMessage({ type: "doc", html: mdToHtml(document.getText()), synced: Boolean(synced) });
+      const text = document.getText();
+      const rendered = await renderMarkdown(text);
+      const html = localizeImages(rendered.html, dir, panel.webview);
+      const tasks = stage.file === "tasks.md" ? flattenTasks(parseTaskTree(text)).map((t) => ({ line: t.line, status: t.status, optional: t.optional })) : [];
+      panel.webview.postMessage({ type: "doc", html, engine: rendered.engine, tasks, synced: Boolean(synced) });
       const action = continueAction(stage, await specObj());
       panel.webview.postMessage({ type: "continueLabel", label: action.label, title: "Continue the spec workflow from " + stage.label });
     };
@@ -2825,7 +3811,12 @@ class SpecEditorProvider {
         if (msg.type === "ready") await push(false);
         else if (msg.type === "link" && msg.url) await vscode.env.openExternal(vscode.Uri.parse(String(msg.url)));
         else if (msg.type === "copy") await vscode.env.clipboard.writeText(String(msg.text || ""));
-        else if (msg.type === "open") await openPathLink(msg.path, msg.line, msg.column);
+        else if (msg.type === "open") {
+          // A link the renderer left relative is relative to the spec's own directory.
+          const raw = String(msg.path || "");
+          if (msg.relative && raw && !raw.startsWith("/")) await openPathLink(vscode.Uri.joinPath(dir, raw).path, msg.line, msg.column);
+          else await openPathLink(raw, msg.line, msg.column);
+        }
         else if (msg.type === "edit") await vscode.commands.executeCommand("vscode.openWith", document.uri, "default");
         else if (msg.type === "sync") {
           await vscode.commands.executeCommand("workbench.action.files.revert", document.uri).then(undefined, () => undefined);
@@ -2917,6 +3908,7 @@ function activate(context) {
   const sessions = new Sessions(feed);
   const chat = new ChatView(context, sessions, feed);
   const specsTree = new SpecsTree(context);
+  const specEditors = new SpecEditorProvider(context);
   const trees = { steering: new AssetTree(context, "steering"), skills: new AssetTree(context, "skills"), hooks: new AssetTree(context, "hooks") };
   // A steering file written or renamed re-reads the composer's steering indicator.
   context.subscriptions.push(trees.steering.onDidChangeTreeData(() => chat.pushSteering().catch(() => undefined)));
@@ -2927,9 +3919,16 @@ function activate(context) {
     vscode.window.registerTreeDataProvider("kirocrew.steering", trees.steering),
     vscode.window.registerTreeDataProvider("kirocrew.skills", trees.skills),
     vscode.window.registerTreeDataProvider("kirocrew.hooks", trees.hooks),
-    vscode.window.registerCustomEditorProvider("kirocrew.spec", new SpecEditorProvider(context), { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.window.registerCustomEditorProvider("kirocrew.spec", specEditors, { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.commands.registerCommand("kirocrew.spec.find", () => specEditors.findInActive()),
     vscode.commands.registerCommand("kirocrew.spec.editSource", (uri) => vscode.commands.executeCommand("vscode.openWith", uri, "default")),
+    // "Open Preview" on a spec file (Shift+Cmd+V, Ctrl+K V, the title-bar button) means the
+    // Kiro spec editor, not the built-in markdown preview; any other file keeps the built-in one.
+    vscode.commands.registerCommand("kirocrew.spec.preview", (uri, beside) => openSpecPreview(uri, Boolean(beside))),
+    vscode.commands.registerCommand("kirocrew.spec.previewToSide", (uri) => openSpecPreview(uri, true)),
+    vscode.window.onDidChangeActiveTextEditor((editor) => markSpecEditor(editor)),
   );
+  markSpecEditor(vscode.window.activeTextEditor);
   log(`bridge ${context.extension && context.extension.packageJSON ? context.extension.packageJSON.version : "?"} activated`);
   // The other way a chat pane stays blank: the workbench never asked for the view at all. Leave a trace either way.
   const resolvedCheck = setTimeout(() => log(chat.view ? "chat view resolved by the workbench" : "chat view NOT resolved 10s after activation (KiroCrew Chat container hidden, or the workbench never asked for it)"), 10000);
@@ -2940,6 +3939,7 @@ function activate(context) {
   syncTheme(context);
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
     if (e.affectsConfiguration("kirocrew.chatFontSize")) chat.post({ type: "fontSize", px: Number(cfg("chatFontSize", 0)) || 0 });
+    if (e.affectsConfiguration("kirocrew.chatWidth")) chat.post({ type: "width", preset: String(cfg("chatWidth", "compact") || "compact") });
   }));
 
   // First run in this browser profile: our Chat is contributed to the secondary
@@ -3090,10 +4090,11 @@ function activate(context) {
       if (!spec.taskTree) spec = (await listSpecs()).find((s) => s.name === spec.name && sameDir(s.dir.path, spec.dir.path)) || spec;
       const task = (spec.taskTree && findTask(spec.taskTree, node.task.id || node.task.line)) || null;
       const text = task ? task.text : (node.task.number ? node.task.number + " " : "") + node.task.title;
-      await runTasks(spec, (kiro) => (kiro && task ? kiroTaskRequest(spec, task) : taskPrompt(spec, node.task)), "Execute Task: " + text, "task");
+      await runTasks(spec, (kiro) => (kiro && task ? kiroTaskRequest(spec, task) : taskPrompt(spec, node.task)), "Execute Task: " + text, "task", task ? { spec: spec.name, dir: spec.dir.path, task: task.id, optional: false, display: "Execute Task: " + text } : null);
     }),
     vscode.commands.registerCommand("kirocrew.spec.runAll", (node) => runAllOf(node, false)),
     vscode.commands.registerCommand("kirocrew.spec.runAllOptional", (node) => runAllOf(node, true)),
+    vscode.commands.registerCommand("kirocrew.spec.resume", (node) => resumeOf(node)),
   );
 
   /**
@@ -3114,13 +4115,28 @@ function activate(context) {
       spec = (await listSpecs()).find((s) => s.name === spec.name && sameDir(s.dir.path, spec.dir.path)) || spec;
     }
     const display = optional ? "Run all required and optional tasks" : "Run all tasks";
-    await runTasks(spec, (kiro) => (kiro ? kiroRunAllRequest(spec) : runAllPrompt(spec)), display, "spec");
+    await runTasks(spec, (kiro) => (kiro ? kiroRunAllRequest(spec) : runAllPrompt(spec)), display, "spec", { spec: spec.name, dir: spec.dir.path, task: null, optional: Boolean(optional), display });
   }
 
-  /** Dispatch a task run: Spec mode, the configured spec agent, Autopilot per `kirocrew.specAutopilot`, Kiro's visible turn text. */
-  async function runTasks(spec, text, display, kind) {
+  /**
+   * Resume an interrupted run (the Specs view's ⟳, the spec editor's "Resume
+   * run"): in the session that ran it when the IDE still has its tab and it is
+   * idle, else as a fresh Run all tasks, whose request already carries the
+   * ticked tasks to skip. Optional tasks stay optional unless a tab's run said
+   * otherwise.
+   */
+  async function resumeOf(node) {
+    const spec = await specOf(node);
     await vscode.commands.executeCommand("kirocrew.chat.focus");
-    const key = await chat.dispatch(text, { mode: "spec", agent: cfg("specAgent", "") || undefined, title: display, kind, display, autopilot: cfg("specAutopilot", true) !== false });
+    const outcome = await chat.resumeSpec(spec, () => runAllOf({ spec, contextValue: "spec" }, false));
+    if (outcome === "running") vscode.window.setStatusBarMessage("KiroCrew: the run of " + spec.name + " is still going", 5000);
+    else if (outcome === "resumed") vscode.window.setStatusBarMessage("KiroCrew: resuming " + spec.name + " in its session", 5000);
+  }
+
+  /** Dispatch a task run: Spec mode, the configured spec agent, Autopilot per `kirocrew.specAutopilot`, Kiro's visible turn text; `run` is what checkRun resumes from. */
+  async function runTasks(spec, text, display, kind, run) {
+    await vscode.commands.executeCommand("kirocrew.chat.focus");
+    const key = await chat.dispatch(text, { mode: "spec", agent: cfg("specAgent", "") || undefined, title: display, kind, display, autopilot: cfg("specAutopilot", true) !== false, run: run || null });
     vscode.window.setStatusBarMessage("KiroCrew: " + display + " — session " + key, 5000);
     return key;
   }
@@ -3128,4 +4144,4 @@ function activate(context) {
 
 module.exports = { activate, deactivate() {} };
 // Pure helpers, exposed for `tests/extension_unit.test.mjs` (never used by the host).
-module.exports.__test = { isReservedModeRefusal, isErrorRow, readText, readWholeText, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, findTask, serializeTask, makeAllTasksRequired, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, normalizeRow, findPathLinks, chatHtml, sameDir, slotTime, slotActivity, ageLabel, HOOK_TEMPLATE, STEERING_TEMPLATE, SKILL_TEMPLATE, mdToHtml, stageOf, specNameOf, continueAction, specEditorHtml, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, clip, ChatView, Sessions, themeFor, STOCK_THEMES, kasAgentFor, mergeRosters, agentPicks, modeOfAgent, activate };
+module.exports.__test = { isReservedModeRefusal, isErrorRow, isTurnLimitRow, turnLimitOf, resumeRequest, isSpecTab, runState, describeLeft, looksLikeQuestion, listSpecs, imageData, IMAGE_PREVIEW_MAX, RESUME_CHAT_TEXT, RESUME_NOTE, readText, readWholeText, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, invalidateSteeringCache, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, findTask, serializeTask, makeAllTasksRequired, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, normalizeRow, findPathLinks, chatHtml, sameDir, slotTime, slotActivity, ageLabel, HOOK_TEMPLATE, STEERING_TEMPLATE, SKILL_TEMPLATE, mdToHtml, stageOf, specNameOf, continueAction, specEditorHtml, isSpecDocument, SpecEditorProvider, openSpecPreview, markSpecEditor, renderMarkdown, localizeImages, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, clip, ChatView, Sessions, themeFor, STOCK_THEMES, kasAgentFor, mergeRosters, agentPicks, modeOfAgent, activate };

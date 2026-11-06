@@ -3,7 +3,7 @@
 // document, and absent (null, never a rejection) on a dashboard that lacks it.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { HOST_PICKER_RAISE_CSS, hostPickerUrl, hostReact, loadHostPicker, mountHostPicker } from "../spa/hostpicker.mjs";
+import { HOST_PICKER_RAISE_CSS, HOST_PICKER_SELECTOR, hostPickerUrl, hostReact, loadHostPicker, mountHostPicker } from "../spa/hostpicker.mjs";
 
 function docWith(links) {
   return {
@@ -71,7 +71,10 @@ test("mountHostPicker drives the component through open/select/close", () => {
 });
 
 test("the raise rule targets the picker's body-level box by its stable list ids", () => {
-  assert.match(HOST_PICKER_RAISE_CSS, /body > div:has\(#pp-recent-list\)/);
-  assert.match(HOST_PICKER_RAISE_CSS, /body > div:has\(#pp-browse-list\)/);
+  // Any tab of the picker: Recent, Browse and (KiroCrew 0.11) Favorites all render pp-… ids; a
+  // rule naming two lists raised the box for its first paint only and let it drop behind the IDE.
+  assert.equal(HOST_PICKER_SELECTOR, 'body > div:has([id^="pp-"])');
+  assert.ok(HOST_PICKER_RAISE_CSS.startsWith(HOST_PICKER_SELECTOR + " {"));
   assert.match(HOST_PICKER_RAISE_CSS, /z-index: 2147483100 !important/);
+  assert.doesNotMatch(HOST_PICKER_RAISE_CSS, /pp-recent-list|pp-browse-list/, "no tab-specific id");
 });
