@@ -1633,6 +1633,25 @@ function chatHtml(foxUri) {
  .tool-k{font-size:10px;text-transform:uppercase;letter-spacing:.05em;opacity:.7;margin-bottom:2px}
  .tool-pre{margin:0;padding:6px 8px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-family:var(--vscode-editor-font-family);font-size:11px;line-height:1.45;color:var(--vscode-foreground);background:var(--vscode-editor-background);border:1px solid var(--vscode-widget-border,var(--vscode-panel-border));border-radius:4px}
  .tool-pre.muted{opacity:.6;font-style:italic}
+ /* The command tip: resting the pointer on a collapsed tool row shows what it ran (the
+    dashboard's tool-command-tip). A hover widget in the editor's hover colours, fixed over
+    the transcript, one grid row per pipeline segment: the gutter holds \`$\` then each
+    operator (a pipe in the accent colour), the cell the segment's pieces. */
+ .tool .tool-head[data-tip="true"]{background:var(--vscode-list-hoverBackground);color:var(--vscode-foreground)}
+ .ktip{position:fixed;z-index:9999;max-width:min(36rem,calc(100vw - 2rem));padding:5px 9px;border-radius:4px;border:1px solid var(--vscode-editorHoverWidget-border,var(--vscode-widget-border,GrayText));background:var(--vscode-editorHoverWidget-background,var(--vscode-editorWidget-background,Canvas));color:var(--vscode-editorHoverWidget-foreground,var(--vscode-foreground,CanvasText));box-shadow:0 2px 8px var(--vscode-widget-shadow,rgba(0,0,0,.36));pointer-events:none;font-size:12px;line-height:1.45}
+ .ktip[hidden]{display:none}
+ .ktip.sh{font-family:var(--vscode-editor-font-family);font-size:11.5px;line-height:1.55;max-width:min(36rem,calc(100vw - 2rem))}
+ .ktip.txt{max-width:min(26rem,calc(100vw - 2rem));white-space:pre-wrap;overflow-wrap:anywhere}
+ .ktip-grid{display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:8px}
+ .ktip-op{user-select:none;text-align:right;color:var(--vscode-descriptionForeground)}
+ .ktip-op.pipe{color:var(--vscode-textLink-foreground,var(--vscode-focusBorder))}
+ .ktip-seg{white-space:pre-wrap;overflow-wrap:anywhere}
+ .ktip .p-program{color:var(--vscode-editor-foreground,var(--vscode-foreground));font-weight:600}
+ .ktip .p-flag{color:var(--vscode-debugTokenExpression-name,var(--vscode-symbolIcon-propertyForeground))}
+ .ktip .p-string{color:var(--vscode-debugTokenExpression-string,var(--vscode-symbolIcon-stringForeground))}
+ .ktip .p-redirect{color:var(--vscode-descriptionForeground)}
+ .ktip-cut{margin-top:3px;color:var(--vscode-descriptionForeground);font-family:var(--vscode-font-family);font-size:11px}
+ .ktip-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
  .think{white-space:normal}
  .think .think-head{display:flex;align-items:center;gap:6px;width:100%;min-width:0;margin:0;padding:1px 0;border:0;border-radius:0;background:transparent;color:var(--vscode-descriptionForeground);font:inherit;font-size:12px;cursor:pointer;text-align:left}
  .think .think-head:hover{color:var(--vscode-foreground)}
@@ -1826,7 +1845,7 @@ function pane(id){
 // Foxes hop while the turn runs and no answer text is on its way (reasoning,
 // tool calls, the wait before the first token); streaming text replaces them.
 function setWork(st){ if(!st||!st.work) return; const on=Boolean(st.running && !st.streaming && !st.empty); st.work.classList.toggle('on', on); if(on) scrollLog(st); }
-function show(id){ active=id; for(const [tid,st] of state) st.log.classList.toggle('on', tid===id); renderCompose(); pinSchedule(); jump.hidden=true; const st=state.get(id); if(st) followUpdate(st); }
+function show(id){ active=id; tipHide(); for(const [tid,st] of state) st.log.classList.toggle('on', tid===id); renderCompose(); pinSchedule(); jump.hidden=true; const st=state.get(id); if(st) followUpdate(st); }
 function el(st, cls, content){ if(st.empty){st.empty.remove(); st.empty=null;} const d=document.createElement('div');d.className='row '+cls;if(content!==undefined)d.textContent=content;st.log.appendChild(d);return d;}
 // Named scrollLog, NOT scroll: a global \`scroll\` shadows window.scroll(),
 // which the webview host calls during setInitialScrollPosition — the resulting
@@ -1978,14 +1997,17 @@ function toolRow(st, d, r){
   let title=(typeof meta.purpose==='string' && meta.purpose) || (em ? first.slice(em[0].length) : first) || meta.tool_name || 'tool';
   const ts=taskStatusOf(meta, title); if(ts){ title=ts.label; d.classList.add('task'); d.dataset.taskId=ts.id; }
   d.classList.add('call'); d.dataset.tcid=meta.tool_call_id||''; d.dataset.open='false';
-  d._tool={ input: meta.input, output: meta.output, done: Boolean(meta.done), extra: lines.length>1 ? lines.slice(1).join('\\n') : '', body:null, note: ts?TASK_STATUS_NOTE:'' };
-  const head=document.createElement('button'); head.type='button'; head.className='tool-head'; head.setAttribute('aria-expanded','false'); head.title=ts?TASK_STATUS_NOTE:"Show this call's input and output";
+  d._tool={ input: meta.input, output: meta.output, done: Boolean(meta.done), extra: lines.length>1 ? lines.slice(1).join('\\n') : '', body:null, note: ts?TASK_STATUS_NOTE:'', kind: meta.kind||'', name: meta.tool_name||(em ? first.slice(em[0].length) : first)||'', raw: ts ? '' : ((em ? first.slice(em[0].length) : first)||'') };
+  // the native title stays only on a bookkeeping row (its note); every other row explains
+  // itself in the command tip on hover, with the click's effect in the accessible name
+  const head=document.createElement('button'); head.type='button'; head.className='tool-head'; head.setAttribute('aria-expanded','false'); head.setAttribute('aria-label', "Show this call's input and output: "+title); if(ts) head.title=TASK_STATUS_NOTE;
   const ic=document.createElement('span'); ic.className='tool-ico'; ic.textContent=ts ? '📋' : (em ? em[1] : '🔧');
   const tt=document.createElement('span'); tt.className='tool-title'; tt.textContent=title;
   const live=document.createElement('span'); live.className='tool-live'; live.title='running';
   const chev=document.createElement('span'); chev.className='tool-chev'; chev.textContent='›';
   head.appendChild(ic); head.appendChild(tt); head.appendChild(live); head.appendChild(chev); d.appendChild(head);
   head.onclick=()=>toolToggle(d);
+  if(!ts){ head.addEventListener('mouseenter', ()=>tipArm(head)); head.addEventListener('mouseleave', tipHide); head.addEventListener('focus', ()=>{ let fv=true; try{ fv=head.matches(':focus-visible'); }catch{} if(fv) tipShow(head); }); head.addEventListener('blur', tipHide); }
   toolLive(st, d);
 }
 function toolLive(st, d){ const t=d._tool; if(!t) return; d.classList.toggle('live', Boolean(st.running) && !t.done); }
@@ -2006,7 +2028,7 @@ function toolFill(d){
   else { t.outPre.textContent = t.done ? '(no output)' : 'running…'; k.textContent='Output'; }
   t.outPre.classList.toggle('muted', !out);
 }
-function toolToggle(d, open){ const body=toolBody(d); const o = open===undefined ? body.hidden : Boolean(open); body.hidden=!o; d.dataset.open=String(o); d.querySelector('.tool-head').setAttribute('aria-expanded', String(o)); pinSchedule(); }
+function toolToggle(d, open){ tipHide(); const body=toolBody(d); const o = open===undefined ? body.hidden : Boolean(open); body.hidden=!o; d.dataset.open=String(o); d.querySelector('.tool-head').setAttribute('aria-expanded', String(o)); pinSchedule(); }
 function toolRows(st, tcid){ return tcid ? [...st.log.querySelectorAll('.row.tool.call')].filter(x=>x.dataset.tcid===tcid) : []; }
 // tool_result: the call returned; its output lands on the row (an empty output
 // still marks it done — the host sends that for tools that print nothing).
@@ -2015,6 +2037,112 @@ function toolResult(st, tcid, output){ for(const d of toolRows(st, tcid)){ const
 function toolUpdate(st, m){ for(const d of toolRows(st, m.tcid)){ const t=d._tool; const title=(typeof m.purpose==='string' && m.purpose) || m.title; if(title && !t.note){ const tt=d.querySelector('.tool-title'); if(tt) tt.textContent=String(title).replace(/^\\p{Extended_Pictographic}\\uFE0F?\\s*/u,''); } if(m.input && (t.input===undefined||t.input===null||t.input==='')) t.input=m.input; toolFill(d); } }
 // The turn ended: nothing is running any more, whatever rows never got a result.
 function toolsSettle(st){ for(const d of st.log.querySelectorAll('.row.tool.call')){ if(d._tool){ d._tool.done=true; toolLive(st, d); toolFill(d); } } }
+// ---- the command tip: resting the pointer on a collapsed tool row shows what it ran
+// (the dashboard's tool-command-tip). A shell call is split into its pipeline segments
+// (the top-level &&, ||, |&, | and ; outside quotes, backticks and $(…)), one grid row
+// each: \`$\` then the operator in the gutter, the program bold, flags, quoted strings and
+// redirects coloured; a command with newlines is shown verbatim. Anything else — a label
+// that is the call's purpose, a title the row cuts — is shown as text. 12 segments or
+// lines and 1200 chars at most, then a hint to open the row. Shown only while the row is
+// collapsed and the tip would say more than the label does (the dashboard's rule: the
+// label is the full command → no tip). 100 ms after the pointer rests, at once on focus.
+const TIP_OPS=['&&','||','|&','|',';'], TIP_PIPES=new Set(['|','|&']), TIP_MAX_CHARS=1200, TIP_MAX_LINES=12, TIP_DELAY=100, TIP_CUT_HINT='Open the step to see the rest';
+const TIP_ASSIGN=/^[A-Za-z_][A-Za-z0-9_]*=/, TIP_SHELL_NAMES=/^(?:shell|execute_bash|Run Command|Terminal|bash|Bash|execute|terminal)$/;
+// A bash-ish tokenizer: words (their quoted parts kept apart), runs of blanks, the
+// pipeline operators and redirections (with an fd prefix and an &N / &- target).
+function shTokens(e){
+  const t=[]; let n=null, r=0;
+  const add=(quoted,text)=>{ n=n||{parts:[],raw:''}; const last=n.parts[n.parts.length-1]; if(last && last.quoted===quoted) last.text+=text; else n.parts.push({quoted,text}); n.raw+=text; };
+  const flush=()=>{ if(n){ t.push({t:'word',w:n}); n=null; } };
+  while(r<e.length){
+    const o=e[r];
+    if(o===' '||o==='\\t'){ flush(); let k=r; while(k<e.length&&(e[k]===' '||e[k]==='\\t')) k++; t.push({t:'space',text:e.slice(r,k)}); r=k; continue; }
+    if(o==='\\\\'){ add(false,e.slice(r,r+2)); r+=2; continue; }
+    if(o==="'"||o==='"'){ let k=r+1; while(k<e.length&&e[k]!==o) k+=(o==='"'&&e[k]==='\\\\')?2:1; add(true,e.slice(r,Math.min(k+1,e.length))); r=k+1; continue; }
+    if(o==='\`'||((o==='$'||o==='<'||o==='>')&&e[r+1]==='(')){
+      let k;
+      if(o==='\`'){ k=e.indexOf('\`',r+1); k=k<0?e.length:k+1; }
+      else { let depth=0; for(k=r+1;k<e.length;k++){ const ch=e[k]; if(ch==='\\\\'){ k++; continue; } if(ch==="'"||ch==='"'){ const q=e.indexOf(ch,k+1); k=q<0?e.length:q; continue; } if(ch==='(') depth++; else if(ch===')'&&--depth===0){ k++; break; } } }
+      add(false,e.slice(r,k)); r=k; continue;
+    }
+    const op=TIP_OPS.find(x=>e.startsWith(x,r));
+    if(op){ flush(); t.push({t:'op',text:op}); r+=op.length; continue; }
+    if(o==='>'||o==='<'||(o==='&'&&e[r+1]==='>')){
+      let fd=''; if(n&&/^\\d+$/.test(n.raw)){ fd=n.raw; n=null; } flush();
+      const m=/^(&>>?|>\\||>>?|<<<|<)(&(\\d+|-))?/.exec(e.slice(r)); const txt=m?m[0]:o;
+      t.push({t:'redir',text:fd+txt}); r+=txt.length; continue;
+    }
+    add(false,o); r++;
+  }
+  flush(); return t;
+}
+// The segments of a one-line command, each {op, pieces:[{kind, text}]}: the first word
+// that is not a NAME= assignment is the program, a -word a flag, a quoted part a string.
+// null for a command with newlines (shown verbatim instead).
+function shSegments(e){
+  const t=e.trim(); if(!t||/[\\r\\n]/.test(t)) return null;
+  const n=[{op:'',pieces:[]}]; let r=false;
+  for(const tok of shTokens(t)){
+    const seg=n[n.length-1];
+    if(tok.t==='op'){ n.push({op:tok.text,pieces:[]}); r=false; continue; }
+    if(tok.t==='space'){ if(seg.pieces.length) seg.pieces.push({kind:'text',text:tok.text}); continue; }
+    if(tok.t==='redir'){ seg.pieces.push({kind:'redirect',text:tok.text}); continue; }
+    const w=tok.w; let a='text';
+    if(!r&&!TIP_ASSIGN.test(w.raw)){ a='program'; r=true; } else if(/^-/.test(w.raw)) a='flag';
+    for(const p of w.parts) seg.pieces.push({kind:p.quoted?'string':a,text:p.text});
+  }
+  for(const seg of n) while(seg.pieces.length&&seg.pieces[seg.pieces.length-1].kind==='text'&&!seg.pieces[seg.pieces.length-1].text.trim()) seg.pieces.pop();
+  return n.filter((seg,i)=>i===0||seg.pieces.length>0);
+}
+// What the tip says for a row — {text, shell} — or null when the label already says it.
+// A shell call's tip is its command; any other row's is its raw title when the label is
+// the call's purpose instead, or the label itself when the row cuts it short.
+function tipFor(d){
+  const t=d._tool; if(!t) return null;
+  const tt=d.querySelector('.tool-title'); const label=tt?tt.textContent:''; const cut=Boolean(tt && tt.scrollWidth>tt.clientWidth+1);
+  let v=t.input; if(typeof v==='string'){ try{ v=JSON.parse(v); }catch{ v=null; } }
+  const cmd = v && typeof v==='object' && !Array.isArray(v) && typeof v.command==='string' ? v.command : '';
+  const shell = Boolean(cmd) && (t.kind==='execute' || TIP_SHELL_NAMES.test(t.name) || !t.kind || t.kind==='unknown');
+  if(shell){ return cmd!==label || cut ? {text:cmd, shell:true} : null; }
+  if(t.raw && t.raw!==label) return {text:t.raw, shell:false};
+  return cut && label ? {text:label, shell:false} : null;
+}
+var tipEl=null, tipTimer=0, tipHead=null;  // var: show()/toolToggle() may run before this line is evaluated
+function tipNode(){ if(!tipEl){ tipEl=document.createElement('div'); tipEl.className='ktip'; tipEl.id='ktip'; tipEl.setAttribute('role','tooltip'); tipEl.hidden=true; document.body.appendChild(tipEl); } return tipEl; }
+function tipRender(tip){
+  const el=tipNode(); el.textContent=''; el.className='ktip '+(tip.shell?'sh':'txt');
+  let text=tip.text, cut=false; if(text.length>TIP_MAX_CHARS){ text=text.slice(0,TIP_MAX_CHARS); cut=true; }
+  const sr=document.createElement('span'); sr.className='ktip-sr'; sr.textContent=text; el.appendChild(sr);
+  if(tip.shell){
+    const segs=shSegments(text);
+    const grid=document.createElement('div'); grid.className='ktip-grid'; grid.setAttribute('aria-hidden','true');
+    const line=(op,fill)=>{ const g=document.createElement('span'); g.className='ktip-op'+(op&&TIP_PIPES.has(op)?' pipe':''); g.textContent=op||'$'; const s=document.createElement('span'); s.className='ktip-seg'; fill(s); grid.appendChild(g); grid.appendChild(s); };
+    if(segs){ if(segs.length>TIP_MAX_LINES) cut=true; segs.slice(0,TIP_MAX_LINES).forEach((seg,i)=>line(i?seg.op:'', (s)=>{ for(const p of seg.pieces){ const x=document.createElement('span'); x.className='p-'+p.kind; x.textContent=p.text; s.appendChild(x); } })); }
+    else { const lines=text.split(/\\r?\\n/); if(lines.length>TIP_MAX_LINES) cut=true; line('', (s)=>{ s.textContent=lines.slice(0,TIP_MAX_LINES).join('\\n'); }); }
+    el.appendChild(grid);
+  } else { const p=document.createElement('span'); p.setAttribute('aria-hidden','true'); p.textContent=text; el.appendChild(p); }
+  if(cut){ const c=document.createElement('div'); c.className='ktip-cut'; c.textContent='… '+TIP_CUT_HINT; el.appendChild(c); }
+  return el;
+}
+// Above the row's header, left-aligned with it; below when the top has no room; kept 8px
+// inside the viewport either way.
+function tipPlace(el, head){
+  const r=head.getBoundingClientRect(); el.hidden=false; el.style.top='0px'; el.style.left='0px';
+  const w=el.offsetWidth, h=el.offsetHeight, vw=window.innerWidth, vh=window.innerHeight;
+  let top=r.top-8-h, place='above';
+  if(top<8){ place='below'; top=Math.min(r.bottom+8, vh-8-h); if(top<8) top=8; }
+  el.style.top=top+'px'; el.style.left=Math.max(8, Math.min(r.left, vw-8-w))+'px'; el.dataset.placement=place;
+}
+function tipShow(head){
+  const d=head.closest('.row.tool.call'); if(!d || d.dataset.open==='true') return;
+  const tip=tipFor(d); if(!tip) return;
+  tipHide(); const el=tipRender(tip); tipPlace(el, head); tipHead=head; head.dataset.tip='true'; head.setAttribute('aria-describedby', el.id);
+}
+function tipHide(){ if(tipTimer){ clearTimeout(tipTimer); tipTimer=0; } if(tipHead){ delete tipHead.dataset.tip; tipHead.removeAttribute('aria-describedby'); tipHead=null; } if(tipEl) tipEl.hidden=true; }
+function tipArm(head){ tipHide(); tipTimer=setTimeout(()=>{ tipTimer=0; if(head.isConnected && head.matches(':hover')) tipShow(head); }, TIP_DELAY); }
+window.addEventListener('scroll', ()=>tipHide(), {capture:true, passive:true});
+window.addEventListener('resize', ()=>tipHide());
+document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') tipHide(); });
 function assistant(st, node, s){
   const m = OPT_RE.exec(s||'');
   const body = m ? s.slice(0, m.index).replace(/\\s+$/,'') : s;

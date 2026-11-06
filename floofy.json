@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.30.8",
+  "version": "0.30.9",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -84,11 +84,11 @@
     },
     {
       "path": "README.md",
-      "sha256": "47509067a1e01da8e85179eb1f9f38dc7bdd37a10a690ff211eb26315513e398"
+      "sha256": "3baac82812bee8bc57db538dd73064a10d3b6e9d6117f806b539bbf4b8e63f69"
     },
     {
       "path": "app/app.json",
-      "sha256": "77cc0ddb45983dd0346dd7cb21d2fc5d120cff35544f103633d5457a91bcc9dd"
+      "sha256": "0a4568a6647bef8f30d2878234b787106c8ce881309e70538f22e70620a022e7"
     },
     {
       "path": "app/ui/art/fox.svg",
@@ -104,7 +104,7 @@
     },
     {
       "path": "extension/extension.js",
-      "sha256": "6faa836cbd57bd7f98bbcdb0a18d14bae0c8b0590615e83ada9a12c5dc884e89"
+      "sha256": "38f8e57bba48b2783dc2777e16527fc4da3a106dd22e4bf21b1288a52eaafffc"
     },
     {
       "path": "extension/media/fox.svg",
@@ -116,7 +116,7 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "9b359745b8b682f77075105d5d72f068bfbfbf7c61fd677c4eb0a448077faef7"
+      "sha256": "0e76b8949082fa289bff212774c5437ecc653d12fe96e1af0ba9e1c4fe7eabda"
     },
     {
       "path": "hook/__init__.py",
@@ -192,7 +192,7 @@
     },
     {
       "path": "tests/e2e/probe_chat_webview.py",
-      "sha256": "4f4f4af5931e5c78635af6cb23a40ba7a04ed4e5546afe1612076b7aa99f3e1f"
+      "sha256": "098e77c672203d3abefd36e775326f3d4f9ec0ddf2aa8fd72d55c24ec2e0860d"
     },
     {
       "path": "tests/e2e/probe_composer.py",
@@ -256,7 +256,7 @@
     },
     {
       "path": "tests/extension_unit.test.mjs",
-      "sha256": "552170ef9b27cfb15379d21f0316c5f33ff261692aa860b7c330929cc8eb9c1a"
+      "sha256": "3fa80db26e1cf4b5be75ec6dc666f50071730dedb689e7d727fed9cf1fd8b14e"
     },
     {
       "path": "tests/gallery_test.py",

@@ -920,6 +920,42 @@ test("chat webview: Kiro's task_status bookkeeping rows name the task from the a
   assert.ok(script.includes("if(title && !t.note){"), "a later tool_call update does not rename the decoded row back to task_status");
 });
 
+test("chat webview: the command tip splits a shell call into its pipeline segments the way the dashboard's tool-command-tip does", async () => {
+  const vm = await import("node:vm");
+  const { chatHtml } = ext.__test;
+  const html = chatHtml("fox.svg");
+  const script = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map((m) => m[1]).find((s) => s.includes("function shTokens("));
+  const start = script.indexOf("const TIP_OPS="), end = script.indexOf("function tipFor(");
+  const ctx = vm.createContext({});
+  vm.runInContext(script.slice(start, end) + "\nthis.shSegments = shSegments; this.shTokens = shTokens; this.TIP_MAX_LINES = TIP_MAX_LINES; this.TIP_MAX_CHARS = TIP_MAX_CHARS;", ctx);
+  const segs = (cmd) => { const r = ctx.shSegments(cmd); return r === null ? null : JSON.parse(JSON.stringify(r)).map((s) => [s.op, s.pieces.map((p) => p.kind[0] + ":" + p.text).join(" ")]); };
+  assert.deepEqual(segs("git status --short && git -P log 2>/dev/null | head -20; echo \"---\"; FOO=1 cmd -v 1>&2"), [
+    ["", "p:git t:  t:status t:  f:--short"],
+    ["&&", "p:git t:  f:-P t:  t:log t:  r:2> t:/dev/null"],
+    ["|", "p:head t:  f:-20"],
+    [";", "p:echo t:  s:\"---\""],
+    [";", "t:FOO=1 t:  p:cmd t:  f:-v t:  r:1>&2"],
+  ], "top-level operators split; the program is the first word that is not NAME=; flags, quoted strings and redirections (fd prefix kept) are their own kinds");
+  assert.deepEqual(segs("cat $(ls | head -1) > out.txt || echo `date` |& tee log; ls <(echo hi)"), [
+    ["", "p:cat t:  t:$(ls | head -1) t:  r:> t:  t:out.txt"],
+    ["||", "p:echo t:  t:`date`"],
+    ["|&", "p:tee t:  t:log"],
+    [";", "p:ls t:  t:<(echo hi)"],
+  ], "a pipe inside $(…), backticks or <(…) does not split; |& is one operator");
+  assert.deepEqual(segs("echo 'it''s' && echo a\\ b 2>&1 &>> all.log"), [["", "p:echo t:  s:'it''s'"], ["&&", "p:echo t:  t:a\\ b t:  r:2>&1 t:  r:&>> t:  t:all.log"]], "quotes and escapes hold a word together");
+  assert.equal(segs("ls\nls -la"), null, "a command with newlines is not segmented (the tip shows it verbatim)");
+  assert.equal(segs("   "), null);
+  assert.equal(ctx.TIP_MAX_LINES, 12);
+  assert.equal(ctx.TIP_MAX_CHARS, 1200);
+  // The row wiring: no native title on a tool row (the tip replaces it), the click's effect in the accessible name, the tip hidden by a click, a tab switch, a scroll and Escape.
+  assert.ok(script.includes("head.setAttribute('aria-label', \"Show this call's input and output: \"+title); if(ts) head.title=TASK_STATUS_NOTE;"), "only a bookkeeping row keeps a native tooltip");
+  assert.ok(script.includes("if(!ts){ head.addEventListener('mouseenter', ()=>tipArm(head)); head.addEventListener('mouseleave', tipHide);"), "hover arms the tip");
+  assert.ok(script.includes("function toolToggle(d, open){ tipHide();") && script.includes("function show(id){ active=id; tipHide();"), "a click and a tab switch hide it");
+  assert.ok(script.includes("window.addEventListener('scroll', ()=>tipHide(), {capture:true, passive:true});") && script.includes("if(e.key==='Escape') tipHide();"), "a scroll and Escape hide it");
+  assert.ok(script.includes("if(!d || d.dataset.open==='true') return;"), "an open row shows no tip");
+  assert.ok(/\.ktip\{position:fixed;z-index:9999;[^}]*background:var\(--vscode-editorHoverWidget-background/.test(html) && /\.ktip-op\.pipe\{color:var\(--vscode-textLink-foreground/.test(html), "a fixed hover widget in the editor's hover colours; the pipe in the accent");
+});
+
 test("chat webview: thinking deltas accumulate into one collapsed block (KiroCrew's ThinkingBlock), never one row per delta", () => {
   const { chatHtml } = ext.__test;
   const html = chatHtml("fox.svg");

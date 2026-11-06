@@ -387,7 +387,20 @@ other theme and it stays yours.
   header toggles a body with the call's Input (a shell call shows its command,
   a one-field call its value, anything else pretty JSON) and Output (the
   result once the tool returned; a pulsing dot and "running…" until then),
-  paths linked into editor tabs, both clipped at 20 KB with a marker. While the agent works and no answer is
+  paths linked into editor tabs, both clipped at 20 KB with a marker. **Rest
+  the pointer on a collapsed row and it shows what it ran** (KiroCrew's own
+  tool-command tip, since 0.30.9): a shell call's command in a hover widget
+  above the row, one line per pipeline segment with `$` and then each operator
+  (`&&`, `||`, `;`, a pipe in the accent colour) in the gutter, the program in
+  bold, flags, quoted strings and redirections coloured; a command with
+  newlines verbatim; an MCP row whose label is its purpose shows its raw title
+  instead. Twelve segments or lines and 1200 characters at most, then "Open the
+  step to see the rest". The tip appears 100 ms after the pointer rests (at
+  once on keyboard focus), only while the row is collapsed, and only when it
+  says more than the label does: a row labelled with its whole command has
+  none, as in the dashboard. A click, a scroll, a tab switch or Esc hides it.
+  The header's native tooltip is gone (it collided with the tip); a task-status
+  bookkeeping row keeps its note there. While the agent works and no answer is
   streaming yet (reasoning, tool calls, the wait for the first token) four
   small FloofyCrew foxes hop in turn under the last row, where KiroCrew shows
   its ghosts; they go still under *prefers-reduced-motion*.

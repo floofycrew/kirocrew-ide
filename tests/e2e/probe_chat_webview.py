@@ -15,6 +15,7 @@ Usage: probe_chat_webview.py [--shots <dir>]      (needs Playwright + Chromium)
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import subprocess
 import sys
@@ -591,6 +592,78 @@ def main() -> int:
             page.click(".log.on [data-testid=\"recovery-card\"] .rc-head")
             page.wait_for_timeout(50)
             page.screenshot(path=str(pathlib.Path(args.shots) / "recovery-cards.png"))
+        # The command tip (the dashboard's tool-command-tip): resting the pointer on a collapsed shell
+        # row whose label is its description shows the command, one grid line per pipeline segment.
+        post({"type": "tabs", "tabs": [{"id": 12, "title": "tip", "running": False, "settings": {}}], "active": 12})
+        cmd = "git status --short && git -P log --oneline -n 3 2>/dev/null | head -20; echo \"---\""
+        post({"type": "row", "id": 12, "row": {"role": "tool", "content": "🔧 Check the mod repo state", "meta": {"tool_call_id": "run_command_1", "kind": "execute", "input": json.dumps({"command": cmd, "description": "Check the mod repo state"}), "output": "clean", "done": True}}})
+        post({"type": "row", "id": 12, "row": {"role": "tool", "content": "🔧 ls", "meta": {"tool_call_id": "run_command_2", "kind": "execute", "input": json.dumps({"command": "ls"}), "output": "", "done": True}}})
+        post({"type": "row", "id": 12, "row": {"role": "tool", "content": "🔧 @slack-enterprise-mcp/slack_read_channel", "meta": {"tool_call_id": "mcp_1", "kind": "other", "mcp_server": "slack-enterprise-mcp", "purpose": "Read the migration channel", "input": json.dumps({"channel_id": "C1", "limit": 100}), "output": "{}", "done": True}}})
+        page.wait_for_function("() => document.querySelectorAll('.log.on .row.tool.call').length === 3")
+        check(page.evaluate("() => { const h = document.querySelector('.log.on .row.tool.call .tool-head'); return [h.hasAttribute('title'), h.getAttribute('aria-label')]; }") == [False, "Show this call's input and output: Check the mod repo state"], "a shell row's header has no native tooltip; the click's effect is its accessible name")
+        page.hover(".log.on .row.tool.call >> nth=0 >> .tool-head")
+        page.wait_for_selector("#ktip:not([hidden])", timeout=2000)
+        tip = page.evaluate("""() => { const t = document.getElementById('ktip'); const h = document.querySelector('.log.on .row.tool.call .tool-head'); const tr = t.getBoundingClientRect(), hr = h.getBoundingClientRect();
+          const lines = [...t.querySelectorAll('.ktip-grid > .ktip-op')].map((g) => g.textContent); const segs = [...t.querySelectorAll('.ktip-grid > .ktip-seg')].map((s) => s.textContent);
+          const kinds = [...t.querySelector('.ktip-grid > .ktip-seg').querySelectorAll('span')].map((s) => s.className);
+          return { role: t.getAttribute('role'), shell: t.classList.contains('sh'), placement: t.dataset.placement, aboveOrBelow: tr.bottom <= hr.top || tr.top >= hr.bottom, leftAligned: Math.abs(tr.left - hr.left) < 2, inView: tr.left >= 8 && tr.right <= window.innerWidth - 8,
+                   lines, segs, kinds, pipeClass: t.querySelector('.ktip-op.pipe')?.textContent ?? null, lit: h.dataset.tip, described: h.getAttribute('aria-describedby'), sr: t.querySelector('.ktip-sr').textContent, cut: !!t.querySelector('.ktip-cut') }; }""")
+        check(tip["role"] == "tooltip" and tip["shell"] and tip["aboveOrBelow"] and tip["leftAligned"] and tip["inView"], f"the tip is a tooltip beside the header, left-aligned with it, inside the viewport ({tip['placement']}, above/below {tip['aboveOrBelow']}, left {tip['leftAligned']})")
+        check(tip["lines"] == ["$", "&&", "|", ";"], f"one grid line per pipeline segment: $ then the operator in the gutter ({tip['lines']})")
+        check(tip["segs"] == ["git status --short", "git -P log --oneline -n 3 2>/dev/null", "head -20", 'echo "---"'], f"each segment's text in its cell ({tip['segs']})")
+        check(tip["kinds"][:5] == ["p-program", "p-text", "p-text", "p-text", "p-flag"], f"the program, then the flag, coloured by kind ({tip['kinds'][:5]})")
+        check(tip["pipeClass"] == "|", "the pipe operator takes the accent class, the sequence operators stay muted")
+        check(tip["lit"] == "true" and tip["described"] == "ktip" and tip["sr"] == cmd and not tip["cut"], f"the header is lit while the tip is open and described by it; the full command for a reader ({tip['lit']}, {tip['described']})")
+        if args.shots:
+            page.screenshot(path=str(pathlib.Path(args.shots) / "tool-command-tip.png"))
+        page.mouse.move(5, 5)
+        page.wait_for_function("() => document.getElementById('ktip').hidden")
+        check(page.evaluate("() => document.querySelector('.log.on .row.tool.call .tool-head').dataset.tip") is None, "leaving the header hides the tip and unlights the header")
+        # A row whose label IS the full command has nothing more to say (the dashboard's rule).
+        page.hover(".log.on .row.tool.call >> nth=1 >> .tool-head")
+        page.wait_for_timeout(250)
+        check(page.evaluate("() => document.getElementById('ktip').hidden"), "a shell row labelled with its whole command shows no tip")
+        # An MCP row whose label is the call's purpose tips its raw title as plain text.
+        page.hover(".log.on .row.tool.call >> nth=2 >> .tool-head")
+        page.wait_for_selector("#ktip:not([hidden])", timeout=2000)
+        mcp = page.evaluate("() => { const t = document.getElementById('ktip'); return [t.classList.contains('txt'), t.querySelector('.ktip-grid') === null, t.querySelector('[aria-hidden]').textContent]; }")
+        check(mcp == [True, True, "@slack-enterprise-mcp/slack_read_channel"], f"a purpose-labelled MCP row tips its raw title, as text ({mcp})")
+        # Opening the row hides the tip and keeps it away while open; the body still shows the command.
+        page.click(".log.on .row.tool.call >> nth=0 >> .tool-head")
+        page.wait_for_timeout(30)
+        check(page.evaluate("() => document.getElementById('ktip').hidden"), "the click that opens the row hides the tip")
+        page.mouse.move(5, 5)
+        page.hover(".log.on .row.tool.call >> nth=0 >> .tool-head")
+        page.wait_for_timeout(250)
+        check(page.evaluate("() => document.getElementById('ktip').hidden"), "an open row shows no tip (its body already shows the command)")
+        # Keyboard: focus shows it, Escape hides it.
+        page.click(".log.on .row.tool.call >> nth=0 >> .tool-head")  # close again
+        page.mouse.move(5, 5)
+        page.keyboard.press("Tab")
+        page.evaluate("() => document.querySelector('.log.on .row.tool.call .tool-head').focus()")
+        page.keyboard.press("Shift+Tab")
+        page.keyboard.press("Tab")
+        focused = page.evaluate("() => document.activeElement && document.activeElement.className")
+        if focused == "tool-head":
+            page.wait_for_selector("#ktip:not([hidden])", timeout=2000)
+            check(True, "focusing the header with the keyboard shows the tip")
+            page.keyboard.press("Escape")
+            check(page.evaluate("() => document.getElementById('ktip').hidden"), "Escape hides it")
+        # A long command is cut at 12 segments with the hint; a multi-line one is shown verbatim.
+        long_cmd = " && ".join(f"step{i}" for i in range(15))
+        post({"type": "row", "id": 12, "row": {"role": "tool", "content": "🔧 Fifteen steps", "meta": {"tool_call_id": "run_command_3", "kind": "execute", "input": json.dumps({"command": long_cmd}), "output": "", "done": True}}})
+        post({"type": "row", "id": 12, "row": {"role": "tool", "content": "🔧 Two lines", "meta": {"tool_call_id": "run_command_4", "kind": "execute", "input": json.dumps({"command": "ls\nls -la"}), "output": "", "done": True}}})
+        page.wait_for_function("() => document.querySelectorAll('.log.on .row.tool.call').length === 5")
+        page.hover(".log.on .row.tool.call >> nth=3 >> .tool-head")
+        page.wait_for_selector("#ktip:not([hidden])", timeout=2000)
+        cut = page.evaluate("() => { const t = document.getElementById('ktip'); return [t.querySelectorAll('.ktip-grid > .ktip-op').length, t.querySelector('.ktip-cut')?.textContent]; }")
+        check(cut == [12, "… Open the step to see the rest"], f"12 segments at most, then the hint ({cut})")
+        page.mouse.move(5, 5)
+        page.hover(".log.on .row.tool.call >> nth=4 >> .tool-head")
+        page.wait_for_selector("#ktip:not([hidden])", timeout=2000)
+        verbatim = page.evaluate("() => { const t = document.getElementById('ktip'); return [[...t.querySelectorAll('.ktip-grid > .ktip-op')].map((g) => g.textContent), t.querySelector('.ktip-seg').textContent, t.querySelector('.ktip-seg span') === null]; }")
+        check(verbatim == [["$"], "ls\nls -la", True], f"a multi-line command is one verbatim cell behind a single $ ({verbatim})")
+        page.mouse.move(5, 5)
         check(errors == [], f"no page errors ({errors})")
         browser.close()
     print("\n" + ("ALL OK" if not failures else f"{len(failures)} FAILURE(S)"))
