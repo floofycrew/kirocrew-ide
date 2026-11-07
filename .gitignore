@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .floofy/
+.composed/
+.pt-scratch/
+.kiro/settings/.kirocrew-cli-settings.lock

@@ -2,7 +2,7 @@
   "name": "kirocrew-ide-bridge",
   "displayName": "KiroCrew",
   "description": "KiroCrew chat (tabbed, with per-project history), agents, approvals, and the Kiro spec / steering / skills / hooks workflow inside the IDE. Sessions run in the KiroCrew gateway and survive a dropped connection. Installed by the kirocrew-ide FloofyCrew mod. Unofficial.",
-  "version": "0.30.9",
+  "version": "0.32.2",
   "publisher": "kirocrew-ide",
   "license": "MIT",
   "engines": {
@@ -67,9 +67,28 @@
         {
           "id": "kirocrew.hooks",
           "name": "Agent Hooks"
+        },
+        {
+          "id": "kirocrew.mcp",
+          "name": "MCP Servers"
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "kirocrew.steering",
+        "contents": "No steering documents yet. Steering files in `.kiro/steering/` tell the agent about this project in every session.\n[Generate steering docs](command:kirocrew.steering.generate)\nOr [create one by hand](command:kirocrew.steering.new).\nAlready have AGENTS.md, CLAUDE.md or Cursor / Cline / Continue / Copilot rules? [Import from other assistants](command:kirocrew.steering.import).",
+        "when": "kirocrew.steering.empty"
+      },
+      {
+        "view": "kirocrew.hooks",
+        "contents": "No agent hooks yet. Hook files in `.kiro/hooks/` (or `~/.kiro/hooks/`) run a prompt or a shell command when a file is saved, a tool runs, a session starts, or on demand.\nHooks are executed by kiro-cli, not by this extension. [Documentation](https://kiro.dev/docs/hooks/)\n[Create a hook](command:kirocrew.hooks.new)"
+      },
+      {
+        "view": "kirocrew.mcp",
+        "contents": "No MCP servers configured. kiro-cli reads `.kiro/settings/mcp.json` (workspace) and `~/.kiro/settings/mcp.json` (global). This view is read-only.\n[Documentation](https://kiro.dev/docs/mcp/)"
+      }
+    ],
     "commands": [
       {
         "command": "kirocrew.newSession",
@@ -87,6 +106,39 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "kirocrew.chat.nextTab",
+        "title": "KiroCrew: Next chat tab"
+      },
+      {
+        "command": "kirocrew.chat.prevTab",
+        "title": "KiroCrew: Previous chat tab"
+      },
+      {
+        "command": "kirocrew.chat.closeTab",
+        "title": "KiroCrew: Close chat tab"
+      },
+      {
+        "command": "kirocrew.chat.newTab",
+        "title": "KiroCrew: New chat tab"
+      },
+      {
+        "command": "kirocrew.chat.find",
+        "title": "KiroCrew: Find in chat transcript"
+      },
+      {
+        "command": "kirocrew.chat.approveAll",
+        "title": "KiroCrew: Approve all pending tool requests of the active chat tab"
+      },
+      {
+        "command": "kirocrew.chat.rejectAll",
+        "title": "KiroCrew: Reject all pending tool requests of the active chat tab"
+      },
+      {
+        "command": "kirocrew.chat.renameTab",
+        "title": "KiroCrew: Rename chat tab",
+        "icon": "$(edit)"
+      },
+      {
         "command": "kirocrew.pickAgent",
         "title": "KiroCrew: Choose agent",
         "icon": "$(person)"
@@ -102,12 +154,29 @@
       },
       {
         "command": "kirocrew.spec.new",
-        "title": "KiroCrew Spec: New spec",
-        "icon": "$(new-file)"
+        "title": "KiroCrew Spec: New spec from an idea",
+        "shortTitle": "New spec",
+        "icon": "$(add)"
+      },
+      {
+        "command": "kirocrew.spec.rename",
+        "title": "KiroCrew Spec: Rename spec",
+        "shortTitle": "Rename",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "kirocrew.spec.delete",
+        "title": "KiroCrew Spec: Delete spec",
+        "shortTitle": "Delete",
+        "icon": "$(trash)"
       },
       {
         "command": "kirocrew.spec.requirements",
         "title": "KiroCrew Spec: Write requirements"
+      },
+      {
+        "command": "kirocrew.spec.bugfix",
+        "title": "KiroCrew Spec: Write bug report"
       },
       {
         "command": "kirocrew.spec.design",
@@ -137,13 +206,74 @@
         "icon": "$(debug-restart)"
       },
       {
+        "command": "kirocrew.spec.viewSession",
+        "title": "KiroCrew Spec: View session",
+        "icon": "$(history)"
+      },
+      {
+        "command": "kirocrew.spec.fixTask",
+        "title": "KiroCrew Spec: Ask the agent to fix the task",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "kirocrew.spec.makeRequired",
+        "title": "KiroCrew Spec: Make task required",
+        "icon": "$(tasklist)"
+      },
+      {
+        "command": "kirocrew.spec.revealRequirement",
+        "title": "KiroCrew Spec: Reveal requirement",
+        "icon": "$(go-to-file)"
+      },
+      {
         "command": "kirocrew.spec.find",
         "title": "KiroCrew Spec: Find in document",
         "icon": "$(search)"
       },
       {
+        "command": "kirocrew.spec.review",
+        "title": "KiroCrew Spec: Review document",
+        "shortTitle": "Review",
+        "icon": "$(comment-discussion)"
+      },
+      {
         "command": "kirocrew.spec.open",
         "title": "KiroCrew Spec: Open file"
+      },
+      {
+        "command": "kirocrew.spec.goto.requirements",
+        "title": "KiroCrew Spec: Go to requirements",
+        "icon": "$(book)"
+      },
+      {
+        "command": "kirocrew.spec.goto.design",
+        "title": "KiroCrew Spec: Go to design",
+        "icon": "$(symbol-structure)"
+      },
+      {
+        "command": "kirocrew.spec.goto.tasks",
+        "title": "KiroCrew Spec: Go to tasks",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "kirocrew.spec.goto.bugfix",
+        "title": "KiroCrew Spec: Go to bugfix",
+        "icon": "$(bug)"
+      },
+      {
+        "command": "kirocrew.spec.previousDocument",
+        "title": "KiroCrew Spec: Previous document",
+        "icon": "$(arrow-left)"
+      },
+      {
+        "command": "kirocrew.spec.nextDocument",
+        "title": "KiroCrew Spec: Next document",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "kirocrew.spec.syncDocument",
+        "title": "KiroCrew Spec: Sync with project files",
+        "icon": "$(sync)"
       },
       {
         "command": "kirocrew.openInDashboard",
@@ -166,14 +296,86 @@
         "icon": "$(new-file)"
       },
       {
+        "command": "kirocrew.steering.generate",
+        "title": "Generate steering docs",
+        "category": "KiroCrew",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "kirocrew.steering.refine",
+        "title": "Refine this steering document",
+        "category": "KiroCrew",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "kirocrew.steering.import",
+        "title": "Import from other assistants",
+        "category": "KiroCrew",
+        "icon": "$(cloud-download)"
+      },
+      {
         "command": "kirocrew.skills.new",
         "title": "KiroCrew: New skill",
         "icon": "$(new-folder)"
       },
       {
+        "command": "kirocrew.skills.import",
+        "title": "Import skill",
+        "category": "KiroCrew",
+        "icon": "$(cloud-download)"
+      },
+      {
         "command": "kirocrew.hooks.new",
         "title": "KiroCrew: New agent hook",
-        "icon": "$(new-file)"
+        "icon": "$(add)"
+      },
+      {
+        "command": "kirocrew.hooks.docs",
+        "title": "Hooks documentation (kiro.dev)",
+        "category": "KiroCrew",
+        "icon": "$(book)"
+      },
+      {
+        "command": "kirocrew.hooks.toggle",
+        "title": "Toggle hook",
+        "category": "KiroCrew",
+        "icon": "$(circle-filled)"
+      },
+      {
+        "command": "kirocrew.hooks.disable",
+        "title": "Disable hook",
+        "category": "KiroCrew",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "kirocrew.hooks.enable",
+        "title": "Enable hook",
+        "category": "KiroCrew",
+        "icon": "$(pass)"
+      },
+      {
+        "command": "kirocrew.hooks.refresh",
+        "title": "Refresh hooks",
+        "category": "KiroCrew",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "kirocrew.hooks.run",
+        "title": "Run hook",
+        "category": "KiroCrew",
+        "icon": "$(play)"
+      },
+      {
+        "command": "kirocrew.mcp.refresh",
+        "title": "Refresh MCP servers",
+        "category": "KiroCrew",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "kirocrew.mcp.openConfig",
+        "title": "Open MCP config file",
+        "category": "KiroCrew",
+        "icon": "$(go-to-file)"
       },
       {
         "command": "kirocrew.openFile",
@@ -199,6 +401,68 @@
         "title": "Install from Marketplace link…",
         "category": "Extensions",
         "icon": "$(cloud-download)"
+      },
+      {
+        "command": "kirocrew.editor.ask",
+        "title": "Ask about this",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.editor.fixGrammar",
+        "title": "Fix grammar and spelling",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.editor.writeComments",
+        "title": "Write comments",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.editor.writeDocstring",
+        "title": "Write a docstring",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.editor.fixCode",
+        "title": "Fix this code",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.editor.optimize",
+        "title": "Optimize this code",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.editor.addCodeBlock",
+        "title": "Add code block to chat",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.editor.fixDiagnostic",
+        "title": "Ask the agent to fix this problem",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.terminal.sendToChat",
+        "title": "Send terminal to chat",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.explorer.addToChat",
+        "title": "Add to chat context",
+        "category": "KiroCrew"
+      },
+      {
+        "command": "kirocrew.scm.generateCommitMessage",
+        "title": "Generate commit message",
+        "category": "KiroCrew",
+        "icon": "$(sparkle)"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "kirocrew.editorActions",
+        "label": "KiroCrew"
       }
     ],
     "menus": {
@@ -214,6 +478,11 @@
           "group": "navigation@2"
         },
         {
+          "command": "kirocrew.chat.renameTab",
+          "when": "view == kirocrew.chat",
+          "group": "1_view@0"
+        },
+        {
           "command": "kirocrew.chat.reload",
           "when": "view == kirocrew.chat",
           "group": "1_view@1"
@@ -226,12 +495,27 @@
         {
           "command": "kirocrew.spec.new",
           "when": "view == kirocrew.specs",
-          "group": "navigation"
+          "group": "navigation@1"
+        },
+        {
+          "command": "kirocrew.steering.generate",
+          "when": "view == kirocrew.steering",
+          "group": "navigation@0"
+        },
+        {
+          "command": "kirocrew.steering.import",
+          "when": "view == kirocrew.steering",
+          "group": "navigation@1"
         },
         {
           "command": "kirocrew.steering.new",
           "when": "view == kirocrew.steering",
           "group": "navigation"
+        },
+        {
+          "command": "kirocrew.skills.import",
+          "when": "view == kirocrew.skills",
+          "group": "navigation@1"
         },
         {
           "command": "kirocrew.skills.new",
@@ -242,6 +526,26 @@
           "command": "kirocrew.hooks.new",
           "when": "view == kirocrew.hooks",
           "group": "navigation"
+        },
+        {
+          "command": "kirocrew.hooks.docs",
+          "when": "view == kirocrew.hooks",
+          "group": "navigation@8"
+        },
+        {
+          "command": "kirocrew.hooks.refresh",
+          "when": "view == kirocrew.hooks",
+          "group": "navigation@9"
+        },
+        {
+          "command": "kirocrew.mcp.openConfig",
+          "when": "view == kirocrew.mcp",
+          "group": "navigation@8"
+        },
+        {
+          "command": "kirocrew.mcp.refresh",
+          "when": "view == kirocrew.mcp",
+          "group": "navigation@9"
         },
         {
           "command": "kirocrew.extensions.installFromMarketplace",
@@ -259,9 +563,85 @@
         {
           "command": "kirocrew.spec.find",
           "when": "activeCustomEditorId == kirocrew.spec"
+        },
+        {
+          "command": "kirocrew.hooks.toggle",
+          "when": "false"
+        },
+        {
+          "command": "kirocrew.hooks.enable",
+          "when": "false"
+        },
+        {
+          "command": "kirocrew.hooks.disable",
+          "when": "false"
+        },
+        {
+          "command": "kirocrew.hooks.run",
+          "when": "false"
+        },
+        {
+          "command": "kirocrew.spec.goto.requirements",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && kirocrew.spec.specType != 'bugfix'"
+        },
+        {
+          "command": "kirocrew.spec.goto.design",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/"
+        },
+        {
+          "command": "kirocrew.spec.goto.tasks",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/"
+        },
+        {
+          "command": "kirocrew.spec.goto.bugfix",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && kirocrew.spec.specType == 'bugfix'"
+        },
+        {
+          "command": "kirocrew.spec.syncDocument",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/"
+        },
+        {
+          "command": "kirocrew.editor.fixDiagnostic",
+          "when": "false"
+        },
+        {
+          "command": "kirocrew.explorer.addToChat",
+          "when": "false"
         }
       ],
       "view/item/context": [
+        {
+          "command": "kirocrew.hooks.run",
+          "when": "view == kirocrew.hooks && viewItem == hook-on-manual",
+          "group": "inline@1"
+        },
+        {
+          "command": "kirocrew.hooks.disable",
+          "when": "view == kirocrew.hooks && viewItem =~ /^hook-on(-manual)?$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "kirocrew.hooks.enable",
+          "when": "view == kirocrew.hooks && viewItem =~ /^hook-off(-manual)?$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "kirocrew.hooks.run",
+          "when": "view == kirocrew.hooks && viewItem == hook-on-manual"
+        },
+        {
+          "command": "kirocrew.hooks.toggle",
+          "when": "view == kirocrew.hooks && viewItem =~ /^hook-(on|off)(-manual)?$/"
+        },
+        {
+          "command": "kirocrew.steering.refine",
+          "when": "view == kirocrew.steering && viewItem == asset",
+          "group": "inline"
+        },
+        {
+          "command": "kirocrew.steering.refine",
+          "when": "view == kirocrew.steering && viewItem == asset"
+        },
         {
           "command": "kirocrew.spec.runTask",
           "when": "view == kirocrew.specs && viewItem == task-open",
@@ -296,13 +676,162 @@
         {
           "command": "kirocrew.spec.tasks",
           "when": "view == kirocrew.specs && viewItem =~ /^spec(-interrupted)?$/"
+        },
+        {
+          "command": "kirocrew.spec.viewSession",
+          "when": "view == kirocrew.specs && viewItem =~ /^(spec(-interrupted)?|task-(open|done|running))$/",
+          "group": "inline@9"
+        },
+        {
+          "command": "kirocrew.spec.viewSession",
+          "when": "view == kirocrew.specs && viewItem =~ /^(spec(-interrupted)?|task-(open|done|running))$/"
+        },
+        {
+          "command": "kirocrew.spec.rename",
+          "when": "view == kirocrew.specs && viewItem =~ /^spec(-interrupted)?$/",
+          "group": "inline@8"
+        },
+        {
+          "command": "kirocrew.spec.rename",
+          "when": "view == kirocrew.specs && viewItem =~ /^spec(-interrupted)?$/",
+          "group": "9_manage@1"
+        },
+        {
+          "command": "kirocrew.spec.delete",
+          "when": "view == kirocrew.specs && viewItem =~ /^spec(-interrupted)?$/",
+          "group": "9_manage@2"
+        },
+        {
+          "command": "kirocrew.spec.review",
+          "when": "view == kirocrew.specs && viewItem =~ /^specfile(-generated)?$/",
+          "group": "inline"
+        },
+        {
+          "command": "kirocrew.spec.review",
+          "when": "view == kirocrew.specs && viewItem =~ /^specfile(-generated)?$/"
         }
       ],
       "editor/title": [
         {
+          "command": "kirocrew.steering.refine",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]steering[\\\\/].+\\.md$/ && resourceExtname == .md",
+          "group": "navigation"
+        },
+        {
           "command": "kirocrew.spec.previewToSide",
           "when": "editorLangId == markdown && resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks)\\.md$/ && !notebookEditorFocused",
           "alt": "kirocrew.spec.preview",
+          "group": "navigation"
+        },
+        {
+          "command": "kirocrew.spec.goto.requirements",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'requirements.md' && kirocrew.spec.specType != 'bugfix' && (kirocrew.spec.workflowType == 'requirements-first' || !kirocrew.spec.workflowType)",
+          "group": "navigation@1"
+        },
+        {
+          "command": "kirocrew.spec.goto.design",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'design.md' && kirocrew.spec.specType != 'bugfix' && (kirocrew.spec.workflowType == 'requirements-first' || !kirocrew.spec.workflowType)",
+          "group": "navigation@2"
+        },
+        {
+          "command": "kirocrew.spec.goto.tasks",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'tasks.md' && kirocrew.spec.specType != 'bugfix' && (kirocrew.spec.workflowType == 'requirements-first' || !kirocrew.spec.workflowType)",
+          "group": "navigation@3"
+        },
+        {
+          "command": "kirocrew.spec.goto.design",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'design.md' && kirocrew.spec.specType != 'bugfix' && kirocrew.spec.workflowType == 'design-first'",
+          "group": "navigation@1"
+        },
+        {
+          "command": "kirocrew.spec.goto.requirements",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'requirements.md' && kirocrew.spec.specType != 'bugfix' && kirocrew.spec.workflowType == 'design-first'",
+          "group": "navigation@2"
+        },
+        {
+          "command": "kirocrew.spec.goto.tasks",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'tasks.md' && kirocrew.spec.specType != 'bugfix' && kirocrew.spec.workflowType == 'design-first'",
+          "group": "navigation@3"
+        },
+        {
+          "command": "kirocrew.spec.goto.tasks",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'tasks.md' && kirocrew.spec.specType != 'bugfix' && kirocrew.spec.workflowType == 'fast-task'",
+          "group": "navigation@1"
+        },
+        {
+          "command": "kirocrew.spec.goto.requirements",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'requirements.md' && kirocrew.spec.specType != 'bugfix' && kirocrew.spec.workflowType == 'fast-task'",
+          "group": "navigation@2"
+        },
+        {
+          "command": "kirocrew.spec.goto.design",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'design.md' && kirocrew.spec.specType != 'bugfix' && kirocrew.spec.workflowType == 'fast-task'",
+          "group": "navigation@3"
+        },
+        {
+          "command": "kirocrew.spec.goto.bugfix",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'bugfix.md' && kirocrew.spec.specType == 'bugfix'",
+          "group": "navigation@1"
+        },
+        {
+          "command": "kirocrew.spec.goto.design",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'design.md' && kirocrew.spec.specType == 'bugfix'",
+          "group": "navigation@2"
+        },
+        {
+          "command": "kirocrew.spec.goto.tasks",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'tasks.md' && kirocrew.spec.specType == 'bugfix'",
+          "group": "navigation@3"
+        },
+        {
+          "command": "kirocrew.spec.syncDocument",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && kirocrew.spec.documentHasContent",
+          "group": "navigation@4"
+        },
+        {
+          "command": "kirocrew.spec.nextDocument",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename != 'tasks.md' && (kirocrew.spec.workflowType != 'fast-task' || resourceFilename != 'design.md')",
+          "group": "navigation@5"
+        },
+        {
+          "command": "kirocrew.spec.runAll",
+          "when": "resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename == 'tasks.md'",
+          "group": "navigation@6"
+        }
+      ],
+      "editor/context": [
+        {
+          "submenu": "kirocrew.editorActions",
+          "when": "editorHasSelection",
+          "group": "navigation@9"
+        }
+      ],
+      "kirocrew.editorActions": [
+        { "command": "kirocrew.editor.ask", "group": "1_ask@1" },
+        { "command": "kirocrew.editor.fixGrammar", "group": "2_edit@1" },
+        { "command": "kirocrew.editor.writeComments", "group": "2_edit@2" },
+        { "command": "kirocrew.editor.writeDocstring", "group": "2_edit@3" },
+        { "command": "kirocrew.editor.fixCode", "group": "2_edit@4" },
+        { "command": "kirocrew.editor.optimize", "group": "2_edit@5" },
+        { "command": "kirocrew.editor.addCodeBlock", "group": "3_insert@1" }
+      ],
+      "terminal/context": [
+        {
+          "command": "kirocrew.terminal.sendToChat",
+          "group": "navigation@9"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "kirocrew.explorer.addToChat",
+          "when": "resourceScheme == file",
+          "group": "7_modification@9"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "kirocrew.scm.generateCommitMessage",
+          "when": "scmProvider == git",
           "group": "navigation"
         }
       ]
@@ -319,6 +848,11 @@
           "type": "string",
           "default": "",
           "description": "KiroCrew agent used to execute spec tasks (empty = same as kirocrew.agent)."
+        },
+        "kirocrew.kiroModeAgents": {
+          "type": "boolean",
+          "default": false,
+          "description": "Hand Spec / Quick Spec / Bug Fix / Plan turns to the kiro-spec-plan mod's mode agents (spec, quick-spec, bug-fix, plan) when they are installed. Off by default: on current kiro-cli, `--agent spec` loads that mod's tool-less handle file rather than Kiro's bundled Spec mode, so the IDE's own spec workflow runs on kirocrew.agent / kirocrew.specAgent instead."
         },
         "kirocrew.specAutopilot": {
           "type": "boolean",
@@ -350,7 +884,7 @@
         "kirocrew.syncTheme": {
           "type": "boolean",
           "default": true,
-          "description": "Follow the KiroCrew dashboard's light/dark scheme with the workbench's stock theme (a theme you picked yourself is never changed)."
+          "description": "Follow a KiroCrew dashboard light/dark toggle made while the window is open with the workbench's stock theme (a theme you picked yourself is never changed; opening a window never changes the theme)."
         },
         "kirocrew.chatFontSize": {
           "type": "number",
@@ -369,6 +903,22 @@
           ],
           "default": "compact",
           "description": "How wide the messages run when the KiroCrew Chat pane is wide; the same three presets as the dashboard's Chat settings."
+        },
+        "kirocrew.toolCardDisplayMode": {
+          "type": "string",
+          "enum": ["collapseOnComplete", "alwaysExpanded"],
+          "enumDescriptions": [
+            "A tool row folds to its one-line header when the call returns; click the header to see its input and output. A row you opened or closed yourself is left as you set it.",
+            "Tool rows open as they arrive and stay open with their input and output visible."
+          ],
+          "default": "collapseOnComplete",
+          "description": "Whether finished tool rows in KiroCrew Chat stay open (Kiro's Tool Card Display Mode). Applies to the rows already on screen when changed."
+        },
+        "kirocrew.editorActions.prompts": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {},
+          "markdownDescription": "Your own instruction for the actions of the editor's **KiroCrew** context menu, keyed by action id: `ask` (Ask about this), `fixGrammar` (Fix grammar and spelling), `writeComments` (Write comments), `writeDocstring` (Write a docstring), `fixCode` (Fix this code), `optimize` (Optimize this code). An id left out (or set to an empty string) keeps the built-in instruction. The selection travels with the message as a `#selection` context in every case."
         }
       }
     },
@@ -392,6 +942,54 @@
         "when": "activeCustomEditorId == kirocrew.spec"
       },
       {
+        "command": "kirocrew.terminal.sendToChat",
+        "key": "ctrl+shift+r",
+        "mac": "cmd+shift+r",
+        "when": "terminalFocus"
+      },
+      {
+        "command": "kirocrew.chat.nextTab",
+        "key": "ctrl+alt+right",
+        "mac": "cmd+alt+right",
+        "when": "focusedView == kirocrew.chat"
+      },
+      {
+        "command": "kirocrew.chat.prevTab",
+        "key": "ctrl+alt+left",
+        "mac": "cmd+alt+left",
+        "when": "focusedView == kirocrew.chat"
+      },
+      {
+        "command": "kirocrew.chat.closeTab",
+        "key": "ctrl+w",
+        "mac": "cmd+w",
+        "when": "focusedView == kirocrew.chat"
+      },
+      {
+        "command": "kirocrew.chat.newTab",
+        "key": "ctrl+t",
+        "mac": "cmd+t",
+        "when": "focusedView == kirocrew.chat"
+      },
+      {
+        "command": "kirocrew.chat.find",
+        "key": "ctrl+f",
+        "mac": "cmd+f",
+        "when": "focusedView == kirocrew.chat"
+      },
+      {
+        "command": "kirocrew.chat.approveAll",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "focusedView == kirocrew.chat"
+      },
+      {
+        "command": "kirocrew.chat.rejectAll",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c",
+        "when": "focusedView == kirocrew.chat"
+      },
+      {
         "command": "kirocrew.spec.preview",
         "key": "ctrl+shift+v",
         "mac": "cmd+shift+v",
@@ -402,6 +1000,18 @@
         "key": "ctrl+k v",
         "mac": "cmd+k v",
         "when": "editorLangId == markdown && resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks)\\.md$/ && !notebookEditorFocused"
+      },
+      {
+        "command": "kirocrew.spec.syncDocument",
+        "key": "ctrl+shift+enter",
+        "mac": "cmd+shift+enter",
+        "when": "editorTextFocus && resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && kirocrew.spec.documentHasContent && !notebookEditorFocused"
+      },
+      {
+        "command": "kirocrew.spec.runAll",
+        "key": "ctrl+alt+enter",
+        "mac": "cmd+alt+enter",
+        "when": "editorTextFocus && resourcePath =~ /[\\\\/]\\.kiro[\\\\/]specs[\\\\/][^\\\\/]+[\\\\/](requirements|design|tasks|bugfix)\\.md$/ && resourceFilename == 'tasks.md' && !notebookEditorFocused"
       }
     ]
   }

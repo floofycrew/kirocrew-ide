@@ -93,7 +93,8 @@ def main():
             held.close()
         hook._ctx.state.pop("last_port", None)
         picked = hook._pick_port()
-        assert picked != hook.PORT_BASE if base_hold else picked == hook.PORT_BASE, "no last port: the base scan as before (%d)" % picked
+        # the base is busy either way (held above, or by the live engine on this machine): the scan skips it
+        assert picked != hook.PORT_BASE and hook.PORT_BASE < picked < hook.PORT_BASE + hook.PORT_SCAN, "no last port: the base scan as before (%d)" % picked
         hook._ctx = _Ctx({"engine.port": port})
         assert hook._pick_port() == port, "a pinned port is honoured"
     finally:
@@ -123,6 +124,17 @@ def main():
     held.close()
     assert [l for l in logged if l[0] == "warning"], "a port still busy after the wait is logged"
     print("stop: remembers the port, waits for its release, warns when it stays busy")
+
+    # --- _live_state: a dead engine's record is cleared, but its port is remembered for the next start ---
+    hook._ctx = _Ctx()
+    cleared = []
+    hook._read_state = lambda: {"pid": 999999999, "port": 35477}
+    hook._clear_state = lambda: cleared.append(True)
+    assert hook._live_state() is None and cleared, "a record whose pid is gone is stale and cleared"
+    assert hook._ctx.state.get("last_port") == 35477, "the dead engine's port is kept for _pick_port (an engine killed with the gateway came back on another port, 2026-11-07)"
+    hook._read_state = lambda: None
+    assert hook._live_state() is None, "no record: nothing to remember"
+    print("live_state: a dead engine's port survives the cleared record")
     print("engine_port_test: ok")
 
 

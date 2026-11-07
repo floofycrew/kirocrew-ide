@@ -1,5 +1,6 @@
 // node --test: the extension's pure logic under a stub `vscode` module.
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { createRequire } from "node:module";
 import { test } from "node:test";
 import path from "node:path";
@@ -16,7 +17,7 @@ const stub = {
   ThemeIcon: class { constructor(id) { this.id = id; } },
   FileType: { Directory: 2 },
   Uri: { joinPath: (base, ...parts) => ({ path: [base.path, ...parts].join("/") }), parse: (s) => ({ toString: () => s }) },
-  workspace: { getConfiguration: () => ({ get: () => undefined }), workspaceFolders: [] },
+  workspace: { getConfiguration: () => ({ get: (k) => (k === "kiroModeAgents" ? true : undefined) }), workspaceFolders: [] },
   window: {},
   commands: {},
   StatusBarAlignment: { Left: 1 },
@@ -649,6 +650,12 @@ test("themeFor follows the dashboard only while the workbench theme is stock", (
   assert.equal(themeFor("dark", "Monokai"), null, "a theme the user picked is never touched");
   assert.equal(themeFor("light", "Default High Contrast"), null, "high contrast is a deliberate choice");
   assert.equal(themeFor("system", undefined), null, "only resolved schemes are handled");
+  // The sync writes only on a scheme CHANGE seen while the window is open: the first poll records
+  // the scheme and returns, so a window load never flips a stock theme (2026-11-07).
+  const src = fs.readFileSync(path.join(here, "..", "extension", "extension.js"), "utf8");
+  const sync = src.slice(src.indexOf("function syncTheme("), src.indexOf("// ---------------------------------------------------------------- native highlighting"));
+  assert.ok(sync.includes("const first = lastScheme === null;\n    lastScheme = scheme;\n    if (first) return;"), "the first observed scheme is recorded, not applied");
+  assert.ok(sync.indexOf("if (first) return;") < sync.indexOf("themeFor(scheme, explicit)"), "the early return comes before the theme is computed or written");
 });
 
 test("chat webview: compact spacing, message font size scoped to the transcript", () => {
@@ -947,6 +954,24 @@ test("chat webview: the command tip splits a shell call into its pipeline segmen
   assert.equal(segs("   "), null);
   assert.equal(ctx.TIP_MAX_LINES, 12);
   assert.equal(ctx.TIP_MAX_CHARS, 1200);
+  // Offsets: every segment, operator and piece names its place in the text, so the engine's
+  // highlight runs (computed over the same text) can be sliced onto the grid without re-tokenizing.
+  const cmd = "  git status --short && FOO=1 git -P log 2>/dev/null | head -20; echo \"---\"  ";
+  const raw = JSON.parse(JSON.stringify(ctx.shSegments(cmd)));
+  assert.deepEqual(raw.map((s) => [s.op, cmd.slice(s.start, s.end)]), [["", "git status --short"], ["&&", "FOO=1 git -P log 2>/dev/null"], ["|", "head -20"], [";", 'echo "---"']], "[start, end) covers the segment's text, leading and trailing blanks excluded");
+  assert.deepEqual(raw.slice(1).map((s) => cmd.slice(s.opStart, s.opStart + s.op.length)), ["&&", "|", ";"], "opStart points at the operator");
+  for (const s of raw) for (const p of s.pieces) assert.equal(cmd.slice(p.start, p.start + p.text.length), p.text, "piece offset " + JSON.stringify(p));
+  // The native colours: the page asks the extension once per distinct command and paints its runs.
+  assert.ok(script.includes("vscode.postMessage({type:'highlight', req, text});") && script.includes("case 'highlighted': tipHighlighted(m); break;") && script.includes("case 'highlightReset': tipReset(); break;"), "request and the two replies");
+  assert.ok(script.includes("if(!Array.isArray(m.lines)){ TIP_NATIVE=false; return; }"), "a null answer stops the asking until a theme change");
+  assert.ok(script.includes("if(hl) paintRuns(s, hl[0]||[], seg.start, seg.end, text);") && script.includes("if(r.c) x.style.color=r.c;") && script.includes("if(r.f&1) x.style.fontStyle='italic'; if(r.f&2) x.style.fontWeight='600';"), "runs painted inline: the theme colour, the font-style bits");
+  assert.ok(script.includes("runs.push({ s, e, c: fg > 1 && this.colorMap[fg] ? this.colorMap[fg] : \"\", f: (meta & FS_MASK) >>> FS_OFFSET });") === false, "the tokenizer lives in the engine-host extension, not in the page");
+  // The bridge forwards the request to the engine-host command and resets on a theme change.
+  const src = fs.readFileSync(path.join(here, "..", "extension", "extension.js"), "utf8");
+  assert.ok(src.includes('const HIGHLIGHT_COMMAND = "kirocrew.preview.highlight";') && src.includes('if (msg.type === "highlight") { this.post(Object.assign({ type: "highlighted", req: msg.req }, await nativeHighlight(msg.text))); return; }'));
+  assert.ok(src.includes("vscode.window.onDidChangeActiveColorTheme(highlightReset)") && src.includes('e.affectsConfiguration("editor.tokenColorCustomizations")) highlightReset();'));
+  const preview = JSON.parse(fs.readFileSync(path.join(here, "..", "preview", "package.json"), "utf8"));
+  assert.deepEqual(preview.activationEvents, ["onCommand:kirocrew.preview.highlight"], "the engine-host extension wakes for the command");
   // The row wiring: no native title on a tool row (the tip replaces it), the click's effect in the accessible name, the tip hidden by a click, a tab switch, a scroll and Escape.
   assert.ok(script.includes("head.setAttribute('aria-label', \"Show this call's input and output: \"+title); if(ts) head.title=TASK_STATUS_NOTE;"), "only a bookkeeping row keeps a native tooltip");
   assert.ok(script.includes("if(!ts){ head.addEventListener('mouseenter', ()=>tipArm(head)); head.addEventListener('mouseleave', tipHide);"), "hover arms the tip");
@@ -1545,4 +1570,96 @@ test("auto-resume off: the card is explained and nothing is sent until Continue"
     assert.equal(calls.sent.length, 2);
     assert.match(calls.sent[1].text, /PHASE: EXECUTE REMAINING TASKS\. Run all tasks for this spec\./, "the paraphrase on the crew agent (no Spec agent on this host)");
   } finally { ws.restore(); stub.workspace.getConfiguration = savedCfg; }
+});
+
+test("sendSpecTurn: Spec_Agent in Spec mode, sibling documents as #file contexts, short display text, the spec's idle tab reused and a busy one left alone", async () => {
+  const { ChatView, specTurnText } = ext.__test;
+  // A workspace with one spec whose requirements.md and design.md exist (tasks.md not yet).
+  const files = { "/w/.kiro/specs/foo/requirements.md": "# Requirements\nR1", "/w/.kiro/specs/foo/design.md": "# Design\nD1", "/w/.kiro/specs/foo/.config.kiro": '{"specId":"x","workflowType":"requirements-first","specType":"feature"}' };
+  const saved = { folders: stub.workspace.workspaceFolders, fs: stub.workspace.fs, exec: stub.commands.executeCommand, status: stub.window.setStatusBarMessage, cfg: stub.workspace.getConfiguration };
+  stub.workspace.workspaceFolders = [{ uri: { path: "/w" } }];
+  stub.workspace.fs = {
+    readDirectory: async (uri) => (uri.path === "/w/.kiro/specs" ? [["foo", 2]] : []),
+    readFile: async (uri) => { if (!(uri.path in files)) throw new Error("ENOENT " + uri.path); return new TextEncoder().encode(files[uri.path]); },
+  };
+  stub.commands.executeCommand = async () => undefined;
+  stub.window.setStatusBarMessage = () => undefined;
+  stub.workspace.getConfiguration = () => ({ get: (k) => (k === "specAgent" ? "spec-writer" : undefined) });
+  const running = new Set();
+  const calls = { created: [], injected: [], sent: [], posted: [] };
+  const sessions = {
+    projectPath: () => "/w", agents: [], onDidChange: () => ({ dispose() {} }),
+    slot: (key) => ({ running: running.has(key) }),
+    create: async (o) => { calls.created.push(o); return "k" + (calls.created.length); },
+    inject: async (key, content, source) => { calls.injected.push({ key, content, source }); },
+    send: async (key, text, agent) => { calls.sent.push({ key, text, agent }); },
+    setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, setSlotAgent: async () => {},
+  };
+  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+  chat.post = (m) => calls.posted.push(m);
+  try {
+    const first = await chat.sendSpecTurn("foo", "update", "design.md");
+    assert.deepEqual(first, { key: "k1", reused: false });
+    assert.deepEqual(calls.created[0], { agent: "spec-writer", kind: "spec", title: "spec foo: design" });
+    const tab = chat.tabForKey("k1");
+    assert.equal(tab.settings.mode, "spec");
+    assert.deepEqual(tab.spec, { name: "foo", dir: "/w/.kiro/specs/foo" });
+    const fileContexts = calls.injected.filter((c) => c.source === "kirocrew-ide #file");
+    assert.deepEqual(fileContexts.map((c) => c.content.split("\n")[0]), ["[.kiro/specs/foo/requirements.md]"], "only the sibling that exists, not design.md itself nor the missing tasks.md");
+    assert.match(fileContexts[0].content, /--- \.kiro\/specs\/foo\/requirements\.md ---\n# Requirements\nR1/);
+    assert.ok(calls.injected.some((c) => c.source === "kirocrew-ide workflow"), "Spec mode's frame on the crew agent");
+    const spec = { name: "foo", workspace: { uri: { path: "/w" } }, config: { specId: "x", workflowType: "requirements-first", specType: "feature" } };
+    assert.equal(calls.sent[0].text, specTurnText("update", "design.md", { spec }));
+    assert.equal(calls.sent[0].agent, "spec-writer");
+    const bubble = calls.posted.find((m) => m.type === "user");
+    assert.equal(bubble.text, "Sync design with project files");
+    assert.deepEqual(bubble.contexts, [".kiro/specs/foo/requirements.md"]);
+    // The same spec again while the tab is idle: the turn lands in that tab, with a custom display text.
+    const second = await chat.sendSpecTurn("foo", "generate", "tasks", { displayText: "Generate the task list" });
+    assert.deepEqual(second, { key: "k1", reused: true });
+    assert.equal(calls.created.length, 1, "no second session");
+    assert.equal(calls.sent[1].key, "k1");
+    assert.match(calls.sent[1].text, /PHASE: TASKS/);
+    assert.equal(calls.posted.filter((m) => m.type === "user")[1].text, "Generate the task list");
+    assert.equal(chat.findSpecTab("foo", "/w/.kiro/specs/foo"), tab);
+    // Busy: a fresh tab instead.
+    running.add("k1");
+    const third = await chat.sendSpecTurn("foo", "review", "requirements.md", { body: "> R1\nsplit it" });
+    assert.deepEqual(third, { key: "k2", reused: false });
+    assert.match(calls.sent[2].text, /APPLY REVIEW COMMENTS to \.kiro\/specs\/foo\/requirements\.md\.\n\n> R1\nsplit it$/);
+    assert.equal(chat.findSpecTab("foo"), chat.tabForKey("k2"), "the idle tab is preferred over the running one");
+    await assert.rejects(chat.sendSpecTurn("nope", "update", "design.md"), /spec nope is not in the workspace/);
+  } finally {
+    stub.workspace.workspaceFolders = saved.folders; stub.workspace.fs = saved.fs; stub.commands.executeCommand = saved.exec;
+    stub.window.setStatusBarMessage = saved.status; stub.workspace.getConfiguration = saved.cfg;
+  }
+});
+test("kiroModeAgents off (the default): the spec turn never goes to the kiro-spec-plan handle; the IDE's own workflow runs on the pick, and the picker shows no install hint", async () => {
+  // Seen live 2026-11-07 on dev-dsk-testing: the host accepted agent `spec`, kiro-cli loaded the mod's
+  // tool-less ~/.kiro/agents/spec.json handle, and the design phase answered "Kiro Spec & Plan needs the
+  // KAS backend" although acp_backend was kas. The mode agents are now opt-in.
+  const { kasAgentFor, agentPicks, ChatView } = ext.__test;
+  const agents = [{ name: "desk-default" }, { name: "spec" }, { name: "plan" }];
+  assert.equal(kasAgentFor("spec", agents, false), null);
+  assert.equal(kasAgentFor("spec", agents, true), "spec");
+  const picks = agentPicks(agents, false).map((p) => p.id);
+  assert.deepEqual(picks, ["workflow:spec", "workflow:quick-spec", "workflow:bug-fix", "workflow:plan", "", "agent:desk-default"], "workflows listed, no hint row, mode agents hidden");
+  const savedCfg = stub.workspace.getConfiguration;
+  stub.workspace.getConfiguration = () => ({ get: () => undefined });
+  try {
+    const calls = { created: [], injected: [], sent: [] };
+    const sessions = {
+      projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents,
+      create: async (o) => { calls.created.push(o); return "k7"; },
+      inject: async (k, c, src) => { calls.injected.push(src); },
+      send: async (k, text, agent) => { calls.sent.push(agent); },
+      setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, setSlotAgent: async () => {},
+    };
+    const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
+    chat.post = () => {};
+    await chat.dispatch("PHASE: DESIGN …", { mode: "spec", title: "t", kind: "spec", agent: "o3r" });
+    assert.equal(calls.created[0].agent, "o3r", "created on the pick, not on the handle");
+    assert.deepEqual(calls.sent, ["o3r"]);
+    assert.ok(calls.injected.includes("kirocrew-ide workflow"), "the prompt-guided Spec frame is injected");
+  } finally { stub.workspace.getConfiguration = savedCfg; }
 });

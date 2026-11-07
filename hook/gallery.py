@@ -38,16 +38,28 @@ one forwarded write, an install count), upstream hosts fixed to the two stores
 and declared in the manifest's network.hosts. No credential is read or
 forwarded. `engine.gallery` in the mod config: "merged" (default), "openvsx"
 (leave the engine alone) or "marketplace" (Marketplace only).
+
+Also here, because it is the hook's other "fetch something from a public store"
+job: the skill importer behind `POST skills/import` (see `import_skill` at the
+end) — a GitHub repository, subfolder or tree URL becomes a tarball download
+from codeload.github.com, the folder holding `SKILL.md` is extracted into a
+temp dir and moved under `.kiro/skills/<name>` of the chosen scope.
 """
 
 from __future__ import annotations
 
 import collections
+import io
 import json
 import os
+import re
+import shutil
 import socket
+import tarfile
+import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -513,3 +525,336 @@ def restore_product_json(path, log):
     os.replace(tmp, path)
     log("gallery: product.json restored to %s" % original.get("serviceUrl"))
     return True
+
+
+# ------------------------------------------------------- skill import (GitHub)
+#
+# `POST skills/import {"url", "scope", "workspace"?}` → `{"name", "path"}` or
+# `{"error"}`. The extension runs in the browser and cannot reach GitHub itself,
+# so the hook downloads the repository tarball (codeload.github.com, the host
+# behind github.com's "Download ZIP"), extracts it into a temp dir under the
+# mod's data dir, finds the folder holding SKILL.md and moves that folder into
+# place. Nothing is left behind on failure: the temp dir is removed in every
+# path and the target is only created by the final move. Network calls go
+# through the fetcher the hook passes in (its manifest-checked opener).
+
+SKILL_FILE = "SKILL.md"
+SKILL_SCOPES = ("workspace", "global")
+#: Branches tried, in order, when the URL names none and the repository's default branch cannot be read.
+SKILL_DEFAULT_REFS = ("main", "master")
+GITHUB_HOSTS = ("github.com", "www.github.com")
+GITHUB_REPO_API = "https://api.github.com/repos/{owner}/{repo}"
+GITHUB_TARBALL = "https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}"
+#: Seconds per network call and the largest tarball accepted (a skill is text; this is generous).
+SKILL_FETCH_TIMEOUT = 60
+SKILL_TARBALL_MAX = 64 * 1024 * 1024
+#: Extracted bytes cap, so a crafted archive cannot fill the disk.
+SKILL_EXTRACT_MAX = 256 * 1024 * 1024
+#: One path segment: a GitHub owner/repo, a git ref segment, a skill folder name.
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+#: A skill name as written to disk: one safe path segment, at most 64 chars.
+SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_FRONT_MATTER_RE = re.compile(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
+_FRONT_NAME_RE = re.compile(r"^name[ \t]*:[ \t]*(.+?)[ \t]*$", re.M | re.I)
+
+
+def parse_github_url(url):
+    """Pure: a GitHub repository reference → `{owner, repo, ref, path}` or None.
+
+    Accepts `https://github.com/<owner>/<repo>` (trailing `.git`, slash,
+    query or fragment allowed), `.../tree/<ref>[/<path>]`, `.../blob/<ref>/<path>`
+    (a link to the SKILL.md itself names its folder) and the shorthand
+    `<owner>/<repo>[/tree/<ref>/<path>]`. `ref` and `path` are None when not
+    given; a branch name with a slash in it cannot be told from the path and is
+    read as its first segment. Anything else — another host, a scheme other
+    than https/http, a path segment of `..` — is None.
+    """
+    if not isinstance(url, str):
+        return None
+    text = url.strip()
+    if not text:
+        return None
+    if "://" in text or text.lower().startswith(GITHUB_HOSTS):
+        if "://" not in text:
+            text = "https://" + text
+        parsed = urllib.parse.urlparse(text)
+        if parsed.scheme not in ("https", "http") or parsed.netloc.lower() not in GITHUB_HOSTS:
+            return None
+        route = parsed.path
+    else:
+        if ":" in text or text.startswith("/") or "?" in text or "#" in text:
+            return None  # ssh forms, absolute paths and query strings are not the shorthand
+        route = text
+    segments = [seg for seg in route.strip("/").split("/") if seg]
+    if len(segments) < 2:
+        return None
+    owner, repo = segments[0], segments[1]
+    if repo.lower().endswith(".git"):
+        repo = repo[:-4]
+    if not _SEGMENT_RE.match(owner) or not _SEGMENT_RE.match(repo) or owner in (".", "..") or repo in (".", ".."):
+        return None
+    ref = path = None
+    rest = segments[2:]
+    if rest:
+        kind = rest[0]
+        if kind not in ("tree", "blob") or len(rest) < 2 or not _SEGMENT_RE.match(rest[1]) or rest[1] in (".", ".."):
+            return None
+        ref = rest[1]
+        tail = rest[2:]
+        if kind == "blob":
+            if not tail or tail[-1] != SKILL_FILE:
+                return None  # a blob link only makes sense when it points at the SKILL.md
+            tail = tail[:-1]
+        for seg in tail:
+            if seg in (".", "..") or not _SEGMENT_RE.match(seg):
+                return None
+        path = "/".join(tail) or None
+    return {"owner": owner, "repo": repo, "ref": ref, "path": path}
+
+
+def skill_name_of(skill_dir, fallback=None):
+    """The skill's name: `name:` from SKILL.md's front matter when it is a safe
+    folder name, else `fallback`, else the folder's basename."""
+    try:
+        with open(os.path.join(skill_dir, SKILL_FILE), "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(16 * 1024)
+    except OSError:
+        head = ""
+    match = _FRONT_MATTER_RE.match(head)
+    if match:
+        found = _FRONT_NAME_RE.search(match.group(1))
+        if found:
+            name = found.group(1).strip().strip("'\"").strip()
+            if SKILL_NAME_RE.match(name) and name not in (".", ".."):
+                return name
+    return fallback or os.path.basename(os.path.normpath(skill_dir))
+
+
+def _has_skill(directory):
+    return os.path.isfile(os.path.join(directory, SKILL_FILE))
+
+
+def _shallowest_skill_dir(base):
+    """Breadth-first: the first directory under `base` (itself included) holding SKILL.md; dot-dirs skipped."""
+    queue = collections.deque([base])
+    while queue:
+        current = queue.popleft()
+        if _has_skill(current):
+            return current
+        try:
+            names = sorted(os.listdir(current))
+        except OSError:
+            continue
+        for name in names:
+            if name.startswith("."):
+                continue
+            child = os.path.join(current, name)
+            if os.path.isdir(child) and not os.path.islink(child):
+                queue.append(child)
+    return None
+
+
+def find_skill_dir(root, sub=None):
+    """The folder to install from an extracted tarball at `root`, or None.
+
+    A GitHub tarball unpacks to one top-level `<repo>-<sha>/` directory; that
+    (or `root` itself when there is no single wrapper) is the repository. With
+    `sub` (the URL's `/tree/<ref>/<path>`), the skill is looked for from
+    `<repository>/<sub>` down; otherwise the shallowest directory holding
+    SKILL.md wins (the repository root first, then its folders, breadth-first,
+    in name order). `sub` may not leave the repository.
+    """
+    if not os.path.isdir(root):
+        return None
+    base = _repo_base(root)
+    if sub:
+        wanted = os.path.normpath(os.path.join(base, sub.strip("/")))
+        if not (wanted == base or wanted.startswith(base + os.sep)) or not os.path.isdir(wanted):
+            return None
+        return _shallowest_skill_dir(wanted)
+    return _shallowest_skill_dir(base)
+
+
+def _within(dest, candidate):
+    real_dest = os.path.realpath(dest)
+    real = os.path.realpath(candidate)
+    return real == real_dest or real.startswith(real_dest + os.sep)
+
+
+def safe_extract(tar, dest):
+    """Extract `tar` into `dest`, refusing anything that could write outside it.
+
+    Rejected (ValueError): absolute member names, `..` segments, device/fifo
+    members, symlinks or hardlinks whose target resolves outside `dest`, and a
+    total size past SKILL_EXTRACT_MAX. Regular files and directories are
+    extracted with the stdlib's `data` filter (no setuid bits, no absolute
+    link targets) on top of these checks.
+    """
+    os.makedirs(dest, exist_ok=True)
+    members = []
+    total = 0
+    for member in tar.getmembers():
+        name = member.name
+        parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+        if name.startswith(("/", "\\")) or os.path.isabs(name) or ".." in parts or (parts and re.match(r"^[A-Za-z]:", parts[0])):
+            raise ValueError("archive member escapes the destination: %s" % name)
+        if not parts:
+            continue
+        if member.isdev() or member.isfifo():
+            raise ValueError("archive member is not a file or directory: %s" % name)
+        target = os.path.join(dest, *parts)
+        if member.issym() or member.islnk():
+            link = member.linkname.replace("\\", "/")
+            if member.issym():
+                resolved = os.path.normpath(os.path.join(os.path.dirname(target), link))
+            else:
+                resolved = os.path.normpath(os.path.join(dest, *[p for p in link.split("/") if p not in ("", ".")]))
+            if os.path.isabs(link) or not (resolved == os.path.normpath(dest) or resolved.startswith(os.path.normpath(dest) + os.sep)):
+                raise ValueError("archive link points outside the destination: %s -> %s" % (name, member.linkname))
+        elif member.isfile():
+            total += max(member.size, 0)
+            if total > SKILL_EXTRACT_MAX:
+                raise ValueError("archive is larger than %d MB unpacked" % (SKILL_EXTRACT_MAX >> 20))
+        elif not member.isdir():
+            raise ValueError("archive member of an unsupported type: %s" % name)
+        members.append(member)
+    tar.extractall(dest, members=members, filter="data")
+    # Belt and braces: nothing extracted may resolve outside dest (a link chain could).
+    for member in members:
+        if not _within(dest, os.path.join(dest, member.name)):
+            raise ValueError("extracted member resolves outside the destination: %s" % member.name)
+
+
+def skill_root(scope, workspace=None, home=None):
+    """`<workspace>/.kiro/skills` or `<home>/.kiro/skills` for the scope; ValueError when the input is unusable."""
+    scope = str(scope or "workspace")
+    if scope not in SKILL_SCOPES:
+        raise ValueError("scope must be one of %s" % ", ".join(SKILL_SCOPES))
+    if scope == "global":
+        base = home or os.path.expanduser("~")
+    else:
+        base = str(workspace or "").strip()
+        if not base:
+            raise ValueError("workspace is required for scope \"workspace\"")
+        if not os.path.isabs(base):
+            raise ValueError("workspace must be an absolute path")
+        if not os.path.isdir(base):
+            raise ValueError("workspace does not exist: %s" % base)
+    return os.path.join(base, ".kiro", "skills")
+
+
+def default_branch(ref, fetch):
+    """The repository's default branch from the GitHub API, or None when it cannot be read."""
+    try:
+        raw = fetch(GITHUB_REPO_API.format(owner=ref["owner"], repo=ref["repo"]))
+        name = json.loads(raw.decode("utf-8")).get("default_branch")
+    except Exception:  # noqa: BLE001 — rate limit, private repo, offline: fall back to the usual names
+        return None
+    return name if isinstance(name, str) and _SEGMENT_RE.match(name) else None
+
+
+def fetch_tarball(ref, fetch):
+    """`(bytes, git_ref)` of the repository tarball; tries the URL's ref, else the default branch, main, master."""
+    candidates = [ref["ref"]] if ref.get("ref") else []
+    if not candidates:
+        default = default_branch(ref, fetch)
+        candidates = [r for r in ([default] if default else []) + list(SKILL_DEFAULT_REFS) if r]
+        candidates = list(dict.fromkeys(candidates))
+    last = None
+    for git_ref in candidates:
+        url = GITHUB_TARBALL.format(owner=ref["owner"], repo=ref["repo"], ref=urllib.parse.quote(git_ref, safe=""))
+        try:
+            data = fetch(url)
+        except urllib.error.HTTPError as error:
+            last = error
+            if error.code in (404, 422) and len(candidates) > 1:
+                continue
+            raise
+        if len(data) > SKILL_TARBALL_MAX:
+            raise ValueError("the repository tarball is larger than %d MB" % (SKILL_TARBALL_MAX >> 20))
+        return data, git_ref
+    raise last or RuntimeError("no branch to download")
+
+
+def default_skill_fetch(url):
+    """Plain https GET → bytes (the hook substitutes its manifest-checked opener)."""
+    if not url.startswith("https://"):
+        raise ValueError("https only: %s" % url)
+    request = urllib.request.Request(url, headers={"User-Agent": "kirocrew-ide-mod", "Accept": "*/*"})
+    with urllib.request.urlopen(request, timeout=SKILL_FETCH_TIMEOUT) as reply:
+        return reply.read(SKILL_TARBALL_MAX + 1)
+
+
+def import_skill(body, fetch=default_skill_fetch, home=None, tmp_root=None, log=None):
+    """The `POST skills/import` route body: `{url, scope, workspace?}` → `{name, path, ...}` or `(status, {error})`.
+
+    `fetch(url) -> bytes` does the network (the hook passes its allowlisted
+    opener); `home` overrides `~` for the global scope; `tmp_root` is where the
+    tarball is unpacked (the mod's data dir), so a failure never leaves a
+    half-written skill under `.kiro/skills`. Refuses a name that already exists
+    in the scope with 409 and `skill <name> already exists`.
+    """
+    body = body if isinstance(body, dict) else {}
+    url = body.get("url")
+    ref = parse_github_url(url if isinstance(url, str) else "")
+    if not ref:
+        return (400, {"error": "give a GitHub URL (https://github.com/<owner>/<repo>[/tree/<ref>/<path>]) or <owner>/<repo>"})
+    try:
+        root = skill_root(body.get("scope"), body.get("workspace"), home)
+    except ValueError as error:
+        return (400, {"error": str(error)})
+    if tmp_root:
+        os.makedirs(tmp_root, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="skill-import-", dir=tmp_root)
+    source = "%s/%s" % (ref["owner"], ref["repo"])
+    try:
+        try:
+            data, git_ref = fetch_tarball(ref, fetch)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return (404, {"error": "GitHub has no %s at %s (is the repository public, and the branch spelled right?)"
+                              % ("ref " + ref["ref"] if ref.get("ref") else "default branch", source)})
+            return (502, {"error": "GitHub answered HTTP %s for %s" % (error.code, source)})
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            return (502, {"error": "download of %s failed: %s" % (source, getattr(error, "reason", None) or error)})
+        extracted = os.path.join(tmp, "tree")
+        try:
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+                safe_extract(tar, extracted)
+        except (tarfile.TarError, ValueError, OSError, EOFError) as error:
+            return (502, {"error": "the download from %s is not a usable tarball: %s" % (source, error)})
+        skill_dir = find_skill_dir(extracted, ref.get("path"))
+        if not skill_dir:
+            where = source + ("/" + ref["path"] if ref.get("path") else "")
+            return (404, {"error": "no %s found under %s (ref %s)" % (SKILL_FILE, where, git_ref)})
+        # A skill at the repository root unpacks as `<repo>-<sha>/`: name it after the repository.
+        fallback = ref["repo"] if os.path.normpath(skill_dir) == os.path.normpath(_repo_base(extracted)) else None
+        name = skill_name_of(skill_dir, fallback)
+        if not SKILL_NAME_RE.match(name) or name in (".", ".."):
+            return (400, {"error": "the skill folder name %r cannot be used on disk" % name})
+        target = os.path.join(root, name)
+        if os.path.lexists(target):
+            return (409, {"error": "skill %s already exists" % name, "name": name, "path": target})
+        os.makedirs(root, exist_ok=True)
+        shutil.move(skill_dir, target)
+        if log:
+            log("skill import: %s (%s) -> %s" % (where_of(ref), git_ref, target))
+        return {"name": name, "path": target, "scope": body.get("scope") or "workspace", "source": where_of(ref), "ref": git_ref}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _repo_base(extracted):
+    """The repository directory inside an extraction dir (the single wrapper folder, else the dir itself)."""
+    try:
+        entries = [e for e in os.listdir(extracted) if not e.startswith(".")]
+    except OSError:
+        return extracted
+    if len(entries) == 1 and os.path.isdir(os.path.join(extracted, entries[0])) and not _has_skill(extracted):
+        return os.path.join(extracted, entries[0])
+    return extracted
+
+
+def where_of(ref):
+    """`owner/repo[/path]` for messages and logs."""
+    return "%s/%s" % (ref["owner"], ref["repo"]) + ("/" + ref["path"] if ref.get("path") else "")

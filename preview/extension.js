@@ -167,7 +167,27 @@ function extendMarkdownIt(md) {
   return md;
 }
 
-function activate() {
+/**
+ * Two services live in this engine-host extension: the markdown-it plugin above (the
+ * markdown extension calls `extendMarkdownIt`), and the `kirocrew.preview.highlight`
+ * command (./highlight.js) that colours a shell command with the engine's own
+ * tokenizer and the active theme for the chat's command tip — the bridge runs in the
+ * browser's worker host and can reach neither the engine's node_modules nor the theme
+ * files. The module loads without a host (the unit tests require it), so `vscode` is
+ * taken here, not at the top.
+ */
+function activate(context) {
+  let vscode = null;
+  try { vscode = require("vscode"); } catch { vscode = null; }
+  if (vscode && context && Array.isArray(context.subscriptions)) {
+    try {
+      const fs = require("fs"), path = require("path");
+      const roots = [vscode.env && vscode.env.appRoot, path.dirname(process.execPath)];
+      require("./highlight").register(vscode, context, { fs, path, roots }, (line) => console.log("[kirocrew-preview] " + line));
+    } catch (error) {
+      console.warn("[kirocrew-preview] highlight command not registered: " + ((error && error.message) || error));
+    }
+  }
   return { extendMarkdownIt };
 }
 

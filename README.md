@@ -35,6 +35,8 @@
     <li><a href="#install">Install</a></li>
     <li><a href="#a-tour">A tour</a></li>
     <li><a href="#everything-it-does">Everything it does</a></li>
+    <li><a href="#spec-coding-like-kiro">Spec coding like Kiro</a></li>
+    <li><a href="#workflows-like-kiro">Workflows like Kiro</a></li>
     <li><a href="#parts">Parts</a></li>
     <li><a href="#requirements">Requirements</a></li>
     <li><a href="#install--develop">Install / develop</a></li>
@@ -104,7 +106,11 @@ while the engine runs. **Fullscreen** raises it over the whole dashboard.
 session per chat tab, every installed agent in the picker, approvals inline,
 file paths as links into editor tabs. Out of the box the workbench follows the
 dashboard's light or dark mode with the matching stock VS Code theme; pick any
-other theme and it stays yours.
+other theme and it stays yours. A stock theme follows a dashboard toggle you
+make while the window is open; opening a window never changes your theme
+(until 0.30.11 it did: the first poll counted as a change, so a stock theme of
+the other polarity was flipped on every window load, and a fresh engine start
+flipped every workspace at once).
 
 <div align="right">[<a href="#readme-top">back to top</a>]</div>
 
@@ -364,9 +370,11 @@ other theme and it stays yours.
 - **KiroCrew** activity-bar views: *Specs* (`.kiro/specs/<name>/`, phase
   commands, ▶ Start task per row, ⏵⏵ Run all tasks per spec, ⟳ Resume run on a
   spec whose tasks.md still carries a run's `[~]` / `[-]` marks, Kiro's queued /
-  in-progress / done marks), *Steering*, *Skills*, *Agent Hooks* — each showing
+  in-progress / done marks; the rest is under *Spec coding like Kiro* below),
+  *Steering*, *Skills*, *Agent Hooks* — each showing
   the workspace's `.kiro/` and the global `~/.kiro/` tier, with a ＋ that
-  scaffolds a new file or skill folder. The bridge is registered for **every
+  scaffolds a new file or skill folder (a wizard for a hook); their generate,
+  refine and import actions are under *Workflows like Kiro* below. The bridge is registered for **every
   VS Code profile** (application-scoped), so a profile you create or import
   keeps the chat and these views, and its activity bar gets KiroCrew in
   second place too.
@@ -391,10 +399,21 @@ other theme and it stays yours.
   the pointer on a collapsed row and it shows what it ran** (KiroCrew's own
   tool-command tip, since 0.30.9): a shell call's command in a hover widget
   above the row, one line per pipeline segment with `$` and then each operator
-  (`&&`, `||`, `;`, a pipe in the accent colour) in the gutter, the program in
-  bold, flags, quoted strings and redirections coloured; a command with
+  (`&&`, `||`, `;`, a pipe in the accent colour) in the gutter; a command with
   newlines verbatim; an MCP row whose label is its purpose shows its raw title
-  instead. Twelve segments or lines and 1200 characters at most, then "Open the
+  instead. **The colours are the editor's own** (0.30.10): the command is
+  tokenized in the engine's extension host with the workbench's own
+  vscode-textmate and the built-in shellscript grammar (`source.shell`), and
+  coloured by the rules of the colour theme you have on, its `include` chain
+  and your `editor.tokenColorCustomizations` included, so the tip reads
+  exactly like a `.sh` file in the editor, under Dark Modern, Nord, Horizon or
+  whatever you installed. A theme switch repaints the next tip. The bridge
+  cannot do this itself (a browser-worker host has no tokenizer, and a webview
+  gets only the workbench colours as variables, never a theme's token colours),
+  so it asks the mod's engine-host extension through the
+  `kirocrew.preview.highlight` command; where that is unavailable the tip
+  falls back to its own four kinds (program, flag, string, redirect) from
+  `--vscode-*` variables. Twelve segments or lines and 1200 characters at most, then "Open the
   step to see the rest". The tip appears 100 ms after the pointer rests (at
   once on keyboard focus), only while the row is collapsed, and only when it
   says more than the label does: a row labelled with its whole command has
@@ -436,6 +455,287 @@ other theme and it stays yours.
 - Sessions run in the gateway. Close the laptop, drop the tunnel, come back
   from the dashboard or your phone: same session, same transcript.
 
+<div align="right">[<a href="#readme-top">back to top</a>]</div>
+
+---
+
+## Spec coding like Kiro
+
+Since 0.31.0 the bridge reads and writes specs the way Kiro's IDE does, so a
+`.kiro/specs/<name>/` directory moves between the two without translation.
+Everything below works in the plain text editor; the Kiro spec editor (the
+rendered view) adds review comments on top.
+
+- **`.config.kiro`.** Kiro's per-spec settings file next to the documents:
+  `{"specId", "workflowType", "specType"}`. `workflowType` is
+  `requirements-first` (default), `design-first` or `fast-task`; `specType` is
+  `feature` (default) or `bugfix`. A missing or unreadable file means the
+  defaults; an invalid one (bad JSON, an unknown value) gets a warning in
+  Problems (source `kirocrew-spec`) and is still read with defaults. The type
+  decides the **document order** — requirements → design → tasks,
+  design → requirements → tasks, tasks first for a fast task, and `bugfix.md`
+  in place of `requirements.md` for a bugfix — which the Specs view, the
+  title-bar actions and the hovers all follow. The active editor's spec sets
+  the `kirocrew.spec.workflowType` / `kirocrew.spec.specType` context keys, so
+  your own keybindings can key on them too.
+- **The Specs view.** ＋ is **New spec from an idea**: type the idea, pick the
+  workflow type, pick the spec type, and the bridge creates the directory with
+  a fresh `specId`, then sends the create turn to the Spec agent in a tab
+  titled with your idea. A spec row has **Rename** (`^[A-Za-z0-9_-]+$`, a name
+  already taken is refused), **Delete** (asks first, names the directory, then
+  removes it), **View session** (the latest run that touched it) and the
+  phase commands as before; a document row has **Review**, which opens it in
+  the spec editor with review mode on. Rows follow the document order: a fast
+  task lists `tasks` first with `requirements` and `design` as *generated*
+  rows, a bugfix lists `bugfix.md`. The view refreshes on its own when a spec
+  directory or `.config.kiro` changes.
+- **Title-bar actions on a spec document.** Every `requirements.md`,
+  `design.md`, `tasks.md` or `bugfix.md` under `.kiro/specs` gets **Go to
+  requirements / design / tasks / bugfix** in its document order with the
+  current one left out (a missing target is created empty and opened), then
+  **Sync with project files** (`Ctrl+Shift+Enter` / `⌘⇧↩`, shown once the
+  document has content or unsaved edits: the Spec agent re-reads the project
+  and updates this document), **Next document** (opens the next one when it
+  has content, otherwise asks the agent to write it; absent on `tasks.md`) and,
+  on `tasks.md`, **Run all tasks** (`Ctrl+Alt+Enter` / `⌘⌥↩`). **Previous
+  document** and **Next document** are in the palette as well. Each of these
+  turns reuses the spec's own chat tab when it is idle and attaches the sibling
+  documents as `#file` context.
+- **Task ↔ session links.** Start task and Run all tasks record which session
+  ran which tasks (`kirocrew.taskSessionLinks` in workspace state, the 200 most
+  recent, with the turn's outcome: ok, error or stopped). **View session** — a
+  lens on the task, a Specs view row, or `KiroCrew Spec: View session` — brings
+  that tab to the front, or reopens the session from history when the tab is
+  gone; a task that never ran falls back to the spec's latest run.
+- **Code lenses and borders in `tasks.md`.** One lens row above every task,
+  titled for its state: **Start task**, **Queued** (`[~]`), **In progress**
+  (`[-]`), **Done** (`[x]`), **Failed · Retry · Ask the agent to fix** (the
+  last run ended in an error; *Ask the agent to fix* sends the task block with
+  the spec as context and asks for the root cause, not the symptom, then a
+  stop after that task), **Stopped · Retry** (the run was interrupted and
+  that session is no longer running). **View session** follows whenever a run
+  is on record; an optional `[ ]*` task reads **Start task · Make required**,
+  which drops the `*` on that line alone. Each task block carries a 2 px left
+  border in a theme colour per state (code-lens grey, info blue, highlight,
+  untracked green, error red, warning yellow), and optional tasks are dimmed to
+  60%. Lenses and borders redraw within a second of a change to the file or to
+  a run — a tick the agent writes shows while you watch.
+- **Task format diagnostics.** `tasks.md` is checked as you type (source
+  `kirocrew-spec`): a box that is not `[ ]`, `[~]`, `[-]` or `[x]`; a task line
+  with no number, or a number not shaped `1`, `1.2`, `1.2.3`; a nesting jump of
+  more than one level; a duplicate number. Every warning has the **Fix task
+  line** quick fix: the box becomes `[ ]`, a missing or duplicate number
+  becomes the parent's next free index, the title is untouched. A file with no
+  task lines gets nothing.
+- **Hovers.** Rest the pointer on a `_Requirements: 1.2, 3_` line in any spec
+  document and each reference shows its requirement heading (a link that
+  reveals the heading in `requirements.md`, or `bugfix.md` for a bugfix spec),
+  the user story and the acceptance criteria named — all of them when the
+  reference has no sub-number. A `Property N` / `**Property N**` reference or a
+  `Validates: Requirements …` line shows the property's title from the
+  design's *Correctness Properties* section and the criteria it validates.
+- **Review comments in the spec editor.** The rendered spec editor has a
+  **💬 Review** toggle with a count badge. With it on, click a heading,
+  paragraph, list item, task row, code block or table and a comment box opens
+  there (Esc cancels, `Ctrl+Enter` / `⌘↩` saves); saved comments sit beside
+  their block as cards with **Edit** and **Delete**, survive **⟳ Sync Files**
+  (re-attached by block id; a block that disappeared keeps its comment in an
+  *unanchored* list), and are dropped when the editor closes. **Send N
+  comments** packs them into one turn — the document, each quoted passage with
+  its comment, and the instruction to apply them to this document and nothing
+  else — sent to the Spec agent through the spec's tab and shown in the
+  transcript as `Review: N comments on design.md`; the comments clear once the
+  turn is away. Review mode covers requirements, design and tasks; other files
+  open as text.
+
+<div align="right">[<a href="#readme-top">back to top</a>]</div>
+
+---
+
+## Workflows like Kiro
+
+0.32.0 adds the rest of what Kiro's IDE does around the chat: its keyboard
+flow and find bar, the context kinds its `#` picker offers, the editor,
+terminal and source-control hand-offs, steering generation and import, skill
+import and an Agent Hooks view that edits hook files. Every turn these send
+goes through the same send path as a typed message — agent, model, autopilot,
+steering and the KiroCrew policy apply as they would in the composer — and the
+instruction text is the mod's own.
+
+### Chat shortcuts, rename and find
+
+- **Tabs from the keyboard** (while the chat view has focus): `Ctrl+Alt+→` /
+  `⌘⌥→` and `Ctrl+Alt+←` / `⌘⌥←` switch to the next / previous tab,
+  `Ctrl+T` / `⌘T` opens a new one, `Ctrl+W` / `⌘W` closes the active tab — a
+  tab whose session is still running asks first (the session keeps running in
+  the gateway; it stays under History). Each is a palette command too
+  (**KiroCrew: Next chat tab**, **Previous chat tab**, **New chat tab**,
+  **Close chat tab**).
+- **Rename chat tab** — the view's ⋯ menu, a double-click on a tab, or
+  *Rename* in a tab's right-click menu (next to *Close tab*). The title is kept
+  with the tab (120 characters at most) and, when the tab has a session, the
+  gateway is asked once to rename it as well (`PATCH /chat/slots/<key>/title`,
+  the call the dashboard's title edit uses); a refused rename leaves the label
+  local.
+- **Find in the transcript** — `Ctrl+F` / `⌘F` (or **KiroCrew: Find in chat
+  transcript**; `F3` / `Shift+F3` step without opening the box) opens a find
+  bar over the active tab: a match count, `Enter` / `↓` and `Shift+Enter` /
+  `↑` for next and previous, **Aa** for match case, `Esc` closes. Matches are
+  marked in message text, tool-row labels and code blocks, and the current one
+  is scrolled into view; following the bottom of the transcript is suspended
+  while the bar is open (the jump pill shows what arrived meanwhile).
+- **Approve all / reject all** — with approval cards pending in the active
+  tab, `Ctrl+Enter` / `⌘↩` approves every one of them and `Ctrl+Shift+C` /
+  `⌘⇧C` rejects them, exactly as pressing each card's buttons would; with
+  nothing pending the shortcuts do nothing (`Ctrl+Enter` in the composer then
+  sends, as before).
+- **Tool rows**: the setting `kirocrew.toolCardDisplayMode` is Kiro's Tool Card
+  Display Mode — `collapseOnComplete` (default: a row folds to its header when
+  the call returns; one you opened or closed yourself stays as you set it) or
+  `alwaysExpanded`. A change applies to the rows already on screen.
+
+### Context providers
+
+The composer's `#` picker (also the **#** button, or `#` typed into an empty
+composer) lists **File**, **Currently Open Files** and **Steering** as before,
+then the providers Kiro has:
+
+- **Problems** — the diagnostics of the active file or of every file (asked
+  when an editor is open), one line each: `file:line:col severity [source
+  code]: message`.
+- **Terminal** — the active terminal's selection; without one, the last 200
+  lines of what shell integration recorded (`$ command` + output); without
+  that, the last command's output; else a note asking you to select text.
+- **Git Diff** — working-tree and staged diff of the workspace, through the
+  built-in git extension when it runs in this host, else the gateway's own
+  `gitdiff` route; an explicit message when neither answers.
+- **Folder** — a directory's listing followed by the contents of its text
+  files (binaries skipped, at most 200 files).
+- **Spec** — a spec's documents concatenated, one `## <file>` section each, in
+  that spec's document order.
+
+Each resolved text is one context document on the turn, injected the same way a
+`#file` is. The cap is 36 000 bytes per item (the host's own limit, less room
+for the label line): a longer item is cut on a character boundary and ends in
+`… [truncated: N of M bytes shown]`. The item is a chip in the composer and, on
+send, in your bubble; the chip's tooltip names the source and says when it was
+cut.
+
+### Editor, terminal and source control
+
+- **The KiroCrew submenu** of the editor's right-click menu, shown while text
+  is selected: **Ask about this** stages the selection as a `#selection` chip
+  (path, range and language ride along) and leaves the composer to you; **Fix
+  grammar and spelling**, **Write comments**, **Write a docstring**, **Fix
+  this code** and **Optimize this code** attach the same chip and send the
+  mod's instruction for that action, shown in the transcript under the
+  action's title; **Add code block to chat** inserts the selection into the
+  composer as a fenced block tagged with the language, to write around. The
+  instructions are yours to change: `kirocrew.editorActions.prompts` is an
+  object keyed by action id (`ask`, `fixGrammar`, `writeComments`,
+  `writeDocstring`, `fixCode`, `optimize`); an id left out keeps the built-in
+  text.
+- **Ask the agent to fix: <message>** — a quick fix (the light bulb, `Ctrl+.`)
+  on any diagnostic of any language: the message, its range and the file go
+  with the request as context, and the transcript shows `Fix: <message>`.
+- **Send terminal to chat** — the terminal's right-click menu or
+  `Ctrl+Shift+R` / `⌘⇧R` while a terminal has focus: the selection when there
+  is one, else the last 200 lines (same fallbacks as the Terminal provider),
+  staged as a chip in the composer for you to ask about.
+- **Add to chat context** — in the explorer's right-click menu for one or
+  more selected files and folders (20 at most): a file becomes the `#file` entry
+  the picker would build (binaries skipped), a folder the Folder provider's
+  entry; they land in the composer as chips.
+- **Generate commit message** — the ✨ in the Source Control title: the staged
+  diff (the working-tree diff when nothing is staged) goes to a background
+  session of the default agent with "Generating commit message…" in the SCM
+  title; the first assistant reply is cleaned (fences, a *Commit message:*
+  lead-in) and written into the commit input box, and the throw-away session is
+  deleted. 60 s without an answer is an error message. A host whose built-in
+  git extension is not reachable (the commit input box belongs to it) gets a
+  message saying so.
+
+### Steering: generate, refine, import
+
+- **Generate steering docs** — the ✨ in the Steering view's title, and the
+  first line of the view's welcome content while `.kiro/steering/` is empty:
+  creates the directory, opens a tab in the workspace and asks the agent to
+  write the standard Kiro documents (`product.md`, `tech.md`, `structure.md`,
+  each with `inclusion: always` front matter) from what the files show; the
+  transcript reads **Generate steering documents** in place of the instruction.
+- **Refine this steering document** — the ✨ in the title bar of any
+  `.kiro/steering/**/*.md` (and inline on a Steering view row): the file is
+  attached as `#file` context and the agent is asked to check every statement
+  against the workspace as it is now, drop or correct what is stale, tighten
+  the wording, keep the front matter, and write it back to the same file.
+- **Import from other assistants** — the Steering view title (and its welcome
+  content): the workspace is scanned for `AGENTS.md`, `CLAUDE.md`,
+  `.cursorrules`, `.cursor/rules/**`, `.clinerules`, `.continue/**` and
+  `.github/copilot-instructions.md`; pick any number and each is copied to
+  `.kiro/steering/<name>.md` with `inclusion: always` front matter (a source
+  that has front matter keeps it, gaining `inclusion: always` when it names no
+  mode) and an `imported from` comment. The name is the source's stem with its
+  origin for the directory sources (`cursor-<file>`, `clinerules-<file>`,
+  `continue-<file>`, `copilot-instructions`); a target that exists is skipped
+  and listed. The view refreshes by itself.
+
+### Skill import
+
+**Import skill** in the Skills view title takes a **local folder** holding a
+`SKILL.md` or a **public GitHub URL** — `https://github.com/<owner>/<repo>`,
+`…/tree/<ref>/<path>` for a subfolder, or just `<owner>/<repo>` — and asks for
+the scope: the workspace's `.kiro/skills/` or the global `~/.kiro/skills/`. A
+GitHub import goes through the hook (`POST skills/import {url, scope}`): the
+repository tarball is downloaded from `codeload.github.com` (which joins the
+declared `network.hosts`), the folder holding
+`SKILL.md` (the subfolder when the URL names one) is extracted into a temporary
+directory and moved into place. The skill's name is the folder's name (or
+`SKILL.md`'s `name`); a name already present in that scope is refused. The
+Skills view refreshes and reveals the new skill.
+
+### Agent hooks
+
+- **The Agent Hooks view** lists every `*.kiro.hook` and `*.json` under the
+  workspace's `.kiro/hooks/` and the global `~/.kiro/hooks/`: name, trigger →
+  action kind (`askAgent` or `runCommand`), the matcher when the trigger has
+  one, and whether it is enabled; a file that does not parse is listed with
+  its error. The inline **Enable hook** / **Disable hook** (and *Toggle hook*
+  in the row's menu) writes `enabled` back into the file; ⟳ **Refresh hooks**
+  re-reads both directories.
+- **Run hook** (inline ▶, `userTriggered` hooks only, enabled ones): an
+  `askAgent` hook's prompt is sent through the chat, shown as **Run hook:
+  <name>**; a `runCommand` hook's command runs in a terminal named for the
+  hook after you confirm.
+- **＋ New agent hook** walks through scope, name, trigger (`fileEdited`,
+  `fileCreated`, `fileDeleted`, `userTriggered`, `promptSubmit`, `agentStop`,
+  `preToolUse`, `postToolUse`, `sessionStart`), the matcher where the trigger
+  takes one (a file glob for the file triggers, `**/*` by default; a tool name
+  for the tool triggers), the action kind and its prompt or command, and writes
+  `<name>.kiro.hook`, enabled, in Kiro's `when` / `then` shape, then reveals the
+  row and opens the file.
+- Hooks are **executed by kiro-cli**, not by the bridge: the view says so in
+  its standing message and links the documentation
+  (<https://kiro.dev/docs/hooks/>; also the 📖 in the view's title).
+
+### MCP servers (read-only)
+
+- **The MCP Servers view** lists the servers kiro-cli reads from the
+  workspace's `.kiro/settings/mcp.json` and the global
+  `~/.kiro/settings/mcp.json`: one row per server with its name and route
+  (`stdio · <command>` or `http · <host>`), a dimmed icon and `· disabled`
+  when the file disables it; a file that does not parse is listed as one
+  warning row with the error. Clicking a row opens the file at that server's
+  entry. `env` values are never read or shown.
+- It is **read-only**: kiro-cli owns MCP, so there is no enable, disable or
+  edit here, only ⟳ **Refresh MCP servers** and **Open MCP config file**
+  (the workspace file; an information message when there is none, nothing is
+  created). The empty view links the documentation
+  (<https://kiro.dev/docs/mcp/>).
+
+<div align="right">[<a href="#readme-top">back to top</a>]</div>
+
+---
+
 ## Parts
 
 | Part | Seam | What |
@@ -443,7 +743,7 @@ other theme and it stays yours.
 | `hook/` (python-hook, early) | gateway | engine supervisor + control API (`status` with per-workspace spec-task counts and engine health, `start` `stop` `relaunch` `workspaces/open` `workspaces/close` `engines` `engines/install` `extensions/install` `browse`), the same-origin proxy at `/kirocrew-ide`, bridge-extension provisioning |
 | `app/` (app) | App Kit | the **KiroCrew IDE** App page. `app/ui/art/icon.svg` is the App's face in the Apps sidebar and the store (manifest `iconPath`): the fox wearing a `</>` badge |
 | `extension/` | the engine | the KiroCrew web extension (chat, sessions, approvals, specs), provisioned per start |
-| `preview/` | the engine | the spec-preview extension (engine-side host): a markdown-it plugin + styles for the built-in Markdown preview (Kiro task rows, spec header) and the mermaid preview script; provisioned per start beside the bridge |
+| `preview/` | the engine | the spec-preview extension (engine-side host): a markdown-it plugin + styles for the built-in Markdown preview (Kiro task rows, spec header), the mermaid preview script, and `highlight.js`, the `kirocrew.preview.highlight` command that colours the chat's command tip with the engine's own vscode-textmate, the shellscript grammar and the active theme's rules; provisioned per start beside the bridge |
 | `ui/page.mjs` (ui) | FloofyCrew App | engine status and settings; points at the App. `ui/icon.svg` is the mod's face in FloofyCrew's Mod pages and Installed mods (the same fox as the App page's loading splash) |
 
 ## Requirements
@@ -496,29 +796,24 @@ The engine binds `127.0.0.1` only and, by default, runs without a connection
 token (see `engine.token`); the dashboard's own session is what guards the
 proxy.
 
-**Kiro's own modes** (Spec, Quick Spec, Bug Fix, Plan as real agents) come
-from the **kiro-spec-plan** mod, which this mod *recommends* rather than
-requires: `floofy install kiro-spec-plan` (or the FloofyCrew page) adds its
-four agents to `~/.kiro/agents`, and the chat's Agent picker then lists them
-under "Kiro modes". Without it the same four names appear under "Workflows
-(prompt-guided)" — a prompt frame injected on your default agent, not Kiro's
-procedure — headed by a row that says so and hands you the install command.
-
-Hosts from KiroCrew 0.8.0.9 on reserve KAS's bundled mode ids (`spec`,
-`quick-spec`, `bug-fix`, `plan`, …) and refuse a session whose agent carries one
-("Rename this crewmate's template: 'spec' is reserved for a built-in agent …"),
-which is exactly the name kiro-spec-plan's handles use. The bridge catches that
-refusal on the first send, says so once in the transcript, and re-sends the
-turn as the prompt-guided workflow on your picked agent, skipping the doomed
-attempt for the rest of the window. KiroCrew 0.11 wears the same refusal
-differently: it renames a reserved id on the wire (`spec` registers as
-`spec-crewmate`) and, when nothing registers under that alias, fails the start
-with "Agent mode 'spec' is not available on this session (advertised modes:
-[… 'spec' …]); its ~/.kiro/agents/spec.json is likely missing" (the file is
-there; the id it looked for was the alias). The bridge treats that sentence,
-for the four mode ids only, as the same refusal. **kiro-spec-plan 0.2.2** pins
-the mode ids to the bundled ids on that host, so with it installed Kiro's
-real Spec mode runs and neither fallback is needed.
+**The four modes** (Spec, Quick Spec, Bug Fix, Plan) are the IDE's own
+prompt-guided workflows: a workflow frame injected on `kirocrew.agent` (or
+`kirocrew.specAgent` for task runs), listed in the chat's Agent picker under
+"Workflows (prompt-guided)". The **kiro-spec-plan** mod's mode agents
+(`spec`, `quick-spec`, `bug-fix`, `plan` in `~/.kiro/agents`) are no longer
+picked by default: on current kiro-cli `--agent spec` loads that mod's
+tool-less handle file, not Kiro's bundled Spec mode. Seen 2026-11-07 (host
+0.11.2.1, kiro-cli 2.22.1): the host accepted the id, and the design phase
+answered "Kiro Spec & Plan needs the KAS backend" with the backend already on
+kas. Set `kirocrew.kiroModeAgents: true` to opt back in; the picker then lists
+the installed mode agents under "Kiro modes" (and, when they are missing, a
+row with the install command), and a host that still refuses a reserved mode
+id ("Rename this crewmate's template: 'spec' is reserved for a built-in
+agent …" on KiroCrew 0.8.0.9+, or 0.11's "Agent mode 'spec' is not available
+on this session … its ~/.kiro/agents/spec.json is likely missing", for the
+four mode ids only) is caught on the first send, noted once in the transcript,
+and the turn is re-sent as the prompt-guided workflow on your picked agent for
+the rest of the window.
 
 **Running tasks** works the way Kiro's IDE does. On a `tasks.md` the
 editor's primary action is **Run all tasks** (or **Resume tasks** once some
@@ -527,7 +822,8 @@ back to back — no "run task N" per task. Each open row has its own **Start
 task** for a single task; queued (`[~]`) and in-progress (`[-]`) rows show
 their state instead. Both run with Autopilot on (`kirocrew.specAutopilot`),
 as Kiro does, so the run is not interrupted by tool approvals. With
-kiro-spec-plan installed the request sent is the very text Kiro's IDE sends
+`kirocrew.kiroModeAgents` on and the mode agents installed, the request sent
+is the very text Kiro's IDE sends
 its engine ("Run all tasks for this spec." with the resume suffix; "Execute
 the following task …" with Kiro's `<task>` block), so the engine's own Task
 Orchestrator queues the tasks, runs them through its task-execution sub-agent
@@ -627,6 +923,26 @@ floofy install kirocrew-ide          # from the FloofyCrew registry, or the Inst
 From a checkout of this repository, `floofy dev <checkout> --follow` runs the
 mod live against your dashboard.
 
+### Where the source lives (internal package)
+
+`github:floofycrew/kirocrew-ide` is the source of record for this mod: every
+change lands there first, and a release is a `kirocrew-ide-X.Y.Z` tag there.
+The GitFarm package `KirocrewIdeMod` is an internal **overlay** of one such tag,
+not a second copy of the mod: `PUBLIC_PIN` at its root names the tag, the commit
+it must peel to and the sha256 of its tree; `Config` (the Brazil package file) is
+what the package lays on top; `python tools/overlay.py build` fetches the pinned
+tag, verifies it, refuses any path present on both sides and composes the two
+into the installable tree (`--check` proves two composes are byte-identical;
+`pin set kirocrew-ide-X.Y.Z` bumps the pin at a release, `pin verify` re-checks
+it). The pin format and the composer are FloofyCrew's own `pin.py` and
+`compose.py`, vendored byte-for-byte under `tools/vendor/` and hash-pinned by
+`tools/vendor/VENDORED_FROM`. Nothing is exported, filtered or reviewed on its
+way to GitHub any more; the former `.github/tools/export_public.py` is gone.
+
+On the internal edition the mod is also installable straight from its package:
+`floofy install ssh://git.amazon.com/pkg/KirocrewIdeMod@release`; a checkout
+develops with `git clone ssh://git.amazon.com/pkg/KirocrewIdeMod && floofy dev KirocrewIdeMod`.
+
 Design, the display-strategy analysis, the bridge architecture and the "why a
 mod, not an App" proof: [DESIGN.md](DESIGN.md).
 
@@ -652,7 +968,10 @@ for chats and spec phases), `specAgent` (agent that executes tasks),
 and `specResumeLimit` (an interrupted task run resumes itself from tasks.md,
 whatever cut it, default on, 3 times), `chatFontSize` and `chatWidth` (the
 transcript's font size and reading column: `compact` | `comfortable` | `full`),
-`folderName` (dashboard folder, default "KiroCrew IDE"), `notifyApprovals`.
+`folderName` (dashboard folder, default "KiroCrew IDE"), `notifyApprovals`,
+`toolCardDisplayMode` (`collapseOnComplete` | `alwaysExpanded`, see *Workflows
+like Kiro*), `editorActions.prompts` (your instruction per action of the
+editor's KiroCrew menu, keyed by action id).
 
 ## One port only (remote hosts)
 
@@ -688,14 +1007,20 @@ counts (`opened`, `failed`, `live`).
 
 ```
 python tests/<name>_test.py            # hook units (stub floofy module, no host code)
-node --test tests/*.test.mjs
+python tests/overlay_test.py           # the overlay build: a scratch public repository tagged kirocrew-ide-9.9.9 is pinned, composed with Config, --check'd; the vendored pin.py/compose.py are re-hashed
+python tests/skills_import_test.py     # the hook's skill importer: GitHub URL parser (URL table shared with steering_import.test.mjs), tarball extraction, import_skill error paths; no network
+node --test tests/*.test.mjs       # includes preview_highlight.test.mjs: the engine-host highlighter on fakes, and against the engine installed under the mod's data dir (KIDE_ENGINE_ROOT overrides; skipped without one)
+                                   # the spec_*.test.mjs / task_session_links files cover the spec-coding bridge; context_providers (the # providers, the cap and marker, chips), editor_actions (prompt overrides, fenced block, diff pick, background turn, quick fix), steering_import (assistant files → steering names, front matter, skill folder import) and agent_hooks (hook file validation, the wizard's output) cover the workflows
 tests/e2e/probe_extension.py <url>     # headless: the extension activates in the workbench
 tests/e2e/probe_profile.py <url> <profile> <udd>   # headless: bridge + seeded order in a non-default profile
 tests/e2e/probe_hosts.py               # headless, self-contained: the layer (host switcher, modes, workspaces) in stub realms
 tests/e2e/probe_chat_webview.py        # headless, self-contained: the chat webview's transcript (the thinking block) driven with the extension's own messages
+tests/e2e/probe_chat_shortcuts.py      # headless, self-contained: the chat webview's Kiro shortcuts — tab messages, the find bar's counts and Aa, approve-all / reject-all over staged approval cards, toolCardDisplayMode — plus a regression pass over the follow pill, lightbox, command tip, pinned prompt, recovery cards and thinking blocks
 tests/e2e/probe_gallery.py <url> <gallery> <text>   # headless: the Extensions view searches through the merged gallery (browser route aborted = remote browser; --direct keeps it)
 tests/e2e/probe_spec_editor.py --engine <bin> [--mermaid <mermaid.min.js>]   # headless, scratch engine: the spec editor renders through the engine's renderer (hljs spans, code bars, task boxes, mermaid) Ctrl+Shift+V on a spec file opens it, and Ctrl+F through the workbench opens its find bar
 tests/e2e/probe_spec_find.py           # headless, self-contained: the spec editor's find bar (marks, count, Enter/Shift+Enter, Aa, Filter tasks, refresh, Esc) driven with the keyboard
+tests/e2e/probe_spec_lenses.py --engine <bin>      # headless, scratch engine: task code lenses and borders per state in the text editor, the redraw after a box changes on disk, Go to … per workflow type
+tests/e2e/probe_review_comments.py --engine <bin>  # headless, scratch engine + a routed fake gateway: review comments in the spec editor (toggle, box, Esc / Ctrl+Enter, Edit, Delete, Sync Files), Send → the turn body and the "Review: N comments on design.md" bubble
 tests/e2e/chat_roundtrip.py <url>      # headless: a message round-trips through a gateway session
 ```
 

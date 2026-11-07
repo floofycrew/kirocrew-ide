@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.30.9",
+  "version": "0.32.2",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -26,13 +26,11 @@
   "dependsOn": {
     "floofycrew": "^1.2"
   },
-  "recommends": {
-    "kiro-spec-plan": ">=0.1.0"
-  },
   "network": {
     "hosts": [
       "api.github.com",
       "cdn.jsdelivr.net",
+      "codeload.github.com",
       "github.com",
       "marketplace.visualstudio.com",
       "objects.githubusercontent.com",
@@ -84,11 +82,11 @@
     },
     {
       "path": "README.md",
-      "sha256": "3baac82812bee8bc57db538dd73064a10d3b6e9d6117f806b539bbf4b8e63f69"
+      "sha256": "9b5e1c38c51c9e9ffecb49df98a77c024e33385f55d84e4dcd47b171574d362a"
     },
     {
       "path": "app/app.json",
-      "sha256": "0a4568a6647bef8f30d2878234b787106c8ce881309e70538f22e70620a022e7"
+      "sha256": "011cf3d266a2a038a84aaae279c9cc6389f1c04c0c308a9bfc6eeaab87a5f1da"
     },
     {
       "path": "app/ui/art/fox.svg",
@@ -104,7 +102,7 @@
     },
     {
       "path": "extension/extension.js",
-      "sha256": "38f8e57bba48b2783dc2777e16527fc4da3a106dd22e4bf21b1288a52eaafffc"
+      "sha256": "9394e7eab92103842d46f1c0538353c87388f6c9b8745584a836afd6e41e117d"
     },
     {
       "path": "extension/media/fox.svg",
@@ -116,19 +114,23 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "0e76b8949082fa289bff212774c5437ecc653d12fe96e1af0ba9e1c4fe7eabda"
+      "sha256": "d0b9cf38cdedfb1af329d122518494a4568d5c97a01ddfdf06da4b75b0e31655"
     },
     {
       "path": "hook/__init__.py",
-      "sha256": "4962a9e73b8e053115a9877495a8d73d5217010fe7cf569b985c947c2e2a9ab8"
+      "sha256": "516cde5ee8fbd2cf8231246bf2bcbfea34063af26f7a1861405888f61fe8b57b"
     },
     {
       "path": "hook/gallery.py",
-      "sha256": "b9e383e9b0edc181326a4bef8d4f28caa830f90900b35a5ed06619349f2b1bcb"
+      "sha256": "4ae304ab0842eeb377f5537c4363084d0d9b670088b9e922cb957d4993886a0e"
     },
     {
       "path": "preview/extension.js",
-      "sha256": "465fad4d8457e9eb8de55ab29156c07dfd01eb348b867db96b91f1b711591bfb"
+      "sha256": "86782bdde681db8b969249fe14caa72b8f886e86e567fe830ed8d663e0ddd14f"
+    },
+    {
+      "path": "preview/highlight.js",
+      "sha256": "734b9b7aa9a3f2545c8a8aa31adc76e2792a7a300f2e892e6e69ef066270a491"
     },
     {
       "path": "preview/media/mermaid-preview.js",
@@ -140,7 +142,7 @@
     },
     {
       "path": "preview/package.json",
-      "sha256": "cde79deb9b12641aaf0d0e62fdebf70aa95cd4b319498d9cc629ef51fc3ff708"
+      "sha256": "014e7351f4e0ed2f3a19a66c439257682f213a8238f566993a18937a2ea71beb"
     },
     {
       "path": "spa/hostmodel.mjs",
@@ -167,6 +169,10 @@
       "sha256": "bc37af7d058f9f2b6ca7ff5e5e2c7482f2f8ee06549975b6f4c26b5bcd3e051b"
     },
     {
+      "path": "tests/agent_hooks.test.mjs",
+      "sha256": "59a4c122503707e040e70a05ce0d1563e8d0750f932ce09fa4d7ba3cb2fb46cc"
+    },
+    {
       "path": "tests/app_icon_test.py",
       "sha256": "290cdb89ad9e52d5562ed8337958acc004834b193e80ade2a931a302eed202f9"
     },
@@ -183,6 +189,10 @@
       "sha256": "7ec29d865c38f323206313e002fc5d50bbd59341bdaceac453f27686c6295dca"
     },
     {
+      "path": "tests/context_providers.test.mjs",
+      "sha256": "02b5fd70678dc0f02508f537069fc2533794ffa2b05ccf9baf0847cf7f76ff96"
+    },
+    {
       "path": "tests/e2e/chat_roundtrip.py",
       "sha256": "9e9b7ccf01dbcf4a5f93ae819ea8383120f2a83fbfc6c27c486dfd137e3733db"
     },
@@ -191,12 +201,16 @@
       "sha256": "8f882abdaddf21849e1059888a474290aa849c01a9bea455241eb9bb1e3fd7b7"
     },
     {
+      "path": "tests/e2e/probe_chat_shortcuts.py",
+      "sha256": "fb1ffcc9e9072fed9d3e0b7632995f775836db82a16521728940e9411ed5ec1e"
+    },
+    {
       "path": "tests/e2e/probe_chat_webview.py",
-      "sha256": "098e77c672203d3abefd36e775326f3d4f9ec0ddf2aa8fd72d55c24ec2e0860d"
+      "sha256": "5c4f8ad317b69039bd20176480dbc12aeb3b3c7c19bf23edc85843594734b06f"
     },
     {
       "path": "tests/e2e/probe_composer.py",
-      "sha256": "d3965b1d3058bdf0d3090725052970551ee244f56233317c97582b0778490a74"
+      "sha256": "cc1629cf4713833872a861de545938456ad98c10cccfaf3cf872b12390397e71"
     },
     {
       "path": "tests/e2e/probe_extension.py",
@@ -223,12 +237,20 @@
       "sha256": "b5a16464d269f4eb710f8a2a82afad6533b008fc23b37b2f4193099c3a83710d"
     },
     {
+      "path": "tests/e2e/probe_review_comments.py",
+      "sha256": "aeacf57b0e89481aab38129082f7ac6d7b8852690e98f3db21db35aea13989a1"
+    },
+    {
       "path": "tests/e2e/probe_spec_editor.py",
       "sha256": "c2350be0b007fab2b048f453e678581c35962a1bb0c965919bb84632956ced71"
     },
     {
       "path": "tests/e2e/probe_spec_find.py",
       "sha256": "49c41251493b0dd1de02249d78dcd684a7df11e15083a4332470df9e6cb880b8"
+    },
+    {
+      "path": "tests/e2e/probe_spec_lenses.py",
+      "sha256": "7a8b2fdfb3f5fed809c2c34d32a01b5800ab4737c9df84f5326c3f3090d2cf08"
     },
     {
       "path": "tests/e2e/proxy_harness.py",
@@ -243,12 +265,16 @@
       "sha256": "adacc09d980a0dcca3a4bf7d05949b7aec3d3dbb561676c61f6a9be190932908"
     },
     {
+      "path": "tests/editor_actions.test.mjs",
+      "sha256": "4d77bdf6f6329d03f74b96c518099e69253d484460778a5f772722d76a831ca6"
+    },
+    {
       "path": "tests/engine_health_test.py",
       "sha256": "f90a09b5b834343dac363ae0164ea6eed0cdfffcb0605fea1d31e5cad3f79963"
     },
     {
       "path": "tests/engine_port_test.py",
-      "sha256": "3bdbee993c51a283071afbcf523dd491f5bd84f15439d8203f88fa98ac7d225d"
+      "sha256": "40eed9e80aa1136ec9be89cf8598f24c4a7479c2e60c102466d6ed7d7dfb060b"
     },
     {
       "path": "tests/extension_provision_test.py",
@@ -256,7 +282,7 @@
     },
     {
       "path": "tests/extension_unit.test.mjs",
-      "sha256": "3fa80db26e1cf4b5be75ec6dc666f50071730dedb689e7d727fed9cf1fd8b14e"
+      "sha256": "634d7d4be1c77fe8df4f5e072eb74c0e3d816164ea29173121474c09eb762d8a"
     },
     {
       "path": "tests/gallery_test.py",
@@ -315,6 +341,10 @@
       "sha256": "d6947cf8a1246dec05f1b1d14fb8e297eb251f5dc8e513b472e38dee1091e976"
     },
     {
+      "path": "tests/preview_highlight.test.mjs",
+      "sha256": "f34c3814c5e6ed7415daf1197c136cfab43666b7f99a844c272c0dfca2c776a8"
+    },
+    {
       "path": "tests/profile_associations_test.py",
       "sha256": "405380d54beff8600ea693cb07be98567521dba4b761d30bfd983cb4507beac5"
     },
@@ -335,20 +365,56 @@
       "sha256": "283046734313ec38ea96e000402cc97b61f7b42b7d462b9ddc78a06a4a9b8e6f"
     },
     {
+      "path": "tests/skills_import_test.py",
+      "sha256": "55a74a7713cd5c543ae725d69e233b951f3f793b7e3f7a6f964033be29b8b57d"
+    },
+    {
       "path": "tests/smoke_test.py",
       "sha256": "0af2adc8bc063e2d00b3d21caca9bb22a99e4384aef1bacb845748182cebdc60"
+    },
+    {
+      "path": "tests/spec_diagnostics.test.mjs",
+      "sha256": "c37dbdb92b89ff054bf0e69c4703aca35d98d70631db09e75de93e6fb77a19f2"
     },
     {
       "path": "tests/spec_editor.test.mjs",
       "sha256": "88ca6df139e18746cf242747de76dc091fb39b957833df2486286f77ba7492c9"
     },
     {
+      "path": "tests/spec_hovers.test.mjs",
+      "sha256": "a7de94672ce0f3b90f6205b5ae05c0707246da715fbe2467bdbea06779857f46"
+    },
+    {
+      "path": "tests/spec_model.test.mjs",
+      "sha256": "e42e887865c0781f484b061ccec7c4de123b9008f739df2cedcb055f5902b406"
+    },
+    {
       "path": "tests/spec_preview.test.mjs",
       "sha256": "e35db29ccdd82101cc56b04d3453cc0c538193ab93304fb199bf6771e6e2d9b2"
     },
     {
+      "path": "tests/spec_review.test.mjs",
+      "sha256": "4eb1d526d743d25dda7f3915834bb492a129391da48fa7ab3bf8f207f4ec90a4"
+    },
+    {
+      "path": "tests/spec_task_state.test.mjs",
+      "sha256": "e415cdc33e237f7de08641b832e80c386fcbfd8bce1293bba18a66d752988c3a"
+    },
+    {
+      "path": "tests/spec_view.test.mjs",
+      "sha256": "494430b2487368633e53bee6517fa226aab0c1ed8e6330ede1848ffd4fe5b3c2"
+    },
+    {
+      "path": "tests/steering_import.test.mjs",
+      "sha256": "0b13a713ff8ec0c648bd929fcf1c1fc998333195003b9061e3572d6c3ff8745c"
+    },
+    {
       "path": "tests/sw_cookie_probe.py",
       "sha256": "05e7645bf4092cfb5abeef9ea4bd924459e271981f8f8510c79873647f9d0e2f"
+    },
+    {
+      "path": "tests/task_session_links.test.mjs",
+      "sha256": "2907b9cebea7658dce6c6f3e7365c50bb5d47a1c6d3fd2e75a6d3ec6cbbafff7"
     },
     {
       "path": "tests/theme_contrast.test.mjs",

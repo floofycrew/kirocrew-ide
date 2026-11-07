@@ -878,12 +878,24 @@ class _JsonRequest:
 
 
 def _live_state():
-    """The persisted server, verified alive; clears stale records."""
+    """The persisted server, verified alive; clears stale records.
+
+    A stale record's port is remembered for `_pick_port` before it goes: an engine
+    that died with the gateway (the 2026-11-06 19:51 restart took pid 3056392 with
+    it) is found dead by the next hook load, and until 0.30.11 that load dropped
+    the record and the first `Start` scanned from the base again, so a week on
+    35477 ended on 35476 and every workspace's UI state (keyed by the folder URI
+    with the engine's authority) started over. `_stop` remembers the port the same
+    way for a relaunch it performs itself.
+    """
     state = _read_state()
     if not state:
         return None
     if _pid_alive(state.get("pid")) and _port_open(state.get("port", 0)):
         return state
+    port = state.get("port")
+    if port and isinstance(getattr(_ctx, "state", None), dict):
+        _ctx.state["last_port"] = int(port)
     _clear_state()
     return None
 
@@ -1425,6 +1437,24 @@ def _extensions_install(request):
 
 def _extensions_install_status(_request):
     return {"install": dict(_ext_install)}
+
+
+# ---------------------------------------------------------- skill import
+
+def _skills_fetch(url):
+    """One https GET → bytes through the manifest-checked opener (api.github.com, codeload.github.com)."""
+    with _open_checked(url, timeout=gallery.SKILL_FETCH_TIMEOUT) as reply:
+        return reply.read(gallery.SKILL_TARBALL_MAX + 1)
+
+
+def _skills_import(request):
+    """POST skills/import {"url", "scope", "workspace"?} → {name, path} or {error}; see gallery.import_skill."""
+    try:
+        body = request.json() or {}
+    except Exception:  # noqa: BLE001
+        body = {}
+    return gallery.import_skill(body, _skills_fetch, tmp_root=os.path.join(str(_ctx.data_dir), "skill-import"),
+                                log=_ctx.log.info)
 
 
 def _engines(_request):
@@ -2994,6 +3024,7 @@ def activate(ctx):
     ctx.routes.add("POST", "engines/install", _engines_install)
     ctx.routes.add("POST", "extensions/install", _extensions_install)
     ctx.routes.add("GET", "extensions/install", _extensions_install_status)
+    ctx.routes.add("POST", "skills/import", _skills_import)
     ctx.routes.add("GET", "browse", _browse)
     ctx.routes.add("GET", "gitdiff", _gitdiff)
     ctx.routes.add("GET", "theme", _theme_get)

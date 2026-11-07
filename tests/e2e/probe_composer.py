@@ -60,7 +60,7 @@ def main():
         frame.wait_for_selector("#menu.on .it", timeout=5000)
         kinds = frame.evaluate("() => Array.from(document.querySelectorAll('#menu .it')).map(b => b.firstChild.textContent)")
         print("context menu:", kinds)
-        assert kinds[:3] == ["Currently Open Files", "Diagnostics", "Git Diff"], kinds
+        assert kinds == ["File", "Currently Open Files", "Steering", "Problems", "Terminal", "Git Diff", "Folder", "Spec"], kinds
         frame.press("body", "Escape")
 
         # An assistant row with a trailing [OPTIONS: …] line renders chips; clicking one sends the label.

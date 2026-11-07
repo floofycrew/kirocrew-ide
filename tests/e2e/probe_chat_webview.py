@@ -664,6 +664,39 @@ def main() -> int:
         verbatim = page.evaluate("() => { const t = document.getElementById('ktip'); return [[...t.querySelectorAll('.ktip-grid > .ktip-op')].map((g) => g.textContent), t.querySelector('.ktip-seg').textContent, t.querySelector('.ktip-seg span') === null]; }")
         check(verbatim == [["$"], "ls\nls -la", True], f"a multi-line command is one verbatim cell behind a single $ ({verbatim})")
         page.mouse.move(5, 5)
+        # Native colours: on hover the page asks the extension to highlight the command; the answer
+        # (one run list per line, as the engine host returns them) is painted inline over the grid.
+        requests = page.evaluate("() => window.__posted.filter((m) => m.type === 'highlight').map((m) => [m.req, m.text])")
+        check(len(requests) >= 4 and all(t for _, t in requests), f"each hovered shell row asked for its colours once ({len(requests)} requests)")
+        check(len(set(t for _, t in requests)) == len(requests), "no command was asked for twice")
+        first = next(r for r in requests if r[1] == cmd)
+        runs = [{"s": 0, "e": 3, "c": "#DCDCAA", "f": 0}, {"s": 3, "e": 4, "c": "", "f": 0}, {"s": 4, "e": 10, "c": "#CE9178", "f": 3}, {"s": 10, "e": 11, "c": "", "f": 0}, {"s": 11, "e": 18, "c": "#569CD6", "f": 0},
+                {"s": 18, "e": 19, "c": "", "f": 0}, {"s": 19, "e": 21, "c": "#D4D4D4", "f": 0}, {"s": 21, "e": 22, "c": "", "f": 0}, {"s": 22, "e": 25, "c": "#DCDCAA", "f": 0}, {"s": 25, "e": len(cmd), "c": "#CE9178", "f": 0}]
+        post({"type": "highlighted", "req": first[0], "lines": [runs]})
+        page.hover(".log.on .row.tool.call >> nth=0 >> .tool-head")
+        page.wait_for_selector("#ktip[data-native=\"true\"]", timeout=2000)
+        native = page.evaluate("""() => { const t = document.getElementById('ktip'); const cells = [...t.querySelectorAll('.ktip-grid > .ktip-seg')];
+          return { spans: [...cells[0].querySelectorAll('span')].map((x) => [x.textContent, x.style.color, x.style.fontStyle, x.style.fontWeight]), classes: [...t.querySelectorAll('.ktip-seg span')].filter((x) => /^p-/.test(x.className)).length,
+                   op: t.querySelectorAll('.ktip-grid > .ktip-op')[1].style.color, segs: cells.map((c) => c.textContent) }; }""")
+        check(native["spans"] == [["git", "rgb(220, 220, 170)", "", ""], [" ", "", "", ""], ["status", "rgb(206, 145, 120)", "italic", "600"], [" ", "", "", ""], ["--short", "rgb(86, 156, 214)", "", ""]], f"the first cell is the engine's runs, sliced to the segment: colours inline, italic|bold from the bits ({native['spans']})")
+        check(native["classes"] == 0, "no fallback kind classes once the native runs paint the tip")
+        check(native["segs"] == ["git status --short", "git -P log --oneline -n 3 2>/dev/null", "head -20", 'echo "---"'], f"the grid keeps its segments ({native['segs']})")
+        check(native["op"] == "rgb(212, 212, 212)", f"a gutter operator takes the run colour at its offset ({native['op']})")
+        if args.shots:
+            page.screenshot(path=str(pathlib.Path(args.shots) / "tool-command-tip-native.png"))
+        # A theme change drops the cache and asks again; a null answer parks the native path on the fallback.
+        n_before = len(page.evaluate("() => window.__posted.filter((m) => m.type === 'highlight')"))
+        post({"type": "highlightReset"})
+        page.wait_for_function(f"() => window.__posted.filter((m) => m.type === 'highlight').length > {n_before}")
+        req = page.evaluate("() => window.__posted.filter((m) => m.type === 'highlight').pop().req")
+        check(page.evaluate("() => document.getElementById('ktip').dataset.native") == "false", "after the reset the open tip repaints with the fallback colours until the new answer lands")
+        post({"type": "highlighted", "req": req, "lines": None})
+        page.wait_for_timeout(30)
+        page.mouse.move(5, 5)
+        page.hover(".log.on .row.tool.call >> nth=2 >> .tool-head")
+        page.wait_for_timeout(250)
+        check(len(page.evaluate("() => window.__posted.filter((m) => m.type === 'highlight')")) == n_before + 1, "a null answer (no engine highlighter) stops the asking")
+        page.mouse.move(5, 5)
         check(errors == [], f"no page errors ({errors})")
         browser.close()
     print("\n" + ("ALL OK" if not failures else f"{len(failures)} FAILURE(S)"))
