@@ -43,11 +43,23 @@ def main():
     assert not matched
 
     out = hook._inject_pane_min_query(PAGE, 22)
-    assert 'workbench/workbench.js?kide-pane=22"' in out and out.count("kide-pane") == 1, out
+    assert 'workbench/workbench.js?kide-pane=22&kide-sash=%d"' % hook.SASH_HOVER_PX in out, out
+    assert out.count("kide-pane") == 1, out
     assert "nls.messages.js\"" in out, "only the bundle's URL is versioned"
     assert hook._inject_pane_min_query(out, 22) == out, "idempotent"
-    assert hook._inject_pane_min_query(PAGE, 120) == PAGE, "stock value: no query, the bundle streams untouched"
+    # The sash hover line is rewritten whatever the pane minimum is, so the stock
+    # minimum still versions the URL (the browser must not keep a stock bundle).
+    assert "kide-sash=" in hook._inject_pane_min_query(PAGE, 120), "stock minimum still carries the sash width"
     assert hook._inject_pane_min_query("<html>", 22) == "<html>", "no bundle tag -> untouched"
+
+    # The sash hover clamp: VS Code derives the lit line from workbench.sash.size as
+    # clamp(size, 1, 8), so the 8px strip served here lights up 8px wide; the ceiling
+    # is rewritten so the strip stays easy to catch and the line stays thin.
+    sash = 'const e=this.b.getValue("workbench.sash.size"),t=Hn(e,4,20),i=Hn(e,1,8);this.a.textContent=`'
+    out, matched = hook._rewrite_sash_hover(sash)
+    assert matched and "Hn(e,1,%d)" % hook.SASH_HOVER_PX in out and "Hn(e,4,20)" in out, out
+    out, matched = hook._rewrite_sash_hover("var x=Hn(e,1,8);")
+    assert not matched, "only the sash clamp is rewritten"
 
     hook._ctx = Ctx({"pane_min_body_px": "40"})
     assert hook._pane_min_body() == 40

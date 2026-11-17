@@ -46,6 +46,7 @@ import zipfile
 try:
     from . import gallery  # the Loader imports this file as the `hook` package
     from . import kas
+    from . import checkpoints
 except ImportError:  # the unit tests load it as a bare module from its path
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("kirocrew_ide_gallery", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gallery.py"))
@@ -54,6 +55,9 @@ except ImportError:  # the unit tests load it as a bare module from its path
     _spec = _ilu.spec_from_file_location("kirocrew_ide_kas", os.path.join(os.path.dirname(os.path.abspath(__file__)), "kas.py"))
     kas = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(kas)
+    _spec = _ilu.spec_from_file_location("kirocrew_ide_checkpoints", os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints.py"))
+    checkpoints = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(checkpoints)
 
 STATE_FILE = "server.json"
 ENGINE_LOG = "engine.log"
@@ -2526,19 +2530,46 @@ def _rewrite_pane_min(js, minimum):
     return out, count == 1
 
 
+#: The sash's lit hover line. VS Code derives it from `workbench.sash.size`:
+#: the grab strip is clamp(size, 4, 20) and the line that lights up on hover is
+#: clamp(size, 1, 8), so the 8px strip served here (MACHINE_SETTINGS) lights up
+#: as an 8px bar, which reads as a thick divider. Kiro IDE's line stays thin.
+#: The ceiling of that second clamp is rewritten to SASH_HOVER_PX so the strip
+#: keeps its easy-to-catch 8px while the visible line is 2px (the stock look at
+#: the stock 4px size is a 4px line; 2px matches the editor's own group sashes).
+SASH_HOVER_PX = 2
+_SASH_HOVER_RE = re.compile(r'(getValue\("workbench\.sash\.size"\),\w+=\w+\(\w+,4,20\),\w+=\w+\(\w+,1,)8\)')
+_SASH_HOVER_QUERY = "kide-sash="
+_sash_unmatched = set()
+
+
+def _rewrite_sash_hover(js, px=SASH_HOVER_PX):
+    """(bundle text with the sash hover line capped at `px`, matched?)."""
+    out, count = _SASH_HOVER_RE.subn(lambda m: m.group(1) + str(px) + ")", js, count=1)
+    return out, count == 1
+
+
 def _inject_pane_min_query(html, minimum=None):
-    """Version the workbench bundle's script URL with the pane minimum; stock value or no bundle tag = untouched."""
+    """Version the workbench bundle's script URL with the values it is rewritten for.
+
+    Both rewrites live in that one bundle (the Pane minimum and the sash hover
+    line), and the engine serves it with a year's max-age, so the URL has to
+    name every value a browser's cached copy could disagree with: a changed
+    pane minimum or a changed hover width is a new URL. No bundle tag (or a
+    query already there) leaves the page alone.
+    """
     minimum = _pane_min_body() if minimum is None else minimum
-    if minimum >= PANE_MIN_BODY_STOCK or _PANE_MIN_QUERY in html:
+    if _PANE_MIN_QUERY in html:
         return html
     needle = _WORKBENCH_JS_SUFFIX + '"'
     if needle not in html:
         return html
-    return html.replace(needle, _WORKBENCH_JS_SUFFIX + "?" + _PANE_MIN_QUERY + str(minimum) + '"', 1)
+    query = "%s%d&%s%d" % (_PANE_MIN_QUERY, minimum, _SASH_HOVER_QUERY, SASH_HOVER_PX)
+    return html.replace(needle, _WORKBENCH_JS_SUFFIX + "?" + query + '"', 1)
 
 
 async def _serve_workbench_bundle(request, target, headers, minimum):
-    """The workbench bundle with the pane minimum rewritten, from the per-build cache or fetched whole once."""
+    """The workbench bundle with the pane minimum and sash hover line rewritten, from the per-build cache or fetched whole once."""
     import aiohttp
     from aiohttp import web
     key = (request.path, minimum)
@@ -2564,11 +2595,16 @@ async def _serve_workbench_bundle(request, target, headers, minimum):
             if _ctx is not None:
                 _ctx.log.warning("workbench bundle %s has no Pane minimum to rewrite; sections keep the stock %dpx minimum",
                                  request.path, PANE_MIN_BODY_STOCK)
+        text, sash_matched = _rewrite_sash_hover(text)
+        if not sash_matched and request.path not in _sash_unmatched:
+            _sash_unmatched.add(request.path)
+            if _ctx is not None:
+                _ctx.log.warning("workbench bundle %s has no sash hover clamp to rewrite; the hover line keeps the stock width", request.path)
         hit = (text.encode("utf-8"), ctype.split(";")[0].strip() or "text/javascript", cache)
         _bundle_cache.clear()  # one engine build at a time; a relaunch on a new build drops the old copy
         _bundle_cache[key] = hit
     body, ctype, cache = hit
-    _log_proxied(request.method, request.path, 200, note="workbench-js pane-min=%d" % minimum)
+    _log_proxied(request.method, request.path, 200, note="workbench-js pane-min=%d sash-hover=%d" % (minimum, SASH_HOVER_PX))
     return web.Response(status=200, body=body, content_type=ctype, charset="utf-8",
                         headers={"Cache-Control": cache})
 
@@ -2999,12 +3035,11 @@ async def _proxy(request):
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return await _proxy_websocket(request, target, headers)
 
-    # The workbench bundle: served whole with the Pane minimum rewritten (see
-    # PANE_MIN_BODY_KEY); at the stock value it streams through like any asset.
+    # The workbench bundle: served whole with the Pane minimum (PANE_MIN_BODY_KEY)
+    # and the sash hover line (SASH_HOVER_PX) rewritten. Always, not only when the
+    # pane minimum differs from stock: the hover width is rewritten either way.
     if request.method == "GET" and request.path.endswith(_WORKBENCH_JS_SUFFIX):
-        minimum = _pane_min_body()
-        if minimum < PANE_MIN_BODY_STOCK:
-            return await _serve_workbench_bundle(request, target, headers, minimum)
+        return await _serve_workbench_bundle(request, target, headers, _pane_min_body())
 
     # Plain HTTP, streamed both ways
     session = aiohttp.ClientSession(auto_decompress=False)
@@ -3207,6 +3242,9 @@ def activate(ctx):
     ctx.routes.add("GET", "kas/sessions", _kas_sessions)
     ctx.routes.add("GET", "kas/sessions/{id}/transcript", _kas_transcript)
     ctx.routes.add("GET", "kas/tasks", _kas_tasks)
+    # Workspace checkpoints behind the chat's "Revert changes" (hook/checkpoints.py):
+    # git-based, the folder must be one of the engine's open workspaces.
+    checkpoints.routes(ctx, str(ctx.data_dir), lambda: _workspaces(_live_state()))
     state = _live_state()
     if state and _mode_mismatch(state):
         # Typically: the engine predates the gateway restart that armed the

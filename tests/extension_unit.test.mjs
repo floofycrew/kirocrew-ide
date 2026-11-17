@@ -592,7 +592,7 @@ test("chat webview: images — composer thumbnails, bubble attachments from mark
   assert.ok(/\.chip\.img img\{display:block;height:48px/.test(html), "a 48px thumbnail chip in the composer");
   assert.ok(/\.user \.att img,\.md img\.mdimg\{[^}]*cursor:zoom-in/.test(html), "pictures in the bubble and in answers open on click");
   assert.ok(html.includes("function attachmentsOf(content, files)") && html.includes("src.startsWith(f.path, end)"), "markers resolve losslessly against meta.files (a path with a space survives)");
-  assert.ok(html.includes("function userBubble(d, content, contexts, files)") && /const d=el\(st,'user'\); userBubble\(d, m\.text, m\.contexts, m\.files\)/.test(html) && /if\(cls==='user'\)\{userBubble\(d, r\.content, null, \(r\.meta&&r\.meta\.files\)\|\|\[\]\);\}/.test(html), "one bubble renderer for a live send and a history row");
+  assert.ok(html.includes("function userBubble(d, content, contexts, files, checkpoint)") && /const d=el\(st,'user'\); if\(m\.local\) d\.dataset\.local=m\.local; userBubble\(d, m\.text, m\.contexts, m\.files, m\.checkpoint\)/.test(html) && /if\(cls==='user'\)\{userBubble\(d, r\.content, null, \(r\.meta&&r\.meta\.files\)\|\|\[\]\);\}/.test(html), "one bubble renderer for a live send and a history row");
   assert.ok(html.includes("vscode.postMessage({type:'image', id:active, path})") && /case 'image': imgArrived\(m\)/.test(html), "a local image is fetched through the extension");
   assert.ok(html.includes("const imgCache = new Map(), imgPending = new Set();"), "fetched images are cached per path, one request in flight per path");
   assert.ok(/function renderMd\(node, s\)\{[^\n]*hydrateImages\(node\)/.test(html), "a rendered answer fetches its local images");
@@ -606,7 +606,7 @@ test("chat webview: your turn is drawn the instant you send; the extension's use
   assert.ok(/function sendText\(t\)\{[\s\S]*?const d=el\(st,'user'\); d\.dataset\.local=local;[\s\S]*?userBubble\(d, shown, contexts\.map/.test(html), "the page draws the bubble before posting the send");
   assert.ok(/st\.running=true; setWork\(st\); scrollLog\(st, true\);\n  vscode\.postMessage\(\{type:'send', id:active, text:t, contexts, files, local\}\)/.test(html), "the pane goes to working at once; the send carries the local id");
   assert.ok(html.includes("const shown = t || (files.length ? 'See the attached file(s).' : 'See the context provided.');"), "the stand-in text matches the extension's");
-  assert.ok(/case 'user': \{[\s\S]*?const own = m\.local \? st\.log\.querySelector\('\.row\.user\[data-local="'\+m\.local\+'"\]'\) : null;\n\s*if\(own\)\{ own\.innerHTML=''; userBubble\(own, m\.text, m\.contexts, m\.files\); break; \}/.test(html), "a user message naming the local id updates that bubble instead of appending");
+  assert.ok(/case 'user': \{[\s\S]*?const own = m\.local \? st\.log\.querySelector\('\.row\.user\[data-local="'\+m\.local\+'"\]'\) : null;\n\s*if\(own\)\{ dropStarting\(st\); own\.innerHTML=''; userBubble\(own, m\.text, m\.contexts, m\.files, m\.checkpoint\|\|own\.dataset\.checkpoint\); break; \}/.test(html), "a user message naming the local id updates that bubble instead of appending");
 });
 
 test("ChatView.send: the user message carries the page's local id, and a failed send releases the pane the page already set to working", async () => {
@@ -626,11 +626,17 @@ test("ChatView.send: the user message carries the page's local id, and a failed 
   assert.equal(user.local, "l7", "the bubble the page drew is the one completed");
   assert.deepEqual(user.files.map((f) => f.path), ["/data/uploads/shot.png"], "with the uploaded paths");
   assert.ok(!calls.posted.some((m) => m.type === "done"), "a send that went out does not release the pane (the turn is running)");
-  // A dispatch (Run all tasks) has no local id: the user row is appended as before.
+  // A dispatch (Run all tasks) draws its bubble ahead of the session under a local id of its
+  // own ("d<n>"), and the send's own user message completes that bubble, not a new one.
+  const beforeDispatch = calls.posted.length;
   await chat.dispatch(() => "Run all tasks for this spec.", { mode: "spec", kind: "spec", display: "Run all tasks" });
-  const disp = calls.posted.filter((m) => m.type === "user").pop();
-  assert.equal(disp.local, undefined);
-  assert.equal(disp.text, "Run all tasks");
+  const dispUsers = calls.posted.slice(beforeDispatch).filter((m) => m.type === "user");
+  assert.equal(dispUsers.length, 2, "the early bubble, then the completed one");
+  assert.match(dispUsers[0].local, /^d\d+$/);
+  assert.equal(dispUsers[1].local, dispUsers[0].local, "same local id: the page fills the early bubble in place");
+  assert.equal(dispUsers[0].text, "Run all tasks");
+  assert.equal(dispUsers[1].text, "Run all tasks");
+  assert.ok(calls.posted.indexOf(dispUsers[0]) < calls.posted.findIndex((m, i) => i > beforeDispatch && m.type === "session"), "the bubble is posted before the session exists");
   // The host refuses the send: the error row lands and the page's pane is released with a done.
   const before = calls.posted.length;
   await chat.onMessage({ type: "send", id: t.id, text: "boom", local: "l8" });
@@ -1340,7 +1346,7 @@ test("a Spec tab without a run record (an older tab, a dashboard-started run) ad
   } finally { ws.restore(); }
 });
 
-test("resumeSpec (Specs view ⟳ / spec editor 'Resume run'): the tab that ran it when idle, 'running' while it goes, a fresh dispatch otherwise; continueAction routes an interrupted tasks.md there", async () => {
+test("resumeSpec (Specs view ⟳ / spec editor 'Resume run'): a fresh chat every time, 'running' while the run goes; continueAction routes an interrupted tasks.md there", async () => {
   const { ChatView, continueAction, parseTaskTree, parseTasks } = ext.__test;
   const ws = specWorkspace(["- [x] 1. Done", "- [-] 2. Half way", "- [ ] 3. Next"].join("\n"));
   const calls = { sent: [], posted: [], dispatched: 0 };
@@ -1360,18 +1366,19 @@ test("resumeSpec (Specs view ⟳ / spec editor 'Resume run'): the tab that ran i
     // No tab yet: a fresh dispatch.
     assert.equal(await chat.resumeSpec(spec, dispatch), "dispatched");
     assert.equal(calls.dispatched, 1);
-    // The tab that ran it, idle: resumed there, made active.
+    // The tab that ran it, idle: a spec action always opens its own chat (item 1), so the
+    // run is dispatched again rather than typed into that session.
     await chat.dispatch(() => "Run all tasks for this spec.", { mode: "spec", kind: "spec", display: "Run all tasks", run: { spec: "thing", dir: ws.spec, task: null, optional: false, display: "Run all tasks" } });
-    const t = chat.tabForKey("k1");
+    chat.tabForKey("k1");
     chat.newTab(true); // another tab in front
-    assert.equal(await chat.resumeSpec(spec, dispatch), "resumed");
-    assert.equal(chat.active, t.id, "the run's tab is brought to the front");
-    assert.equal(calls.sent.length, 2); assert.match(calls.sent[1].text, /Resume from prior progress/);
-    assert.equal(calls.dispatched, 1, "no second session");
-    // Still running there: say so, send nothing.
+    assert.equal(await chat.resumeSpec(spec, dispatch), "dispatched");
+    assert.equal(calls.dispatched, 2, "a new chat, not a turn in the old session");
+    assert.equal(calls.sent.length, 1, "nothing was sent into the tab that ran before");
+    // Still running there: say so, send nothing, start nothing.
     slots.k1.running = true;
     assert.equal(await chat.resumeSpec(spec, dispatch), "running");
-    assert.equal(calls.sent.length, 2);
+    assert.equal(calls.sent.length, 1);
+    assert.equal(calls.dispatched, 2, "a live run is never doubled");
     // The spec editor's primary action on an interrupted tasks.md is "Resume run" through the same route.
     const md = ws.files[ws.spec + "/tasks.md"];
     const action = continueAction({ file: "tasks.md", label: "Tasks" }, { present: { "tasks.md": true }, taskTree: parseTaskTree(md), tasks: parseTasks(md) });
@@ -1410,7 +1417,7 @@ test("auto-resume off: the card is explained and nothing is sent until Continue"
   } finally { ws.restore(); stub.workspace.getConfiguration = savedCfg; }
 });
 
-test("sendSpecTurn: Spec_Agent in Spec mode, sibling documents as #file contexts, short display text, the spec's idle tab reused and a busy one left alone", async () => {
+test("sendSpecTurn: Spec_Agent in Spec mode, sibling documents as #file contexts, short display text, a chat of its own for every action", async () => {
   const { ChatView, specTurnText } = ext.__test;
   // A workspace with one spec whose requirements.md and design.md exist (tasks.md not yet).
   const files = { "/w/.kiro/specs/foo/requirements.md": "# Requirements\nR1", "/w/.kiro/specs/foo/design.md": "# Design\nD1", "/w/.kiro/specs/foo/.config.kiro": '{"specId":"x","workflowType":"requirements-first","specType":"feature"}' };
@@ -1450,23 +1457,33 @@ test("sendSpecTurn: Spec_Agent in Spec mode, sibling documents as #file contexts
     assert.equal(calls.sent[0].text, specTurnText("update", "design.md", { spec }));
     assert.equal(calls.sent[0].agent, "spec-writer");
     const bubble = calls.posted.find((m) => m.type === "user");
+    assert.match(bubble.local, /^d\d+$/, "the bubble is drawn ahead of the session under a local id");
     assert.equal(bubble.text, "Sync design with project files");
     assert.deepEqual(bubble.contexts, [".kiro/specs/foo/requirements.md"]);
-    // The same spec again while the tab is idle: the turn lands in that tab, with a custom display text.
+    const completed = calls.posted.filter((m) => m.type === "user")[1];
+    assert.equal(completed.local, bubble.local, "the send's own user message completes that bubble");
+    assert.equal(completed.text, "Sync design with project files");
+    // The same spec again: its own chat (item 1), never a turn in the previous session.
     const second = await chat.sendSpecTurn("foo", "generate", "tasks", { displayText: "Generate the task list" });
-    assert.deepEqual(second, { key: "k1", reused: true });
-    assert.equal(calls.created.length, 1, "no second session");
-    assert.equal(calls.sent[1].key, "k1");
+    assert.deepEqual(second, { key: "k2", reused: false });
+    assert.equal(calls.created.length, 2, "a second session, not the first one reused");
+    assert.equal(calls.sent[1].key, "k2");
     assert.match(calls.sent[1].text, /PHASE: TASKS/);
-    assert.equal(calls.posted.filter((m) => m.type === "user")[1].text, "Generate the task list");
-    assert.equal(chat.findSpecTab("foo", "/w/.kiro/specs/foo"), tab);
-    // Busy: a fresh tab instead.
-    running.add("k1");
+    // Its tab showed a starting row at click time, then the bubble, then the send's own message.
+    const secondPosts = calls.posted.filter((m) => m.type === "starting" || m.type === "user").slice(3);
+    assert.equal(secondPosts[0].type, "starting", "the chat says it is starting before the session exists");
+    assert.match(secondPosts[0].text, /Generate the task list — starting…/);
+    assert.equal(secondPosts[1].local, secondPosts[2].local, "the early bubble is completed, not duplicated");
+    assert.equal(secondPosts[2].text, "Generate the task list");
+    // A busy session is no obstacle either: again, a chat of its own.
+    running.add("k1"); running.add("k2");
     const third = await chat.sendSpecTurn("foo", "review", "requirements.md", { body: "> R1\nsplit it" });
-    assert.deepEqual(third, { key: "k2", reused: false });
+    assert.deepEqual(third, { key: "k3", reused: false });
     assert.match(calls.sent[2].text, /APPLY REVIEW COMMENTS to \.kiro\/specs\/foo\/requirements\.md\.\n\n> R1\nsplit it$/);
-    assert.equal(chat.findSpecTab("foo"), chat.tabForKey("k2"), "the idle tab is preferred over the running one");
+    // A spec that does not exist: the tab prepared for the click is dropped again.
+    const tabsBefore = chat.tabs.length;
     await assert.rejects(chat.sendSpecTurn("nope", "update", "design.md"), /spec nope is not in the workspace/);
+    assert.equal(chat.tabs.length, tabsBefore, "a failed action leaves no empty chat behind");
   } finally {
     stub.workspace.workspaceFolders = saved.folders; stub.workspace.fs = saved.fs; stub.commands.executeCommand = saved.exec;
     stub.window.setStatusBarMessage = saved.status; stub.workspace.getConfiguration = saved.cfg;

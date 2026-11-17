@@ -108,10 +108,26 @@ mode until you pick a theme of your own.
 - **Specs like Kiro.** A *Specs* view over `.kiro/specs`, **Run all tasks** on a
   `tasks.md` (one durable session, every task back to back), a run that
   resumes itself when a turn is cut, code lenses per task state, a spec editor
-  with review comments, and a completeness donut per workspace.
+  with review comments, and a completeness donut per workspace. Every spec
+  action opens a chat of its own, and that chat says it is starting the moment
+  you click, not when the session is ready. A spec file opens as markdown text
+  (so a diff shows the source); *Review* in the Specs view, the editor's
+  preview action and Ctrl/Cmd+K V open the spec editor.
+- **An empty chat offers the four workflows.** Spec, Quick Spec, Bug Fix and
+  Plan as tiles, Kiro's own modes in kiro-cli when they are available and the
+  mod's prompt-guided ones otherwise.
 - **Workflows like Kiro.** Steering, Skills and Agent Hooks views with
   generate / refine / import, the editor's *KiroCrew* right-click menu, *Ask the
   agent to fix* on any diagnostic, a commit message from the staged diff.
+- **Revert changes, like Kiro.** Every chat turn starts with a workspace
+  checkpoint; hover a message for **↶ Revert changes** to put the files back to
+  how they were before it (edits undone, files created since removed), with
+  Undo in the chat. Checkpoints are git trees written through a temporary
+  index, so your own index, HEAD, branches and stash are never touched; they
+  sit under `refs/kirocrew/checkpoints/` and are pruned to 200 per repository.
+  *KiroCrew: Revert workspace to a checkpoint…* in the palette lists them all.
+  Folders that are not git repositories get no checkpoints (the chat says so
+  once). `kirocrew.checkpoints: false` turns it off.
 - **Several workspaces, one engine.** A tab row like a browser's; idle
   workspaces sleep and wake in seconds. Profiles and themes follow you between
   browsers.
@@ -173,7 +189,7 @@ the FloofyCrew page):
 | `kas.kiro_cli` | path of the kiro-cli the hook runs (default: PATH, then `~/.local/bin/kiro-cli`) |
 
 IDE-side settings (`kirocrew.*` in VS Code settings): `agent` and `specAgent`
-(which crew agent chats and task runs use), `specEngine` (`gateway` | `kas`), `specAutopilot`, `specAutoResume`,
+(which crew agent chats and task runs use), `specEngine` (`gateway` | `kas`), `specAutopilot`, `specAutoResume`, `checkpoints`,
 `chatFontSize`, `chatWidth`, `toolCardDisplayMode`. The full table of both is
 in [docs/reference.md](docs/reference.md#config-keys-mod-config).
 

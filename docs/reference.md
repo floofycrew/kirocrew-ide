@@ -910,6 +910,31 @@ real engine were proven at the ACP level (`probe_kas_acp.py`, 2.22.1 and
 3.3.0) and through the fake in the browser; the in-dashboard run on
 dev-dsk-testing still needs the operator's session token.
 
+### One spec chat per click (0.34.2)
+
+Between a click on a Specs action (Run all tasks, Write design, Start task,
+Resume run, Sync, Next document, Ask the agent to fix, Send review comments,
+＋ New spec) and the chat it opens sit several round trips: focusing the chat
+view (resolving the webview when the side bar was hidden), the engine probe,
+re-reading the spec, creating the session, applying the picks, the steering
+scan, the context injections, and on Kiro's engine the session resolve. On a
+loaded host nothing visible happened for seconds, and a second click opened
+a second chat. Now every such command runs under a **start guard**
+(`SpecStartGuard`), one hold per spec directory (a palette click that will
+ask which spec holds an unkeyed slot until the spec is known, then moves to
+its row): while the hold lasts the Specs row spins and reads *starting:
+Run all tasks…*, the host's progress toast says *KiroCrew: starting Run all
+tasks…*, and a second click gets the start already going (a status-bar note
+says it was ignored) instead of a new chat. The hold ends when the chat is
+away, however the start ends, so the spec can be started again at once;
+different specs start side by side. On the gateway path the chat also draws
+the turn's bubble and the working foxes **before** the session exists (the
+rule composer sends follow: a local id the send's own user message completes
+in place), so the chat is never a blank tab while the host works.
+`tests/e2e/probe_spec_start_guard.py` proves it with a fake gateway whose
+session mint takes 3 s: two Run all tasks 400 ms apart, one session, one turn,
+one bubble, one tab.
+
 ## Config keys (mod config)
 
 | Key | Meaning |
@@ -991,6 +1016,7 @@ tests/e2e/probe_spec_editor.py --engine <bin> [--mermaid <mermaid.min.js>]   # h
 tests/e2e/probe_spec_find.py           # headless, self-contained: the spec editor's find bar (marks, count, Enter/Shift+Enter, Aa, Filter tasks, refresh, Esc) driven with the keyboard
 tests/e2e/probe_spec_lenses.py --engine <bin>      # headless, scratch engine: task code lenses and borders per state in the text editor, the redraw after a box changes on disk, Go to … per workflow type
 tests/e2e/probe_review_comments.py --engine <bin>  # headless, scratch engine + a routed fake gateway: review comments in the spec editor (toggle, box, Esc / Ctrl+Enter, Edit, Delete, Sync Files), Send → the turn body and the "Review: N comments on design.md" bubble
+tests/e2e/probe_spec_start_guard.py --engine <bin>  # headless, scratch engine + a fake gateway whose session mint takes 3 s: two Run all tasks 400 ms apart → one session, one turn, one bubble (drawn before the mint answers), one tab; the Specs row spins, the progress toast and the status-bar note show; a click after the hold starts anew
 tests/e2e/chat_roundtrip.py <url>      # headless: a message round-trips through a gateway session
 python tests/kas_acp_test.py           # the hook's ACP client against tests/e2e/fake_kas.py: ids, buffer and replay windows, parked requests, Autopilot, exit, folder refusal, restart
 python tests/kas_link_test.py          # the Kas_Link over a real aiohttp WebSocket through _proxy (426 / 403 / hello / new / prompt / attach) and the kas/* routes — the gateway's python (aiohttp)

@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.34.1",
+  "version": "0.36.1",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -82,7 +82,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "37c02b419c26360006706f8c768e8792922022f6851d85bc9c73a13c5386a854"
+      "sha256": "c3e38f6bdde93151eb3c5c1208684f883ebd68bbae4156dcb7ffb4d906c9f938"
     },
     {
       "path": "app/app.json",
@@ -102,11 +102,11 @@
     },
     {
       "path": "docs/reference.md",
-      "sha256": "e759cd0557edc7acf281e288d2b84de22120aceaab8f127f68e4be7599c71cf8"
+      "sha256": "0f08c1236a42c7f9d2db1273fddc5ed35df67d807b6c6bf094f52ee0d7730d47"
     },
     {
       "path": "extension/extension.js",
-      "sha256": "01ee7cf7bd5233cdc32bdb521975db505634bac85a4e9a0b41cb1eeb5b9c5b71"
+      "sha256": "eb7abbae97f9ebddf902c57c7e0579015d955f02b633408f1e67230f7b54e31c"
     },
     {
       "path": "extension/media/fox.svg",
@@ -118,11 +118,15 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "9f4edc5d8d7a0f127682c6feeda00fb67f2061fabcf9ea02a0ee4d637ab32348"
+      "sha256": "c8bd5f9e0b381adfbd5be31fd3e6c56438913596b612d033822a0fe803ea9703"
     },
     {
       "path": "hook/__init__.py",
-      "sha256": "aa5c4189766e23c4f9d8f07fb3f52b937490b4dce63b13ddfcef57b956375c51"
+      "sha256": "a4bf9dc6c55bd0d38b38ed9ed7b41d910727d066292b43aa08c6e04ba43bfaf3"
+    },
+    {
+      "path": "hook/checkpoints.py",
+      "sha256": "d9936d14ffed58c28844d3dedf92525f73d901de3f5d63f62e941a4808a801c7"
     },
     {
       "path": "hook/gallery.py",
@@ -191,6 +195,14 @@
     {
       "path": "tests/browse_test.py",
       "sha256": "fbac2523e8248cf1ad717113381646550d8ff86888fb91ec31d1da4b329dfd2d"
+    },
+    {
+      "path": "tests/checkpoints_bridge.test.mjs",
+      "sha256": "4c9dbec533b0fed7c0fa05d74c84c8a8bc21817876b058d406e40473ca79ae21"
+    },
+    {
+      "path": "tests/checkpoints_test.py",
+      "sha256": "64825b10827387f6904f79fc97d80c372820f1a0fd7bdfd8511b3bff99db43cd"
     },
     {
       "path": "tests/chrome_style_test.py",
@@ -293,6 +305,10 @@
       "sha256": "7a8b2fdfb3f5fed809c2c34d32a01b5800ab4737c9df84f5326c3f3090d2cf08"
     },
     {
+      "path": "tests/e2e/probe_spec_start_guard.py",
+      "sha256": "c52d362eb2b6910df0832e766033199ad37763aeb15425da0ae78401db8474da"
+    },
+    {
       "path": "tests/e2e/proxy_harness.py",
       "sha256": "67ec7381db5ee908a0c74912ebcc4fce06cec6f1ea440a3e2e2fb685ab0f34a7"
     },
@@ -322,11 +338,15 @@
     },
     {
       "path": "tests/extension_unit.test.mjs",
-      "sha256": "4cd763f58a7696acdc2e83b7b61e5ba4a56cdd652f11e44e21bf80003bb82cb7"
+      "sha256": "d02ad4e4f8aedca2edded20eb228b612fcc1aa1a3607f27510304a4d4dc6f62d"
     },
     {
       "path": "tests/gallery_test.py",
       "sha256": "eaf03f97f1994665d99f8fc4ebaf409a9d91cd7892b99b66120430cf0b608c3d"
+    },
+    {
+      "path": "tests/gateway_agent.test.mjs",
+      "sha256": "263dec68b83a68856f630f6319b4b71268a85c13641809f3556dc06db190dc07"
     },
     {
       "path": "tests/gitdiff_test.py",
@@ -394,7 +414,7 @@
     },
     {
       "path": "tests/pane_min_test.py",
-      "sha256": "a7415e113136ef7bcfef6f63f1cc66982e20c4ac2c91036044015f17668e6e40"
+      "sha256": "734e0f5eb9239238abb3760ffbca87445c299fb94b4e349feec440253417b96e"
     },
     {
       "path": "tests/preview_highlight.test.mjs",
@@ -451,6 +471,14 @@
     {
       "path": "tests/spec_review.test.mjs",
       "sha256": "4eb1d526d743d25dda7f3915834bb492a129391da48fa7ab3bf8f207f4ec90a4"
+    },
+    {
+      "path": "tests/spec_run_feedback.test.mjs",
+      "sha256": "152ad9b7eaa3c344ca719d867f9ce90e17336e302bcde7d693962271d0167b2a"
+    },
+    {
+      "path": "tests/spec_start_guard.test.mjs",
+      "sha256": "c638796829d5f2c9a1cf9a43879464157d6d59218da01db78d3ce4126af21c24"
     },
     {
       "path": "tests/spec_task_state.test.mjs",

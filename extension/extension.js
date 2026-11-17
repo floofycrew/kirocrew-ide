@@ -74,6 +74,15 @@ async function api(path, init) {
   }
   return body;
 }
+/** A call to this mod's own hook routes (`/apps/floofycrew/mods/kirocrew-ide/api/<route>`); a 409 `unsupported` answer is flagged on the error. */
+async function modApi(route, init) {
+  try {
+    return await api("/apps/floofycrew/mods/" + IDE_TAG + "/api/" + route, init);
+  } catch (error) {
+    if (error && error.body && error.body.unsupported) error.unsupported = true;
+    throw error;
+  }
+}
 
 /** Same directory ignoring a trailing slash and a `/local` prefix (symlinked homes spell one dir two ways). */
 function sameDir(a, b) {
@@ -119,6 +128,27 @@ function ageLabel(ms, now = Date.now()) {
 function cfg(key, fallback) {
   const v = vscode.workspace.getConfiguration("kirocrew").get(key);
   return v === undefined || v === null || v === "" ? fallback : v;
+}
+
+// Agent ids the gateway never runs: KAS's bundled modes (KiroCrew's
+// KAS_RESERVED_AGENT_IDS). They reached gateway sessions through the retired
+// kiro-spec-plan handles (`~/.kiro/agents/spec.json`) and still live on in old
+// slots, `kirocrew.agent` / `kirocrew.specAgent` settings and restored tabs; once
+// the handle files are gone the gateway answers "Bot 'spec' is unavailable;
+// restore it or choose a member". The modes run on Kiro's engine (kas tabs),
+// never as a gateway agent, so every place that hands an agent id to the
+// gateway goes through gatewayAgent(), which maps a reserved id to the crew
+// default ("").
+const GATEWAY_RESERVED_AGENT_IDS = new Set(["default", "vibe", "spec", "quick-spec", "bug-fix", "plan", "autonomous"]);
+function gatewayAgent(agent) {
+  const id = String(agent || "").trim();
+  return GATEWAY_RESERVED_AGENT_IDS.has(id) ? "" : id;
+}
+/** The gateway's answer when a session's recorded agent no longer resolves (turn_context.unavailable_agent_message). */
+const UNAVAILABLE_AGENT_RE = /Bot '([^']+)' is unavailable; restore it or choose a member/;
+function unavailableAgentOf(text) {
+  const m = UNAVAILABLE_AGENT_RE.exec(String(text || ""));
+  return m ? m[1] : "";
 }
 
 // ------------------------------------------------------------- live feed
@@ -243,6 +273,7 @@ class Sessions {
     const name = IDE_TAG + "-" + (kind || "chat") + "-" + stamp;
     const json = { name, memory_mode: "persistent", mode: "" };
     if (this.folderId) json.folder_id = this.folderId;
+    agent = gatewayAgent(agent);
     if (agent) json.agent = agent;
     const created = await api("/chat/slots", { method: "POST", json });
     const key = (created && (created.key || created.slot || (created.slot && created.slot.key))) || name;
@@ -299,7 +330,7 @@ class Sessions {
   }
   setModel(key, model) { return api("/chat/slots/" + encodeURIComponent(key) + "/model", { method: "POST", json: { model: model || "" } }); }
   setEffort(key, effort) { return api("/chat/slots/" + encodeURIComponent(key) + "/reasoning-effort", { method: "POST", json: { reasoning_effort: effort || "" } }); }
-  setSlotAgent(key, agent) { return api("/chat/slots/" + encodeURIComponent(key) + "/agent", { method: "POST", json: { agent: agent || "" } }); }
+  setSlotAgent(key, agent) { return api("/chat/slots/" + encodeURIComponent(key) + "/agent", { method: "POST", json: { agent: gatewayAgent(agent) } }); }
   /** Autopilot: the host's slot-scoped trust — every tool of this session is approved without asking. */
   setTrust(key, on) { return api("/chat/mode", { method: "POST", json: { mode: on ? "trust" : "normal", slot: key } }); }
   /** Silent background context, prepended by the host to the next user turn (never shown in the transcript). */
@@ -404,8 +435,9 @@ class ChatView {
     this.view = null;
     this.tabs = [];          // [{ id, key|null, title, settings }]
     this.active = null;      // tab id
-    this.agent = cfg("agent", "");
+    this.agent = gatewayAgent(cfg("agent", ""));
     this.nextId = 1;
+    this.dispatchSeq = 0;    // local ids of the bubbles dispatch() draws ahead of the session ("d<n>")
     this.lastSettings = null; // a new tab inherits the previous tab's picks
     this.kas = null;          // the KasLink of this workspace (Kiro-mode tabs), opened on first use
     this.kasSpecListeners = new Set(); // spec machinery listening for specEvent frames (task state)
@@ -416,7 +448,11 @@ class ChatView {
   storageKey() { return "kirocrew.tabs:" + (this.sessions.projectPath() || "-"); }
   /** Per-tab composer picks: agent, model, reasoning effort, workflow mode, Autopilot; `engine` is "kas" for a Kiro-mode pick. */
   defaultSettings() {
-    return Object.assign({ agent: this.agent || "", model: "", effort: "", mode: "default", autopilot: false, engine: "" }, this.lastSettings || {});
+    const s = Object.assign({ agent: this.agent || "", model: "", effort: "", mode: "default", autopilot: false, engine: "" }, this.lastSettings || {});
+    // A reserved mode id inherited from an old tab must not become the next gateway session's agent.
+    s.agent = gatewayAgent(s.agent);
+    if (s.baseAgent !== undefined) s.baseAgent = gatewayAgent(s.baseAgent);
+    return s;
   }
   /**
    * The tabs as they were when the window closed, and the one that was in front.
@@ -688,7 +724,7 @@ class ChatView {
       t.key = key;
       const slot = this.sessions.slot(key);
       t.title = (slot && (slot.title || slot.label)) || key;
-      if (slot && slot.agent && slot.agent !== "default") t.settings.agent = slot.agent;
+      if (slot && gatewayAgent(slot.agent)) t.settings.agent = gatewayAgent(slot.agent);
     }
     this.select(t.id);
     await this.load(t);
@@ -707,11 +743,13 @@ class ChatView {
    * fresh Kas_Tab attached with `since: 0`, so the hook replays everything it
    * holds (or `session/load`s the session into a new kiro-cli child).
    */
-  async openKas(sessionId, { mode, title, select = true } = {}) {
+  async openKas(sessionId, { mode, title, select = true, adopt = null } = {}) {
     const key = "kas:" + sessionId;
     let t = this.tabForKey(key);
     if (!t) {
-      const draft = this.tabs.find((x) => !x.key && x.id === this.active) || null;
+      // `adopt` is the tab a spec action prepared (beginSpecRun) so its starting row and
+      // working foxes carry over into this session's tab; otherwise the selected draft.
+      const draft = (adopt && !adopt.key && this.tabs.includes(adopt) ? adopt : null) || this.tabs.find((x) => !x.key && x.id === this.active) || null;
       t = draft || this.newTab(false);
       t.key = key;
       t.kind = "kas";
@@ -804,7 +842,7 @@ class ChatView {
   /** Post the Adapter's messages to the tab's pane; the `_`-prefixed ones update the tab record instead. */
   applyKasMessages(t, messages) {
     let tabsChanged = false;
-    for (const m of messages) {
+    for (let m of messages) {
       if (m.type === "_attached") { tabsChanged = true; if (m.title && !t.renamed && (t.title === "New chat" || /^Kiro /.test(t.title))) t.title = String(m.title).slice(0, 60); continue; }
       if (m.type === "_mode") { t.settings.mode = m.mode; tabsChanged = true; continue; }
       if (m.type === "_config") {
@@ -817,6 +855,13 @@ class ChatView {
       }
       if (m.type === "_title") { if (!t.renamed && (t.title === "New chat" || /^Kiro /.test(t.title))) { t.title = String(m.title).slice(0, 60); tabsChanged = true; } continue; }
       if (m.type === "done" || m.type === "row" || m.type === "question" || m.type === "questionResolved") tabsChanged = true;
+      // A spec action on Kiro's engine takes its checkpoint in runKasSpec, before the
+      // invoke; KAS echoes the turn's user message afterwards, and that is the bubble
+      // the Revert action belongs on, so the pending id rides along with it.
+      if (m.type === "user" && t.kas && t.kas.pendingCheckpoint) {
+        m = Object.assign({}, m, { checkpoint: t.kas.pendingCheckpoint });
+        t.kas.pendingCheckpoint = null;
+      }
       this.post(Object.assign({ id: t.id }, m));
       if (m.type === "done") this.noteKasTurnEnd(t);
     }
@@ -827,6 +872,63 @@ class ChatView {
   noteKasTurnEnd(t) {
     if (t.link) this.noteLinkOutcome(t, t.stopped ? "stopped" : "ok");
     t.stopped = false;
+  }
+  // -- workspace checkpoints: "Revert changes" on a turn (hook/checkpoints.py) --------
+  /**
+   * Checkpoint the workspace before a turn runs, like Kiro's per-message
+   * checkpoint: the hook writes a git tree of the working tree through a
+   * temporary index (the user's index and HEAD untouched). Returns the
+   * checkpoint id for the bubble's Revert action, or undefined when the
+   * folder is not a git repository, `kirocrew.checkpoints` is off, or the hook
+   * did not answer (a turn never waits on a failed snapshot; the reason is
+   * logged once per tab).
+   */
+  async checkpointBeforeTurn(t, label) {
+    if (cfg("checkpoints", true) === false) return undefined;
+    const folder = this.sessions.projectPath();
+    if (!folder) return undefined;
+    try {
+      const rec = await modApi("checkpoints/snapshot", { method: "POST", json: { folder, session: t.key || null, turn: (t.turns = (t.turns || 0) + 1), label: String(label || "").slice(0, 120) } });
+      return rec && rec.id ? String(rec.id) : undefined;
+    } catch (error) {
+      if (!t.checkpointNoted) {
+        t.checkpointNoted = true;
+        const why = error && error.unsupported ? "this folder is not a git repository" : (error && error.message) || "the gateway did not answer";
+        log("checkpoint before turn skipped: " + why);
+        if (error && error.unsupported) this.post({ type: "status", id: t.id, text: "Revert changes is unavailable here: " + why + "." });
+      }
+      return undefined;
+    }
+  }
+  /**
+   * Restore the workspace to checkpoint `id` after a modal confirmation that
+   * names what would change; the result lands as a row with Undo (the hook
+   * checkpoints the current state first). `undoOf` marks an undo/redo so the
+   * row reads the other way round and skips the confirmation.
+   */
+  async revertTo(t, id, { undoOf = "" } = {}) {
+    const folder = this.sessions.projectPath();
+    if (!folder) return;
+    try {
+      if (!undoOf) {
+        const preview = await modApi("checkpoints/changed?folder=" + encodeURIComponent(folder) + "&id=" + encodeURIComponent(id));
+        const files = (preview && preview.files) || [];
+        if (!files.length) { this.post({ type: "reverted", id: t.id, files: [], checkpoint: id, root: preview && preview.root }); return; }
+        const sample = files.slice(0, 6).map((f) => "  " + (f.status === "A" ? "remove " : f.status === "D" ? "restore " : "restore ") + f.path).join("\n");
+        const more = files.length > 6 ? "\n  … and " + (files.length - 6) + " more" : "";
+        const pick = await vscode.window.showWarningMessage(
+          "Revert " + files.length + " file" + (files.length === 1 ? "" : "s") + " to how they were before this message?",
+          { modal: true, detail: sample + more + "\n\nFiles created since are removed, edits since are undone. Undo stays available in the chat." },
+          "Revert");
+        if (pick !== "Revert") return;
+      }
+      const result = await modApi("checkpoints/revert", { method: "POST", json: { folder, id } });
+      this.post({ type: "reverted", id: t.id, files: result.files || [], undo: result.undo, undoOf: undoOf || undefined, checkpoint: id, root: result.root });
+      const n = (result.files || []).length;
+      if (n) vscode.window.setStatusBarMessage("KiroCrew: " + (undoOf ? "undo — " : "reverted ") + n + " file" + (n === 1 ? "" : "s"), 5000);
+    } catch (error) {
+      this.post({ type: "reverted", id: t.id, error: (error && error.message) || String(error), checkpoint: id });
+    }
   }
   /**
    * Send from a Kiro-mode tab (requirements 3.2, 3.8): open the link, create
@@ -875,7 +977,8 @@ class ChatView {
       }
     }
     const blocks = kasPromptBlocks(text, contexts, attached);
-    this.post({ type: "user", id: t.id, local: msg.local || undefined, text: msg.display || text.trim() || blocks[blocks.length - 1].text, contexts: contexts.map((c) => contextChipEcho(c)), files: attached.map((a) => ({ name: a.name, path: a.path, image: a.image, data: a.preview })) });
+    const checkpoint = await this.checkpointBeforeTurn(t, msg.display || text);
+    this.post({ type: "user", id: t.id, local: msg.local || undefined, checkpoint, text: msg.display || text.trim() || blocks[blocks.length - 1].text, contexts: contexts.map((c) => contextChipEcho(c)), files: attached.map((a) => ({ name: a.name, path: a.path, image: a.image, data: a.preview })) });
     const accepted = await link.request({ op: "prompt", sessionId: k.sessionId, blocks });
     this.applyKasMessages(t, kasFramesToMessages(accepted, k));
     this.pushTabs();
@@ -917,9 +1020,16 @@ class ChatView {
     this.pushTabs();
   }
   // -- spec actions on Kiro's engine (requirements 5.1–5.3, 5.6, 5.7) -----------
-  /** The engine spec actions run on: "kas" when `kirocrew.specEngine` is kas AND kiro-cli is usable, else "gateway". */
+  /**
+   * The engine spec actions run on: "kas" when `kirocrew.specEngine` is kas, or
+   * when the tab in front is a Kiro-mode tab (the user picked Spec / Quick Spec /
+   * Bug Fix / Plan from the Kiro modes group, so a Specs-view click should run on
+   * that engine too), AND kiro-cli is usable; else "gateway".
+   */
   async specEngine() {
-    if (cfg("specEngine", "gateway") !== "kas") return "gateway";
+    const front = this.tab(this.active);
+    const wanted = cfg("specEngine", "gateway") === "kas" || (front && isKasTab(front));
+    if (!wanted) return "gateway";
     const status = await kasStatus();
     return status && status.available ? "kas" : "gateway";
   }
@@ -963,15 +1073,17 @@ class ChatView {
    * NO run record: Kiro's orchestrator owns resume through its checkpoint, so
    * the mod's resume logic never touches these tabs. Returns the tab.
    */
-  async runKasSpec(op, args, { feature, dir, title, link } = {}) {
+  async runKasSpec(op, args, { feature, dir, title, link, tab } = {}) {
     const root = this.sessions.projectPath();
-    const params = { strategy: op === "createSpec" ? "fresh" : "reuse", workspacePaths: [root] };
+    // Every spec action opens its own chat, so each operation resolves a FRESH KAS
+    // session (Kiro's IDE does the same for executeTask and runAllTasks).
+    const params = { strategy: "fresh", workspacePaths: [root] };
     if (feature && op !== "createSpec") params.featureName = feature;
     const resolved = await this.kasSpec("_kiro/spec/resolveSession", params);
     const sessionId = resolved && resolved.sessionId;
     if (!sessionId) throw new Error("_kiro/spec/resolveSession returned no session");
     await vscode.commands.executeCommand("kirocrew.chat.focus").then(undefined, () => undefined);
-    const t = await this.openKas(sessionId, { mode: "spec", title: title || ("Kiro spec" + (feature ? ": " + feature : "")) });
+    const t = await this.openKas(sessionId, { mode: "spec", title: title || ("Kiro spec" + (feature ? ": " + feature : "")), adopt: tab || null });
     t.kind = "kas";
     t.spec = feature ? specTabRecord({ name: feature, dir: dir && dir.path !== undefined ? dir.path : dir }) : null;
     t.run = null;
@@ -982,6 +1094,10 @@ class ChatView {
     this.saveTabs();
     this.pushTabs();
     if (t.link && taskSessionLinks()) taskSessionLinks().setSession(t.link, sessionId);
+    // The workspace as it is before Kiro's engine writes anything, so this run's message
+    // offers "Revert changes" like every other turn; applyKasMessages puts the id on the
+    // user bubble KAS echoes for the invoke.
+    t.kas.pendingCheckpoint = (await this.checkpointBeforeTurn(t, title || op)) || null;
     await this.kasSpec("_kiro/spec/invoke", Object.assign({ operation: op, sessionId }, args));
     t.kas.running = true;   // the invoke's turn (KAS echoes its user message; turnEnd closes it)
     this.pushTabs();
@@ -1056,6 +1172,8 @@ class ChatView {
         await this.answer(t.key, msg.card, msg.answers || {}, Boolean(msg.dismissed));
       } else if (msg.type === "open") {
         await openPathLink(msg.path, msg.line, msg.column);
+      } else if (msg.type === "revert" && msg.checkpoint) {
+        await this.revertTo(t, String(msg.checkpoint), { undoOf: msg.undoOf ? String(msg.undoOf) : "" });
       } else if (msg.type === "link" && msg.url) {
         await vscode.env.openExternal(vscode.Uri.parse(String(msg.url)));
       } else if (msg.type === "copy") {
@@ -1154,9 +1272,41 @@ class ChatView {
     // The transcript shows what was typed (the chips name the files; a provider's chip keeps
     // its glyph and note, see contextChipEcho); the markers are for the host.
     // `local` names the bubble the page drew at send time, which this message completes.
-    this.post({ type: "user", id: t.id, local: msg.local || undefined, text: msg.display || typed || text, contexts: contexts.map((c) => contextChipEcho(c)), files: attached.map((a) => ({ name: a.name, path: a.path, image: a.image, data: a.data })) });
+    const checkpoint = await this.checkpointBeforeTurn(t, msg.display || typed || text);
+    this.post({ type: "user", id: t.id, local: msg.local || undefined, checkpoint, text: msg.display || typed || text, contexts: contexts.map((c) => contextChipEcho(c)), files: attached.map((a) => ({ name: a.name, path: a.path, image: a.image, data: a.data })) });
     const meta = attached.length ? { files: attached.map((a) => a.path) } : undefined;
-    await this.sessions.send(t.key, text, agent, meta);
+    // The gateway's unavailable-agent refusal can arrive as the turn's streamed error
+    // row; onFrame resends this turn once from here (set before the POST so the row
+    // cannot outrun it).
+    t.retryTurn = { text, agent: gatewayAgent(agent), meta, tried: false };
+    try {
+      await this.sessions.send(t.key, text, agent, meta);
+    } catch (error) {
+      // An old session pinned to an agent the gateway no longer has (a retired
+      // kiro-spec-plan handle such as "spec"): re-pin to the crew default once and resend.
+      if (!(await this.repinUnavailableAgent(t, error && error.message))) throw error;
+      t.retryTurn.tried = true;
+      await this.sessions.send(t.key, text, gatewayAgent(agent), meta);
+    }
+  }
+  /**
+   * The gateway's "Bot 'X' is unavailable; restore it or choose a member" on a
+   * session whose recorded agent is one of KAS's mode ids (left by the retired
+   * kiro-spec-plan handles): re-pin the slot and the tab to the crew default,
+   * tell the transcript once, and answer true so the caller resends. Any other
+   * agent or text answers false. Once per tab, so a second refusal surfaces.
+   */
+  async repinUnavailableAgent(t, text) {
+    const name = unavailableAgentOf(text);
+    if (!name || !GATEWAY_RESERVED_AGENT_IDS.has(name) || !t.key || isKasTab(t)) return false;
+    if (t.repinned) return false;
+    t.repinned = true;
+    t.settings.agent = ""; if (t.settings.baseAgent !== undefined) t.settings.baseAgent = "";
+    if (this.lastSettings && GATEWAY_RESERVED_AGENT_IDS.has(String(this.lastSettings.agent || ""))) this.lastSettings.agent = "";
+    await this.sessions.setSlotAgent(t.key, "").catch(() => undefined);
+    this.saveTabs(); this.pushTabs();
+    this.post({ type: "status", id: t.id, text: "This session was pinned to '" + name + "', a Kiro mode id the gateway cannot run (it came from the retired kiro-spec-plan handles). It now runs on the crew default agent; pick another agent from the picker if you want one. Kiro's own modes run in kiro-cli through the Kiro modes group." });
+    return true;
   }
   /**
    * The steering of one turn: { contexts, note }. `contexts` are the fileMatch
@@ -1220,14 +1370,17 @@ class ChatView {
    * TaskSessionLinks record of a task run: the tab fills in its session id
    * once created and its outcome when the turn ends. Returns the session key.
    */
-  async dispatch(text, { mode, agent, title, kind, display, autopilot, run, spec, contexts, link, engine } = {}) {
-    const t = this.newTab(true);
+  async dispatch(text, { mode, agent, title, kind, display, autopilot, run, spec, contexts, link, engine, tab } = {}) {
+    // `tab` is a tab beginSpecRun already prepared and drew the starting row in, so a
+    // Specs-view click shows the chat working before the engine probe and the session
+    // create; without one the tab is made here, as every other programmatic turn does.
+    const t = tab || this.newTab(true);
     // A spec turn runs on the gateway path unless the caller asks for Kiro's engine
     // (task 7's specEngine); the inherited `engine: "kas"` of the last tab must not decide it.
     t.settings.engine = engine === "kas" ? "kas" : "";
     if (engine === "kas") { t.kind = "kas"; t.kas = kasTabState({ mode: mode || "spec" }); }
     if (mode) t.settings.mode = mode;
-    if (agent) t.settings.agent = agent;
+    if (gatewayAgent(agent)) t.settings.agent = gatewayAgent(agent);
     if (autopilot) t.settings.autopilot = true;
     t.kind = kind || "spec";
     // A task run remembers what it runs, so the host's turn ceiling can be
@@ -1238,8 +1391,50 @@ class ChatView {
     t.pendingTitle = title;
     this.pushTabs();
     const body = typeof text === "function" ? text(null) : text;
-    await this.send(t, { text: body, display, contexts: Array.isArray(contexts) ? contexts.slice() : undefined });
+    const local = this.earlyBubble(t, display || body, contexts);
+    await this.send(t, { text: body, display, local, contexts: Array.isArray(contexts) ? contexts.slice() : undefined });
     return t.key;
+  }
+  /**
+   * The tab a spec action runs in, prepared and on screen BEFORE the slow part
+   * (the engine probe, re-reading the spec, creating the session): a fresh tab,
+   * selected, with a "starting…" row and the working foxes going, so a click in
+   * the Specs view answers at once. The caller passes the tab to `dispatch`
+   * (gateway) or lets `openKas` adopt it (Kiro's engine picks up the selected
+   * keyless tab), so either engine lands in this tab and the row is replaced by
+   * the turn's own bubble.
+   */
+  beginSpecRun({ mode, agent, title, kind, display, autopilot, run, spec, link } = {}) {
+    const t = this.newTab(true);
+    t.settings.engine = "";
+    if (mode) t.settings.mode = mode;
+    if (gatewayAgent(agent)) t.settings.agent = gatewayAgent(agent);
+    if (autopilot) t.settings.autopilot = true;
+    t.kind = kind || "spec";
+    t.run = run ? Object.assign({ resumed: 0 }, run) : null;
+    t.spec = specTabRecord(spec) || (run ? specTabRecord({ name: run.spec, dir: run.dir }) : null);
+    t.link = typeof link === "string" && link ? link : null;
+    t.pendingTitle = title;
+    if (title && !t.renamed) t.title = String(title).slice(0, 40);
+    this.pushTabs();
+    this.post({ type: "starting", id: t.id, text: String(display || title || "Starting") + " — starting…" });
+    return t;
+  }
+  /**
+   * Draw a programmatic turn's bubble (and start the working foxes) NOW, before
+   * the session is created and the picks, steering and contexts go out, each a
+   * round trip: the page draws the turn from the display text under a local id
+   * ("d<n>"), and _send's own 'user' message for the turn completes that bubble
+   * in place, the page's rule for composer sends. Returns the local id to pass
+   * to send(); undefined (nothing drawn) for a Kiro-mode tab or an empty text.
+   */
+  earlyBubble(t, shown, contexts) {
+    const text = String(shown || "");
+    if (isKasTab(t) || !text) return undefined;
+    const local = "d" + (++this.dispatchSeq);
+    const early = Array.isArray(contexts) ? contexts.slice() : [];
+    this.post({ type: "user", id: t.id, local, text, contexts: early.map((c) => contextChipEcho(c)), files: [] });
+    return local;
   }
   /**
    * The tab working on the spec `feature` (its directory `dir` when given, so
@@ -1262,16 +1457,37 @@ class ChatView {
    * specTurnText) on the spec `feature`, the way the title-bar actions, the
    * Specs view and the review comments do: the Spec_Agent (`kirocrew.specAgent`,
    * Spec mode) on the gateway, or Kiro's own engine when `kirocrew.specEngine` is kas,
-   * the spec's own tab when findSpecTab finds one that is idle (the same rule
-   * the resume feature uses) and a fresh Spec tab otherwise, the sibling
-   * documents that exist attached as `#file` contexts through the Send_Path,
-   * and `opts.displayText` (or the kind's short label) as the transcript's
-   * bubble in place of the long request. `opts`: { dir, displayText, title,
-   * idea, task, body, autopilot, run }. Returns { key, reused }.
+   * always in its OWN new chat (a spec action never continues the spec's last
+   * session; the documents it needs travel as contexts), the sibling documents
+   * that exist attached as `#file` contexts through the Send_Path, and
+   * `opts.displayText` (or the kind's short label) as the transcript's bubble in
+   * place of the long request. `opts`: { dir, displayText, title, idea, task,
+   * body, autopilot, run, tab }. Returns { key, reused }.
    */
   async sendSpecTurn(feature, kind, document, opts = {}) {
     const name = String(feature || "");
     const file = specDocumentName(document || "");
+    // The chat answers the click FIRST: focus the view, then draw the starting row and
+    // the working foxes in a fresh tab — before reading the specs, probing the engine
+    // and creating the session, each of which is a round trip the user used to wait
+    // through with nothing on screen.
+    await vscode.commands.executeCommand("kirocrew.chat.focus").then(undefined, () => undefined);
+    const prepared = opts.tab || this.beginSpecRun({
+      mode: "spec", agent: cfg("specAgent", "") || undefined, kind: "spec",
+      title: opts.title || "", display: opts.displayText || opts.title || (name ? "spec " + name : "Spec"),
+      autopilot: Boolean(opts.autopilot), run: opts.run || null,
+    });
+    try {
+      return await this.sendSpecTurnIn(name, kind, file, Object.assign({}, opts, { tab: prepared }));
+    } catch (error) {
+      // Nothing was sent, so the prepared tab has no session: drop it rather than leave
+      // an empty chat with a starting row that will never finish.
+      if (!prepared.key && !opts.tab) this.closeTab(prepared.id);
+      throw error;
+    }
+  }
+  /** `sendSpecTurn`'s body, with the spec named by `name` and the tab already prepared in `opts.tab`. */
+  async sendSpecTurnIn(name, kind, file, opts) {
     const specs = await listSpecs();
     let spec = specs.find((s) => s.name === name && (!opts.dir || sameDir(s.dir.path, opts.dir.path !== undefined ? opts.dir.path : opts.dir))) || null;
     if (!spec && opts.dir && kind === "create") {
@@ -1292,20 +1508,21 @@ class ChatView {
       const viaKas = async () => {
         const docs = ChatView.kasSpecDocuments(spec);
         if (kind === "create") {
-          const t = await this.runKasSpec("createSpec", { userPrompt: String(opts.idea || text) }, { feature: spec.name, dir: spec.dir, title });
+          const t = await this.runKasSpec("createSpec", { userPrompt: String(opts.idea || text) }, { feature: spec.name, dir: spec.dir, title, tab: opts.tab || null });
           return { key: t.key, reused: false, engine: "kas" };
         }
         if (kind === "generate" || kind === "update") {
           const documentType = String(file || "").replace(/\.md$/, "") || "requirements";
-          const t = await this.runKasSpec("generateDocument", { featureName: spec.name, specDocuments: docs.specDocuments, documentType, action: kind === "generate" ? "create" : "update" }, { feature: spec.name, dir: spec.dir, title });
-          return { key: t.key, reused: true, engine: "kas" };
+          const t = await this.runKasSpec("generateDocument", { featureName: spec.name, specDocuments: docs.specDocuments, documentType, action: kind === "generate" ? "create" : "update" }, { feature: spec.name, dir: spec.dir, title, tab: opts.tab || null });
+          return { key: t.key, reused: false, engine: "kas" };
         }
-        const resolved = await this.kasSpec("_kiro/spec/resolveSession", { featureName: spec.name, strategy: "reuse", workspacePaths: [this.sessions.projectPath()] });
+        // A review or fix turn also gets its own chat (strategy "fresh"), like every other spec action.
+        const resolved = await this.kasSpec("_kiro/spec/resolveSession", { featureName: spec.name, strategy: "fresh", workspacePaths: [this.sessions.projectPath()] });
         await vscode.commands.executeCommand("kirocrew.chat.focus").then(undefined, () => undefined);
-        const t = await this.openKas(resolved.sessionId, { mode: "spec", title });
+        const t = await this.openKas(resolved.sessionId, { mode: "spec", title, adopt: opts.tab || null });
         t.spec = specTabRecord({ name: spec.name, dir: spec.dir.path });
         await this.send(t, { text, display, contexts: await specSiblingContexts(spec, file) });
-        return { key: t.key, reused: true, engine: "kas" };
+        return { key: t.key, reused: false, engine: "kas" };
       };
       try {
         const out = await viaKas();
@@ -1320,20 +1537,13 @@ class ChatView {
     }
     const contexts = await specSiblingContexts(spec, file);
     await vscode.commands.executeCommand("kirocrew.chat.focus").then(undefined, () => undefined);
-    const existing = this.findSpecTab(spec.name, spec.dir.path);
-    const slot = existing ? this.sessions.slot(existing.key) : null;
-    if (existing && !(slot && slot.running)) {
-      this.select(existing.id);
-      existing.turnError = ""; existing.stopped = false;
-      existing.link = null; // a phase turn is not the task run whose link the tab carried
-      await this.send(existing, { text, display, contexts });
-      vscode.window.setStatusBarMessage("KiroCrew: " + display + " — in the session of " + spec.name, 5000);
-      return { key: existing.key, reused: true };
-    }
-    if (existing) vscode.window.setStatusBarMessage("KiroCrew: the session of " + spec.name + " is busy; " + display + " starts a new one", 5000);
+    // Every spec action opens its own chat: a phase turn is a fresh session, not a
+    // continuation of whatever the spec's last tab was doing. The documents it needs
+    // travel as contexts, so nothing is lost by starting clean.
     const key = await this.dispatch(text, {
       mode: "spec", agent: cfg("specAgent", "") || undefined, title, kind: "spec", display, contexts,
       autopilot: Boolean(opts.autopilot), run: opts.run || null, spec: { name: spec.name, dir: spec.dir.path },
+      tab: opts.tab || null,
     });
     vscode.window.setStatusBarMessage("KiroCrew: " + display + " — session " + key, 5000);
     return { key, reused: false };
@@ -1530,10 +1740,13 @@ class ChatView {
     try { return links.setOutcome(t.link, outcome); } catch (e) { log("task session link: " + e.message); return null; }
   }
   /**
-   * Resume the run of `spec` from the Specs view or the spec editor: in the
-   * tab that ran it when there is one and it is idle (the orchestrator keeps
-   * its context), else in a fresh Spec tab the way Run all tasks starts one.
-   * Returns "resumed", "running", or "dispatched".
+   * Resume the run of `spec` from the Specs view or the spec editor. Every spec
+   * action opens its own chat, so this starts a fresh run (`dispatch`) that
+   * continues from the ticked boxes in tasks.md rather than typing into the
+   * session that ran before. What it still refuses is a second run of the same
+   * spec while the first is live: that tab is selected and nothing is sent.
+   * Returns "running" or "dispatched". (The automatic mid-run resume, when a
+   * turn is cut, is a different path and stays in its own session.)
    */
   async resumeSpec(spec, dispatch) {
     let t = this.tabs.find((x) => x.key && x.run && x.run.spec === spec.name && (!x.run.dir || sameDir(x.run.dir, spec.dir.path)));
@@ -1543,11 +1756,11 @@ class ChatView {
     }
     if (t) {
       const slot = this.sessions.slot(t.key);
-      this.select(t.id);
-      if (slot && slot.running) { this.post({ type: "status", id: t.id, text: "The run is still going in this session." }); return "running"; }
-      t.turnError = ""; t.stopped = false;
-      await this.resume(t, "button");
-      return "resumed";
+      if (slot && slot.running) {
+        this.select(t.id);
+        this.post({ type: "status", id: t.id, text: "The run is still going in this session." });
+        return "running";
+      }
     }
     await dispatch();
     return "dispatched";
@@ -1605,7 +1818,7 @@ class ChatView {
     this.pushTabs();
   }
   setAgent(agent) {
-    this.agent = agent || "";
+    this.agent = gatewayAgent(agent);
     const t = this.tab(this.active);
     if (t) this.setSetting(t, "agent", this.agent).catch(() => undefined);
   }
@@ -1641,7 +1854,17 @@ class ChatView {
         // failure row (the ceiling card included) is the reason the run check
         // reads once the turn is judged from tasks.md.
         if (row.role === "assistant" && !isErrorRow(row)) t.lastAssistant = row.content || "";
-        if (isErrorRow(row)) this.noteTurnEnd(t, { error: row.content });
+        if (isErrorRow(row)) {
+          // The unavailable-agent refusal streamed as the turn's error row: re-pin once and resend the same turn.
+          const retry = t.retryTurn;
+          if (retry && !retry.tried && unavailableAgentOf(row.content)) {
+            retry.tried = true;
+            this.repinUnavailableAgent(t, row.content).then((ok) => ok && this.sessions.send(t.key, retry.text, retry.agent, retry.meta))
+              .catch((e) => this.post({ type: "error", id, text: "resend: " + e.message }));
+            break;
+          }
+          this.noteTurnEnd(t, { error: row.content });
+        }
         break;
       }
       case "chat_done": this.post({ type: "done", id }); this.noteTurnEnd(t, { done: true }); break;
@@ -3105,6 +3328,13 @@ function chatHtml(foxUri) {
  .empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;opacity:.45;pointer-events:none}
  .empty img{width:72px;height:72px;filter:grayscale(1);opacity:.6}
  .empty div{padding:0 24px;text-align:center;max-width:320px}
+ /* The four workflow tiles of an empty chat (Kiro's empty-chat choices). The empty
+    state itself takes no clicks, so the row re-enables them for itself. */
+ .empty .modes{pointer-events:auto;display:flex;flex-wrap:wrap;gap:6px;justify-content:center;padding:0 16px;max-width:360px}
+ .empty .modes button{border:1px solid var(--vscode-widget-border,var(--vscode-input-border,transparent));background:var(--vscode-editorWidget-background);color:var(--vscode-foreground);border-radius:4px;font-size:12px;padding:5px 10px;cursor:pointer;opacity:.9}
+ .empty .modes button:hover{opacity:1;background:var(--vscode-toolbar-hoverBackground,var(--vscode-button-secondaryHoverBackground))}
+ .empty .modes button.on{border-color:var(--vscode-focusBorder);opacity:1}
+ .row.starting{opacity:.75;font-style:italic}
  /* Message rows follow KiroCrew's own transcript: the user's turn is a bubble
     on the right (its card colour, small radius), the assistant's is bare text
     on the surface, tool/status lines are a quiet mono row with a hairline. */
@@ -3113,6 +3343,15 @@ function chatHtml(foxUri) {
  .row{margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;line-height:1.55;min-width:0}
  .user{align-self:flex-end;width:fit-content;max-width:92%;background:var(--vscode-input-background);color:var(--vscode-input-foreground,inherit);border:1px solid var(--vscode-input-border,var(--vscode-widget-border,transparent));padding:6px 10px;border-radius:6px}
  .user .ctx{display:flex;flex-wrap:wrap;gap:3px;margin-bottom:4px}
+ /* "Revert changes": a small action at the bubble's bottom-right, shown on hover or
+    focus, when the turn has a workspace checkpoint (data-checkpoint). Like Kiro's
+    per-message Revert, it restores the files to how they were before this message. */
+ .user{position:relative}
+ .user .revert{position:absolute;right:4px;bottom:-9px;opacity:0;transition:opacity .12s;border:1px solid var(--vscode-widget-border,transparent);background:var(--vscode-editorWidget-background);color:var(--vscode-foreground);border-radius:4px;font-size:11px;line-height:1;padding:3px 6px;cursor:pointer;white-space:nowrap}
+ .user:hover .revert,.user:focus-within .revert,.user .revert:focus{opacity:.85}.user .revert:hover{opacity:1;background:var(--vscode-toolbar-hoverBackground,var(--vscode-button-secondaryHoverBackground))}
+ .revert-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;opacity:.9}
+ .revert-row button{border:1px solid var(--vscode-widget-border,transparent);background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border-radius:4px;font-size:11px;padding:2px 8px;cursor:pointer}
+ .revert-row button:hover{background:var(--vscode-button-secondaryHoverBackground,var(--vscode-button-secondaryBackground))}
  /* The pinned prompt (KiroCrew's pinned-prompt): while the transcript is
     scrolled past a user turn, that turn stays at the top right as a one-line
     card in the bubble's own colours (three lines on hover, the whole prompt on
@@ -3363,6 +3602,9 @@ function chatHtml(foxUri) {
 document.getElementById('noscript-hint').remove();
 const vscode = acquireVsCodeApi();
 const FOX = ${JSON.stringify(foxUri || "")};
+/* The workflow tiles of an empty chat (item 3): Kiro's four modes, in the order its own
+   picker lists them. The tile resolves to the kiro-cli mode when available (pickMode). */
+const EMPTY_MODES = ${JSON.stringify(WORKFLOWS.filter((w) => w.id !== "default").map((w) => ({ id: w.id, label: w.label, description: w.description })))};
 const $ = (id) => document.getElementById(id);
 const tabsEl = $('tabs'), panes = $('panes'), text = $('text'), menu = $('menu'), chipsEl = $('chips');
 const jump = $('jump'), jumpLabel = jump.querySelector('.jl');
@@ -3378,7 +3620,17 @@ function pane(id){
     const log=document.createElement('div'); log.className='log'; log.dataset.id=id; panes.appendChild(log); log.addEventListener('scroll', ()=>{ pinSchedule(); followUpdate(state.get(id)); }, { passive:true });
     const empty=document.createElement('div'); empty.className='empty';
     if(FOX){const im=document.createElement('img'); im.src=FOX; im.alt=''; empty.appendChild(im);}
-    const tx=document.createElement('div'); tx.textContent='New chat — pick an agent and a workflow below, then say something.'; empty.appendChild(tx); log.appendChild(empty);
+    const tx=document.createElement('div'); tx.textContent='New chat — pick an agent and a workflow below, then say something.'; empty.appendChild(tx);
+    // The four workflows as tiles, the way Kiro's empty chat offers them: a click sets this
+    // tab's pick (Kiro's own mode in kiro-cli when the picker offers it, else the mod's
+    // prompt-guided workflow) and leaves the cursor in the composer.
+    const modes=document.createElement('div'); modes.className='modes';
+    for(const w of EMPTY_MODES){
+      const b=document.createElement('button'); b.type='button'; b.textContent=w.label; b.title=w.description||''; b.dataset.mode=w.id;
+      b.onclick=()=>{ for(const o of modes.querySelectorAll('button')) o.classList.toggle('on', o===b); pickMode(w.id); };
+      modes.appendChild(b);
+    }
+    empty.appendChild(modes); log.appendChild(empty);
     // The working indicator: four foxes (dots without the asset). \`order\` keeps it
     // the last flex item however rows are appended around it.
     const work=document.createElement('div'); work.className='work'+(FOX?'':' nofox'); work.style.order='1'; work.dataset.testid='working'; work.setAttribute('role','status'); work.setAttribute('aria-label','Agent working');
@@ -3982,13 +4234,37 @@ function contextChip(entry, onRemove){
 }
 /* The user's bubble: # context chips, the typed text (markers stripped; the full prompt is kept
    for the pinned card), then the attachment strip. One renderer for a live send and a history row. */
-function userBubble(d, content, contexts, files){
+function userBubble(d, content, contexts, files, checkpoint){
   const { text, items } = attachmentsOf(content, files);
   d.dataset.prompt = String(text||'');
   if(contexts && contexts.length){ const c=document.createElement('div'); c.className='ctx'; contexts.forEach((x)=>{ c.appendChild(contextChip(x, null)); }); d.appendChild(c); }
   if(text) d.appendChild(document.createTextNode(text));
   if(items.length) d.appendChild(attachmentStrip(items));
+  if(checkpoint) revertAction(d, checkpoint);
 }
+/* The bubble's Revert changes action (a workspace checkpoint was taken before this turn):
+   a click asks the extension, which confirms and restores; the answer lands as a row below. */
+function revertAction(d, checkpoint){
+  d.dataset.checkpoint = checkpoint;
+  let b = d.querySelector('.revert');
+  if(!b){ b=document.createElement('button'); b.className='revert'; b.type='button'; d.appendChild(b); }
+  b.textContent='↶ Revert changes'; b.title='Restore the workspace files to how they were before this message';
+  b.onclick=(e)=>{ e.stopPropagation(); vscode.postMessage({type:'revert', id:active, checkpoint}); };
+}
+/* The outcome of a revert (or its undo): one row naming the files put back, with Undo while the
+   "before revert" checkpoint exists, and Open on each file. */
+function revertRow(st, m){
+  const d=el(st,'status revert-row');
+  const files=Array.isArray(m.files)?m.files:[];
+  const head=document.createElement('span');
+  head.textContent = m.error ? ('Revert failed: '+m.error) : files.length===0 ? 'Nothing to revert: the files already match that point.' : ((m.undoOf?'Undo: ':'Reverted: ')+describeFiles(files));
+  d.appendChild(head);
+  if(!m.error && files.length && m.undo){ const u=document.createElement('button'); u.textContent=m.undoOf?'Redo':'Undo'; u.title=(m.undoOf?'Apply the reverted changes again':'Put the changes back'); u.onclick=()=>{ u.disabled=true; vscode.postMessage({type:'revert', id:active, checkpoint:m.undo, undoOf:m.id}); }; d.appendChild(u); }
+  for(const f of files.slice(0,12)){ const s=document.createElement('span'); s.className='file'; s.textContent=(f.status==='A'?'− ':f.status==='D'?'+ ':'~ ')+baseName(f.path); s.title=(f.status==='A'?'removed (created after the checkpoint): ':f.status==='D'?'restored (deleted after the checkpoint): ':'restored: ')+f.path; s.style.cursor='pointer'; s.onclick=()=>vscode.postMessage({type:'open', id:active, path:(m.root?m.root+'/':'')+f.path}); d.appendChild(s); }
+  if(files.length>12){ const more=document.createElement('span'); more.textContent='… '+(files.length-12)+' more'; d.appendChild(more); }
+  scrollLog(st);
+}
+function describeFiles(files){ const n=files.length; return n+' file'+(n===1?'':'s')+' put back'; }
 /* The bubble's attachment strip: a picture per image (thumbnail from its data or fetched), a 📎 chip per other file; each opens the file. */
 function attachmentStrip(items){
   const box=document.createElement('div'); box.className='att';
@@ -4144,6 +4420,8 @@ function interrupted(id, m){
 function isTurnLimit(s){ return /hit the \\S+ limit and was stopped/i.test(String(s||'')); }
 function dropButtons(st){ st.log.querySelectorAll('button.resume').forEach((b)=>b.remove()); }
 function dropResume(st){ dropButtons(st); st.log.querySelectorAll('.row.pause').forEach((p)=>p.remove()); }
+/* The "starting…" row a spec action drew at click time: gone the moment the turn's own bubble lands. */
+function dropStarting(st){ st.log.querySelectorAll('.row.starting').forEach((p)=>p.remove()); }
 function resumeButton(st, d, id, label, title){
   dropButtons(st);
   const b=document.createElement('button'); b.className='resume'; b.textContent=label||'Continue from where it stopped';
@@ -4252,6 +4530,19 @@ document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeMenu(); })
 function setting(key, value){ const st=state.get(active); if(!st) return; st.settings[key]=value; renderCompose(); vscode.postMessage({type:'setting', id:active, key, value}); }
 // The effective pick of a tab, in the picker's own id space (see agentPicks on the extension side).
 function pickId(s){ if(s.engine==='kas') return 'kas:'+(s.mode||'spec'); if(s.mode && s.mode!=='default'){ const kiro=(choices.agents||[]).find(x=>x.kiro && x.id==='agent:'+s.agent); return kiro ? kiro.id : 'workflow:'+s.mode; } return s.agent ? 'agent:'+s.agent : ''; }
+/* An empty chat's workflow tile: Kiro's own mode (kiro-cli) when the picker offers it,
+   else the mod's prompt-guided workflow on the picked agent. Mirrors the agent menu's
+   own derivation so the composer bar updates before the round trip. */
+function pickMode(mode){
+  const st=state.get(active); if(!st) return;
+  const kas=(choices.agents||[]).find((x)=>x.id==='kas:'+mode);
+  const id=kas?kas.id:'workflow:'+mode;
+  if(kas){ if(!st.key) st.settings.engine='kas'; if(!st.key || st.settings.engine==='kas') st.settings.mode=mode; }
+  else { if(!st.key) st.settings.engine=''; st.settings.mode=mode; st.settings.agent=st.settings.baseAgent||''; }
+  renderCompose();
+  vscode.postMessage({type:'setting', id:active, key:'pick', value:id});
+  const box=$('input'); if(box) box.focus();
+}
 function pickLabel(s){ const id=pickId(s); const it=(choices.agents||[]).find(x=>x.id===id); if(it) return it.label + (s.engine==='kas' ? ' · kiro-cli' : ''); if(s.engine==='kas') return (s.mode||'Kiro mode')+' · kiro-cli'; return s.agent || 'Default'; }
 for(const [id,key,header] of [['p-model','model','Model'],['p-effort','effort','Reasoning effort']]){
   $(id).onclick=(e)=>{ const list = key==='model'?choices.models:choices.efforts; const st=state.get(active);
@@ -4401,10 +4692,18 @@ window.addEventListener('message', (e)=>{
     case 'compose.insert': composeInsert(String(m.text||'')); break;
     case 'user': {
       // The turn the page already drew (same local id): fill in what the extension resolved
-      // (file paths for the lightbox's Open file), in place. Anything else is a new row.
+      // (file paths for the lightbox's Open file), in place. Anything else is a new row; one
+      // that carries a local id (a Specs action drawn ahead of its session) is tagged with it
+      // so the extension's later message for the same turn completes it instead of adding one.
       const own = m.local ? st.log.querySelector('.row.user[data-local="'+m.local+'"]') : null;
-      if(own){ own.innerHTML=''; userBubble(own, m.text, m.contexts, m.files); break; }
-      thinkClose(st); dropResume(st); const d=el(st,'user'); userBubble(d, m.text, m.contexts, m.files); st.running=true; setWork(st); scrollLog(st, true); break; }
+      if(own){ dropStarting(st); own.innerHTML=''; userBubble(own, m.text, m.contexts, m.files, m.checkpoint||own.dataset.checkpoint); break; }
+      thinkClose(st); dropResume(st); dropStarting(st); const d=el(st,'user'); if(m.local) d.dataset.local=m.local; userBubble(d, m.text, m.contexts, m.files, m.checkpoint); st.running=true; setWork(st); scrollLog(st, true); break; }
+    case 'starting': { // a spec action's "starting…" row: the chat works from the click, not from the send
+      thinkClose(st); dropResume(st); dropStarting(st); el(st,'status starting', m.text||'Starting…'); st.running=true; setWork(st); scrollLog(st, true); break; }
+    case 'checkpoint': { // the checkpoint of a turn, learned after its bubble was drawn (the snapshot ran meanwhile)
+      const rows=st.log.querySelectorAll('.row.user'); const last=m.local ? st.log.querySelector('.row.user[data-local="'+m.local+'"]') : rows[rows.length-1];
+      if(last && m.checkpoint) revertAction(last, m.checkpoint); break; }
+    case 'reverted': revertRow(st, m); break;
     case 'chunk': if(!st.streaming){st.streaming=el(st,'streaming cursor','');} st.buf+=m.text; st.streaming.textContent=st.buf; setWork(st); scrollLog(st); break;
     case 'segment': finishStream(st); thinkClose(st); break;
     case 'row': thinkClose(st); row(m.id, m.row); break;
@@ -8143,9 +8442,11 @@ async function listSpecs() {
  * is for the actions that want the eye to follow at once (create, rename, delete).
  */
 class SpecsTree {
-  constructor(context, models) {
+  constructor(context, models, starts) {
     this._change = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._change.event;
+    // The start guard (one chat per click): a spec whose start is going shows a spinning row.
+    this.starts = starts || null;
     if (models && typeof models.onDidChange === "function") {
       context.subscriptions.push(models.onDidChange(() => this.refresh()));
     } else {
@@ -8176,9 +8477,12 @@ class SpecsTree {
         // generated rows do not hold it back), else the task tally.
         const needed = specDocumentRows(spec.config, spec.present).find((row) => !row.exists && !row.generated);
         const phase = needed ? "needs " + needed.stem : done + "/" + spec.tasks.length + " tasks";
-        item.description = interrupted ? phase + " · interrupted: " + describeLeft({ partial, queued, remaining: 0 }) : phase;
-        item.tooltip = interrupted ? spec.name + ": a run left " + describeLeft({ partial, queued, remaining: 0 }) + " in tasks.md. ⟳ Resume run continues it in the session that ran it (or a new one)." : undefined;
-        item.iconPath = new vscode.ThemeIcon(interrupted ? "debug-pause" : "notebook");
+        const starting = this.starts ? this.starts.titleFor(spec.dir.path) : null;
+        item.description = starting ? "starting: " + starting.replace(/^spec [^:]*: /, "") + "…"
+          : interrupted ? phase + " · interrupted: " + describeLeft({ partial, queued, remaining: 0 }) : phase;
+        item.tooltip = starting ? spec.name + ": " + starting + " is starting — its chat opens in a moment; another click adds nothing."
+          : interrupted ? spec.name + ": a run left " + describeLeft({ partial, queued, remaining: 0 }) + " in tasks.md. ⟳ Resume run continues it in the session that ran it (or a new one)." : undefined;
+        item.iconPath = new vscode.ThemeIcon(starting ? "loading~spin" : interrupted ? "debug-pause" : "notebook");
         return item;
       });
     }
@@ -8390,6 +8694,93 @@ async function specSiblingContexts(spec, document) {
     out.push({ kind: "file", label: rel, content: "--- " + rel + " ---\n" + clip(text, CONTEXT_BUDGET), paths: [uri.path] });
   }
   return out;
+}
+
+// ------------------------------------------------- one start per click
+//
+// Between a click on a Specs action (Run all tasks, Generate design, …) and the
+// chat it opens sit several round trips: focusing the chat view (resolving the
+// webview when the side bar was hidden), the engine probe, re-reading the spec,
+// creating the session, applying the picks, the steering scan, the context
+// injections, and on Kiro's engine the session resolve. For a few seconds
+// nothing visible happens, and a second click starts a second chat. The guard
+// below holds one start per spec (keyed by the spec's directory; SPEC_START_ANY
+// when the spec is not known at the click, e.g. a palette invocation that will
+// ask) and answers a click during that window with the start already going
+// instead of a new one. `onChange` lets the Specs view spin the row; `progress`
+// wraps the work in the host's progress UI; `onDuplicate` tells the user.
+
+const SPEC_START_ANY = "*";
+const SPEC_START_NEW = "new-spec"; // the ＋ wizard: one at a time, not tied to a directory
+
+class SpecStartGuard {
+  constructor({ onChange, onDuplicate, progress } = {}) {
+    this.inFlight = new Map(); // key -> { key, title, promise }
+    this.onChange = typeof onChange === "function" ? onChange : () => undefined;
+    this.onDuplicate = typeof onDuplicate === "function" ? onDuplicate : () => undefined;
+    this.progress = typeof progress === "function" ? progress : null;
+  }
+  /** The start a click keyed `key` collides with: its own spec's, the unkeyed one, or any when the click is unkeyed. */
+  held(key) {
+    if (this.inFlight.has(key)) return this.inFlight.get(key);
+    if (this.inFlight.has(SPEC_START_ANY)) return this.inFlight.get(SPEC_START_ANY);
+    if (key === SPEC_START_ANY && this.inFlight.size) return this.inFlight.values().next().value;
+    return null;
+  }
+  /** The title of the start going on for the spec directory `dirPath` (exact key; the Specs view's row), else null. */
+  titleFor(dirPath) {
+    const entry = this.inFlight.get(dirPath);
+    return entry ? entry.title : null;
+  }
+  get size() { return this.inFlight.size; }
+  /**
+   * Move a start held under `from` (the unkeyed SPEC_START_ANY of a palette
+   * click) under `to` (the spec's directory once the handler has resolved it),
+   * so the Specs view can spin that row. No-op when nothing is held under
+   * `from` or `to` is already held.
+   */
+  rekey(from, to) {
+    const entry = this.inFlight.get(from);
+    if (!entry || from === to || this.inFlight.has(to)) return false;
+    this.inFlight.delete(from);
+    entry.key = to;
+    this.inFlight.set(to, entry);
+    this.onChange();
+    return true;
+  }
+  /**
+   * Run `work` as the start `title` under `key`. A click that collides with a
+   * start still going gets that start's promise (and `onDuplicate(heldTitle,
+   * title)`), so it adds nothing. The hold ends when `work` settles, however it
+   * settles.
+   */
+  run(key, title, work) {
+    const held = this.held(key);
+    if (held) { this.onDuplicate(held.title, title); return held.promise; }
+    const entry = { key, title, promise: null };
+    this.inFlight.set(key, entry);
+    this.onChange();
+    entry.promise = (async () => {
+      try {
+        return await (this.progress ? this.progress(title, work) : work());
+      } finally {
+        if (this.inFlight.get(entry.key) === entry) this.inFlight.delete(entry.key);
+        this.onChange();
+      }
+    })();
+    return entry.promise;
+  }
+}
+
+/** The guard key for what a spec command was invoked on: the spec's directory when the argument names one, else SPEC_START_ANY. */
+function specStartKey(arg) {
+  if (!arg) return SPEC_START_ANY;
+  if (arg.spec && arg.spec.dir && arg.spec.dir.path !== undefined) return arg.spec.dir.path;
+  if (arg.dir && arg.dir.path !== undefined) return arg.dir.path;
+  if (typeof arg.dir === "string" && arg.dir) return arg.dir;
+  const path = arg.path !== undefined && arg.scheme ? arg.path : arg.uri && arg.uri.path !== undefined ? arg.uri.path : arg.fsPath;
+  const dir = specDirOf(path);
+  return dir || SPEC_START_ANY;
 }
 
 /** The `{ name, dir }` record a tab keeps of the spec it works on (null for anything else). */
@@ -8617,7 +9008,7 @@ function liveSettings(slot) {
   if (slot.model !== undefined && slot.model !== null) live.model = slot.model || "";
   if (slot.reasoning_effort !== undefined && slot.reasoning_effort !== null) live.effort = slot.reasoning_effort || "";
   if (slot.trust !== undefined && slot.trust !== null) live.autopilot = Boolean(slot.trust);
-  if (slot.agent && slot.agent !== "default") live.agent = slot.agent;
+  if (gatewayAgent(slot.agent)) live.agent = gatewayAgent(slot.agent);
   return live;
 }
 
@@ -10308,7 +10699,10 @@ class SpecEditorProvider {
     const dir = uri.with({ path: specDirOf(uri.path) || uri.path.replace(/\/[^/]+$/, "") });
     let result;
     try {
-      result = await this.chat.sendSpecTurn(feature, "review", file, { dir, body: turn.text, displayText: turn.displayText });
+      const send = () => this.chat.sendSpecTurn(feature, "review", file, { dir, body: turn.text, displayText: turn.displayText });
+      // One start per click (SpecStartGuard, when the chat carries one): a second Send
+      // while the first is still opening its chat adds nothing.
+      result = this.chat.specStarts ? await this.chat.specStarts.run(dir.path, "Send review comments", send) : await send();
     } catch (error) {
       void vscode.window.showErrorMessage("KiroCrew: send review comments on " + file + ": " + (error && error.message ? error.message : String(error)));
       return null;
@@ -10531,7 +10925,19 @@ function activate(context) {
   // providers read; its watcher on .kiro/specs/** invalidates it and fires onDidChange —
   // the one change source the Specs view refreshes from too.
   specModels = new SpecModelStore(context);
-  const specsTree = new SpecsTree(context, specModels);
+  // One spec chat per click: a start (Run all tasks, a phase, a review, a resume…) holds
+  // its spec until its chat is away; the Specs view spins the row, the host's progress
+  // toast shows the title, and a click during the hold is told so and adds nothing.
+  let specsTree = null;
+  const specStarts = new SpecStartGuard({
+    onChange: () => { if (specsTree) specsTree.refresh(); },
+    onDuplicate: (held) => vscode.window.setStatusBarMessage("KiroCrew: " + held + " is still starting — its chat opens in a moment; the second click was ignored", 6000),
+    progress: (title, work) => vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "KiroCrew: starting " + title + "…", cancellable: false }, () => work()),
+  });
+  /** Run `work` as the start `title` of whatever `arg` names (a Specs node, a document Uri, nothing). */
+  const startSpec = (arg, title, work) => specStarts.run(specStartKey(arg), title, work);
+  specsTree = new SpecsTree(context, specModels, specStarts);
+  chat.specStarts = specStarts; // the spec editor's Send goes through the same guard
   // Which session ran which task (kirocrew.taskSessionLinks): written by runTasks and the
   // chat's turn ends, read by "View session" and the task states.
   taskLinks = new TaskSessionLinks(context);
@@ -10613,8 +11019,8 @@ function activate(context) {
     vscode.commands.registerCommand("kirocrew.spec.previousDocument", (uri) => stepSpecDocument(uri, -1, specEditors)),
     // "Next document" opens the next document when it has content and has the Spec_Agent
     // generate it otherwise; "Sync with project files" sends the update turn for this one.
-    vscode.commands.registerCommand("kirocrew.spec.nextDocument", (uri) => nextSpecDocument(uri, specEditors, chat)),
-    vscode.commands.registerCommand("kirocrew.spec.syncDocument", (uri) => syncSpecDocument(uri, specEditors, chat)),
+    vscode.commands.registerCommand("kirocrew.spec.nextDocument", (uri) => startSpec(uri, "Next document", () => nextSpecDocument(uri, specEditors, chat))),
+    vscode.commands.registerCommand("kirocrew.spec.syncDocument", (uri) => startSpec(uri, "Sync with project files", () => syncSpecDocument(uri, specEditors, chat))),
   );
   markSpecEditor(vscode.window.activeTextEditor);
   log(`bridge ${context.extension && context.extension.packageJSON ? context.extension.packageJSON.version : "?"} activated`);
@@ -10696,6 +11102,12 @@ function activate(context) {
   };
 
   const specOf = async (node) => {
+    const spec = await pickSpec(node);
+    // A palette click held the unkeyed start; now that the spec is known, the hold is its row's.
+    if (spec && spec.dir && spec.dir.path !== undefined) specStarts.rekey(SPEC_START_ANY, spec.dir.path);
+    return spec;
+  };
+  const pickSpec = async (node) => {
     if (node && node.spec) return node.spec;
     const specs = await listSpecs();
     if (!specs.length) throw new Error("no specs in this workspace");
@@ -10725,6 +11137,26 @@ function activate(context) {
     vscode.commands.registerCommand("kirocrew.openSession", async (key) => { await vscode.commands.executeCommand("kirocrew.chat.focus"); await chat.open(key); }),
     vscode.commands.registerCommand("kirocrew.openInDashboard", (key) => vscode.env.openExternal(vscode.Uri.parse(ORIGIN + "/chat/" + encodeURIComponent(typeof key === "string" ? key : chat.key || "")))),
     vscode.commands.registerCommand("kirocrew.stopSession", (key) => sessions.stop(typeof key === "string" ? key : chat.key).catch((e) => vscode.window.showErrorMessage(e.message))),
+    vscode.commands.registerCommand("kirocrew.checkpoints.revert", async () => {
+      // The palette's way to the same restore: every checkpoint of this folder's repository, newest first.
+      const folder = chat.sessions.projectPath();
+      if (!folder) { vscode.window.showErrorMessage("KiroCrew: open a folder first."); return; }
+      let listed;
+      try { listed = await modApi("checkpoints?folder=" + encodeURIComponent(folder)); } catch (error) {
+        vscode.window.showErrorMessage("KiroCrew: " + (error && error.unsupported ? "this folder is not a git repository, so it has no checkpoints." : (error && error.message) || String(error)));
+        return;
+      }
+      const rows = ((listed && listed.checkpoints) || []).slice().reverse();
+      if (!rows.length) { vscode.window.showInformationMessage("KiroCrew: no checkpoints yet. One is taken before every chat turn."); return; }
+      const pick = await vscode.window.showQuickPick(rows.map((r) => ({
+        label: (r.kind === "before-revert" ? "$(discard) " : "$(comment) ") + (r.label || (r.kind === "before-revert" ? "before a revert" : "turn " + (r.turn || "?"))),
+        description: ageLabel(Number(r.time) * 1000) + (r.session ? " · " + String(r.session).replace(/^dashboard_/, "") : ""),
+        detail: r.id, id: r.id,
+      })), { placeHolder: "Restore the workspace to how it was at…", matchOnDescription: true, matchOnDetail: true });
+      if (!pick) return;
+      const t = chat.tab(chat.active) || chat.newTab(true);
+      await chat.revertTo(t, pick.id);
+    }),
     vscode.commands.registerCommand("kirocrew.history", async () => {
       const [, kasDoc] = await Promise.all([sessions.refresh().catch(() => undefined), api(KAS_SESSIONS_ROUTE).catch(() => null)]);
       const rows = sessions.history();
@@ -10794,38 +11226,38 @@ function activate(context) {
     }),
     // ＋ in the Specs view: idea → workflow type → spec type → directory + .config.kiro →
     // create turn on the Spec_Agent with the idea as the tab title (createSpecFromIdea).
-    vscode.commands.registerCommand("kirocrew.spec.new", () => createSpecFromIdea(chat, specsTree)),
+    vscode.commands.registerCommand("kirocrew.spec.new", () => startSpec({ dir: SPEC_START_NEW }, "New spec", () => createSpecFromIdea(chat, specsTree))),
     // Spec row actions: Rename (validated input box, directory moved) and Delete (modal
     // confirmation naming the directory, recursive). Both refresh the tree themselves.
     vscode.commands.registerCommand("kirocrew.spec.rename", async (node) => renameSpec(await specOf(node), specsTree)),
     vscode.commands.registerCommand("kirocrew.spec.delete", async (node) => deleteSpec(await specOf(node), specsTree)),
-    vscode.commands.registerCommand("kirocrew.spec.requirements", async (node) => {
+    vscode.commands.registerCommand("kirocrew.spec.requirements", (node) => startSpec(node, "Write requirements", async () => {
       const spec = await specOf(node);
       const idea = spec.present["requirements.md"] ? "" : await vscode.window.showInputBox({ prompt: "What should this feature do?" });
       if (idea === undefined) return;
       await dispatch(spec, phasePrompt("requirements", spec, idea), "spec", "spec " + spec.name + ": requirements");
-    }),
+    })),
     // The bugfix spec's first document (its "requirements"); the view's missing bugfix row runs this.
-    vscode.commands.registerCommand("kirocrew.spec.bugfix", async (node) => {
+    vscode.commands.registerCommand("kirocrew.spec.bugfix", (node) => startSpec(node, "Write bugfix", async () => {
       const spec = await specOf(node);
       const idea = spec.present["bugfix.md"] ? "" : await vscode.window.showInputBox({ prompt: "What is the bug? (what happens, what should happen)" });
       if (idea === undefined) return;
       await dispatch(spec, phasePrompt("bugfix", spec, idea), "spec", "spec " + spec.name + ": bugfix");
-    }),
-    vscode.commands.registerCommand("kirocrew.spec.design", async (node) => {
+    })),
+    vscode.commands.registerCommand("kirocrew.spec.design", (node) => startSpec(node, "Write design", async () => {
       const spec = await specOf(node);
       const req = requirementsFileOf(spec.config);
       if (!spec.present[req]) return vscode.window.showWarningMessage("Write " + req.replace(/\.md$/, "") + " first — the design is derived from it.");
       await dispatch(spec, phasePrompt("design", spec), "spec", "spec " + spec.name + ": design");
-    }),
-    vscode.commands.registerCommand("kirocrew.spec.tasks", async (node) => {
+    })),
+    vscode.commands.registerCommand("kirocrew.spec.tasks", (node) => startSpec(node, "Write tasks", async () => {
       const spec = await specOf(node);
       if (!spec.present["design.md"]) return vscode.window.showWarningMessage("Write the design first — tasks are derived from it.");
       await dispatch(spec, phasePrompt("tasks", spec), "spec", "spec " + spec.name + ": tasks");
-    }),
+    })),
     // Analyze requirements (requirement 5.1): Kiro's own `analyzeRequirements` on its engine; on the
     // gateway, the mod's read-only review of the requirements document.
-    vscode.commands.registerCommand("kirocrew.spec.analyze", async (node) => {
+    vscode.commands.registerCommand("kirocrew.spec.analyze", (node) => startSpec(node, "Analyze requirements", async () => {
       const spec = await specOf(node);
       const reqFile = requirementsFileOf(spec.config);
       if (!spec.present[reqFile]) return vscode.window.showWarningMessage("Write the requirements first — there is nothing to analyze.");
@@ -10834,8 +11266,8 @@ function activate(context) {
       await chat.specAction(
         () => chat.runKasSpec("analyzeRequirements", { featureName: spec.name, specDocuments: docs.specDocuments }, { feature: spec.name, dir: spec.dir, title: "Analyze requirements: " + spec.name }),
         () => dispatch(spec, "Analyze the requirements of the spec `" + spec.name + "` (" + spec.dir.path + "/" + reqFile + "). For each acceptance criterion check: EARS form (WHEN/IF … THEN the system SHALL …), testability, ambiguity, overlap with other criteria, and gaps against the introduction and user stories. Report the findings as a numbered list with the criterion quoted and a suggested rewording where one is needed. Do not edit any file.", "spec", title));
-    }),
-    vscode.commands.registerCommand("kirocrew.spec.runTask", async (node) => {
+    })),
+    vscode.commands.registerCommand("kirocrew.spec.runTask", (node) => startSpec(node, "Start task", async () => {
       if (!node || !node.task) return vscode.window.showWarningMessage("Pick a task in the Specs view.");
       let spec = node.spec;
       if (!spec.taskTree) spec = (await listSpecs()).find((s) => s.name === spec.name && sameDir(s.dir.path, spec.dir.path)) || spec;
@@ -10843,12 +11275,12 @@ function activate(context) {
       const text = task ? task.text : (node.task.number ? node.task.number + " " : "") + node.task.title;
       const taskId = task ? task.id : (typeof node.task.id === "string" && node.task.id) || text;
       await runTasks(spec, (kiro) => (kiro && task ? kiroTaskRequest(spec, task) : taskPrompt(spec, node.task)), "Execute Task: " + text, "task", task ? { spec: spec.name, dir: spec.dir.path, task: task.id, optional: false, display: "Execute Task: " + text } : null, [taskId]);
-    }),
+    })),
     // Run all also comes from tasks.md's title bar (a Uri) and its keybinding (no argument,
     // the active editor); `runNodeOf` turns those into the view's node, else specOf asks.
-    vscode.commands.registerCommand("kirocrew.spec.runAll", async (node) => runAllOf(await runNodeOf(node), false)),
-    vscode.commands.registerCommand("kirocrew.spec.runAllOptional", async (node) => runAllOf(await runNodeOf(node), true)),
-    vscode.commands.registerCommand("kirocrew.spec.resume", (node) => resumeOf(node)),
+    vscode.commands.registerCommand("kirocrew.spec.runAll", (node) => startSpec(node, "Run all tasks", async () => runAllOf(await runNodeOf(node), false))),
+    vscode.commands.registerCommand("kirocrew.spec.runAllOptional", (node) => startSpec(node, "Run all tasks", async () => runAllOf(await runNodeOf(node), true))),
+    vscode.commands.registerCommand("kirocrew.spec.resume", (node) => startSpec(node, "Resume run", () => resumeOf(node))),
     vscode.commands.registerCommand("kirocrew.spec.viewSession", (arg) => viewSessionOf(arg)),
     // The task lenses (requirement 4.1): the links store decides failed / aborted and "View
     // session"; a session counts as running while its slot's turn is going.
@@ -10862,7 +11294,7 @@ function activate(context) {
     vscode.window.onDidChangeVisibleTextEditors(() => taskDecorations.applyAll()),
     vscode.window.onDidChangeActiveTextEditor((editor) => taskDecorations.apply(editor)),
     vscode.workspace.onDidChangeTextDocument((e) => taskDecorations.onDocument(e.document)),
-    vscode.commands.registerCommand("kirocrew.spec.fixTask", (arg) => fixTaskOf(arg)),
+    vscode.commands.registerCommand("kirocrew.spec.fixTask", (arg) => startSpec(arg, "Ask the agent to fix", () => fixTaskOf(arg))),
     vscode.commands.registerCommand("kirocrew.spec.makeRequired", (arg) => makeTaskRequired(arg)),
     // Requirement hovers on `_Requirements: …_` lines of every spec document (requirement 6.1) and
     // property hovers on `Property N` references and `Validates:` lines (requirement 6.2); the
@@ -11015,6 +11447,12 @@ function activate(context) {
    */
   async function runTasks(spec, text, display, kind, run, taskIds) {
     await vscode.commands.executeCommand("kirocrew.chat.focus");
+    // The chat shows this run starting before the engine probe and the session create,
+    // in the tab both engines then land in (dispatch takes it; openKas adopts it).
+    const prepared = chat.beginSpecRun({
+      mode: "spec", agent: cfg("specAgent", "") || undefined, kind, title: display, display,
+      autopilot: cfg("specAutopilot", true) !== false, run: run || null, spec: { name: spec.name, dir: spec.dir },
+    });
     const engine = await chat.specEngine();
     const links = taskSessionLinks();
     const link = links ? links.record({ feature: spec.name, dir: spec.dir.path, taskIds: Array.isArray(taskIds) ? taskIds : [], sessionId: null, startedAt: Date.now(), engine: engine === "kas" ? "kas" : undefined }) : null;
@@ -11029,13 +11467,15 @@ function activate(context) {
         const args = op === "executeTask"
           ? { featureName: spec.name, specDocuments: docs.specDocuments, tasksFilePath: docs.tasksFilePath, taskId: run.task }
           : { featureName: spec.name, specDocuments: docs.specDocuments, tasksFilePath: docs.tasksFilePath, makeAllRequired: Boolean(run && run.optional) };
-        const t = await chat.runKasSpec(op, args, { feature: spec.name, dir: spec.dir, title: display, link: link ? link.id : null });
+        const t = await chat.runKasSpec(op, args, { feature: spec.name, dir: spec.dir, title: display, link: link ? link.id : null, tab: prepared });
         return t.key;
       };
-      const viaGateway = () => chat.dispatch(text, { mode: "spec", agent: cfg("specAgent", "") || undefined, title: display, kind, display, autopilot: cfg("specAutopilot", true) !== false, run: run || null, spec: { name: spec.name, dir: spec.dir }, link: link ? link.id : null });
+      const viaGateway = () => chat.dispatch(text, { mode: "spec", agent: cfg("specAgent", "") || undefined, title: display, kind, display, autopilot: cfg("specAutopilot", true) !== false, run: run || null, spec: { name: spec.name, dir: spec.dir }, link: link ? link.id : null, tab: prepared });
       key = run ? await chat.specAction(viaKas, viaGateway) : await viaGateway();
     } catch (error) {
       if (link) links.setOutcome(link.id, "error");
+      // Nothing ran in the prepared tab: drop it rather than leave a chat that never starts.
+      if (!prepared.key) chat.closeTab(prepared.id);
       throw error;
     }
     vscode.window.setStatusBarMessage("KiroCrew: " + display + " — session " + key, 5000);
@@ -11045,4 +11485,4 @@ function activate(context) {
 
 module.exports = { activate, deactivate() {} };
 // Pure helpers, exposed for `tests/extension_unit.test.mjs` (never used by the host).
-module.exports.__test = { kasHistoryItems, KAS_SESSIONS_ROUTE, mergeKasTaskState, kasFeatureOfPath, resolveKasViewSession, KasTaskStore, KAS_TASK_POLL_MS, KAS_WS_PATH, KAS_MODES, KAS_SECTION, KAS_TAB_NOTICE, kasStatus, invalidateKasStatus, kasPicks, isKasTab, kasTabState, kasTabRecord, kasPromptBlocks, kasContentText, kasToolOutput, kasPermissionChoice, kasFramesToMessages, toolInputPreview, KasLink, isErrorRow, isTurnLimitRow, turnLimitOf, resumeRequest, isSpecTab, runState, describeLeft, looksLikeQuestion, listSpecs, imageData, IMAGE_PREVIEW_MAX, RESUME_CHAT_TEXT, RESUME_NOTE, readText, readWholeText, SPEC_CONFIG_FILE, WORKFLOW_TYPES, SPEC_TYPES, DEFAULT_WORKFLOW_TYPE, DEFAULT_SPEC_TYPE, DOCUMENT_ORDER, uuid, parseSpecConfig, readSpecConfig, newSpecConfig, serializeSpecConfig, writeSpecConfig, documentOrder, requirementsFileOf, specDocumentRows, SPEC_NAME_PATTERN, SPEC_NAME_MAX, SPEC_NAME_FALLBACK, WORKFLOW_TYPE_PICKS, SPEC_TYPE_PICKS, specNameFromIdea, validateSpecName, existingSpecNames, createSpecFromIdea, specFolderOf, renameSpec, SPEC_DELETE_BUTTON, deleteSpec, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, invalidateSteeringCache, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, taskBlockEnd, findTask, serializeTask, makeAllTasksRequired, parseRequirements, findRequirement, parseProperties, findProperty, correctnessSection, buildSpecModel, loadSpecModel, specDirOf, specFileOf, SpecModelStore, specModelStore, SPEC_MODEL_DEBOUNCE_MS, SPEC_MODEL_FILES, TASK_SESSION_LINKS_KEY, TASK_SESSION_LINKS_MAX, LINK_OUTCOMES, normalizeLink, readLinks, pruneLinks, latestLink, linkMatchesFeature, latestLinkForTask, latestLinkForFeature, findLink, viewSessionTarget, resolveViewSessionLink, TASK_STATES, taskStateLink, taskState, TaskSessionLinks, taskSessionLinks, TASK_LENS_PATTERN, TASK_STATE_LENS_TITLES, TASK_LENS_RETRY, TASK_LENS_FIX, TASK_LENS_VIEW_SESSION, TASK_LENS_MAKE_REQUIRED, taskLensSpecs, optionalMarkRange, SpecTaskCodeLensProvider, TASK_DECORATION_COLORS, TASK_DECORATION_OPTIONAL_OPACITY, TASK_DECORATION_DEBOUNCE_MS, mergeLineRanges, taskDecorationRanges, SpecTaskDecorations, SPEC_CONTEXT_KEYS, SPEC_CONFIG_DIAGNOSTICS, specContextKeyValues, positionAt, specConfigDiagnostic, toVscodeDiagnostic, specDirUri, SpecContextKeys, SpecConfigDiagnostics, SPEC_TASK_DIAGNOSTICS, TASK_FORMAT_RULES, TASK_FORMAT_BOXES, TASK_FORMAT_INDENT, TASK_FORMAT_LINE, TASK_DIAGNOSTICS_DEBOUNCE_MS, taskFormatIssues, toTaskDiagnostic, createDiagnosticCollection, SpecTaskDiagnostics, TASK_FIX_TITLE, TASK_FIX_NUMBER_RULES, taskNumbersOf, fixTaskLine, rangesIntersect, taskFixAction, SpecTaskFixProvider, SPEC_HOVER_PATTERN, REVEAL_REQUIREMENT_COMMAND, requirementRefsAt, requirementRefsAfter, activeRefs, revealRequirementUri, requirementHoverMarkdown, hoverMarkdown, makeHover, requirementHoverResolver, PROPERTY_HOVER_FILE, propertyRefsAt, propertyHoverMarkdown, propertyAtLine, propertyHoverResolver, SpecRequirementHoverProvider, revealRequirement, SPEC_NAV_DOCUMENTS, SPEC_GOTO_COMMAND_PREFIX, SPEC_RESOURCE_WHEN, specDocumentName, specGotoCommand, specNavigationTargets, adjacentSpecDocument, specGotoMenuEntries, specGotoPaletteEntries, specCommandSource, specRunNode, gotoSpecDocument, stepSpecDocument, SPEC_CONTENT_KEY, SPEC_SYNC_WHEN, SPEC_NEXT_WHEN, SPEC_RUN_ALL_WHEN, specDocumentHasContent, nextDocumentDecision, SpecContentKey, specConfigFor, specDocumentState, syncSpecDocument, nextSpecDocument, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, SPEC_TURN_KINDS, specTurnDocument, specSiblings, specTurnText, specTurnDisplay, specTurnTitle, specSiblingContexts, specTabRecord, specTabMatches, normalizeRow, findMatches, markTextNode, pendingApprovalCards, TOOL_CARD_DISPLAY_MODES, DEFAULT_TOOL_CARD_DISPLAY_MODE, toolRowShouldCollapse, findPathLinks, chatHtml, nextTabIndex, tabLabel, TAB_TITLE_MAX, validateTabTitle, sameDir, slotTime, slotActivity, ageLabel, HOOK_FILE_RE, HOOK_TRIGGERS, HOOK_MATCHER_TRIGGERS, HOOK_ACTION_KINDS, hookNameFromPath, parseHookFile, hookRowLabel, hookRowDescription, hookRowIcon, hookContextValue, hookRowTooltip, toggleHookEnabled, HooksTree, toggleHook, HOOK_RUN_COMMAND, HOOK_RUN_CONFIRM, HOOK_RUN_BUTTON, hookRunDisplay, hookTerminalName, hookRunDecision, hookTerminal, runHook, HOOK_TEMPLATE, HOOK_TRIGGER_DESCRIPTIONS, HOOK_FILE_TRIGGERS, HOOK_DEFAULT_FILE_MATCHER, HOOK_FILE_EXT, HOOK_DOCS_URL, HOOK_DOCS_COMMAND, HOOK_VIEW_MESSAGE, HOOK_VIEW_MESSAGE_PLAIN, setHookViewMessage, buildHookFile, serializeHookFile, hookFileName, hookScopePicks, createHookWizard, MCP_CONFIG_FILE, MCP_DOCS_URL, MCP_OPEN_CONFIG_COMMAND, MCP_CONFIG_ABSENT_MESSAGE, parseMcpConfig, mcpUrlHost, mcpRowDescription, mcpRowIcon, mcpRowTooltip, mcpServerLine, McpServersTree, openMcpConfig, STEERING_TEMPLATE, SKILL_TEMPLATE, STEERING_EMPTY_CONTEXT_KEY, STEERING_GENERATE_COMMAND, STEERING_GENERATE_DISPLAY, STEERING_GENERATE_FILES, STEERING_GENERATE_PROMPT, steeringIsEmpty, ensureSteeringDir, generateSteeringDocs, STEERING_REFINE_COMMAND, STEERING_REFINE_PROMPT, isSteeringDocument, steeringNameOf, steeringRefineDisplay, steeringDocLabel, refineSteeringDoc, STEERING_IMPORT_COMMAND, IMPORT_SOURCES, IMPORT_FIND_EXCLUDE, IMPORT_FIND_MAX, importStem, importTargetName, withSteeringFrontMatter, scanImportSources, importSteeringFromAssistants, SKILL_IMPORT_COMMAND, SKILL_FILE, SKILL_IMPORT_ROUTE, SKILL_NAME_RE, parseGithubSkillUrl, skillNameFromText, skillScopePicks, importSkillFolder, importSkillFromGithub, revealSkill, importSkill, AssetTree, mdToHtml, stageOf, specNameOf, continueAction, REVIEW_EXCERPT_MAX, reviewBlockId, reviewExcerpt, buildReviewTurn, SPEC_REVIEW_CONTEXT_KEYS, specEditorHtml, isSpecDocument, SpecEditorProvider, openSpecPreview, specReviewTarget, reviewSpecDocument, markSpecEditor, renderMarkdown, localizeImages, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, CONTEXT_FILE_KINDS, CONTEXT_PROVIDERS, CONTEXT_CAP, PROVIDER_CAP, TERMINAL_TAIL_LINES, TERMINAL_HISTORY_MAX, FOLDER_FILES_MAX, GIT_ABSENT_MESSAGE, byteLength, capText, tailLines, stripAnsi, formatProblems, formatFolder, formatSpec, formatGitDiff, providerEntry, contextChipLabel, contextChipTooltip, contextChipEcho, providerContext, plainDiagnostic, clipboardVia, trackTerminalOutput, resolveProblems, resolveTerminal, resolveGitDiff, resolveFolder, resolveSpec, pickContext, looksBinary, fileContextEntry, fileContext, sendTerminalToChat, EXPLORER_MAX_ITEMS, explorerSelection, addExplorerToChat, EDITOR_ACTION_IDS, EDITOR_ACTION_TITLES, DEFAULT_ACTION_PROMPTS, SELECTION_GLYPH, actionPrompt, fenceFor, buildSelectionContext, selectionInput, selectionContext, runEditorAction, fencedBlock, addCodeBlockToChat, COMMIT_MESSAGE_COMMAND, COMMIT_MESSAGE_SESSION_TITLE, COMMIT_MESSAGE_TIMEOUT_MS, COMMIT_MESSAGE_GIT_ABSENT, COMMIT_MESSAGE_NOTHING, COMMIT_MESSAGE_PROMPT, pickDiff, commitMessagePrompt, cleanCommitMessage, gitRepository, runBackgroundTurn, generateCommitMessage, DIAGNOSTIC_FIX_COMMAND, DIAGNOSTIC_FIX_TITLE, DIAGNOSTIC_TITLE_MAX, DIAGNOSTIC_GLYPH, DIAGNOSTIC_FIX_PROMPT, diagnosticTitle, plainRange, buildDiagnosticFixContext, diagnosticFixAction, AgentFixCodeActionProvider, runDiagnosticFix, clip, ChatView, Sessions, themeFor, STOCK_THEMES, mergeRosters, agentPicks, activate };
+module.exports.__test = { gatewayAgent, GATEWAY_RESERVED_AGENT_IDS, unavailableAgentOf, kasHistoryItems, KAS_SESSIONS_ROUTE, mergeKasTaskState, kasFeatureOfPath, resolveKasViewSession, KasTaskStore, KAS_TASK_POLL_MS, KAS_WS_PATH, KAS_MODES, KAS_SECTION, KAS_TAB_NOTICE, kasStatus, invalidateKasStatus, kasPicks, isKasTab, kasTabState, kasTabRecord, kasPromptBlocks, kasContentText, kasToolOutput, kasPermissionChoice, kasFramesToMessages, toolInputPreview, KasLink, isErrorRow, isTurnLimitRow, turnLimitOf, resumeRequest, isSpecTab, runState, describeLeft, looksLikeQuestion, listSpecs, imageData, IMAGE_PREVIEW_MAX, RESUME_CHAT_TEXT, RESUME_NOTE, readText, readWholeText, SPEC_CONFIG_FILE, WORKFLOW_TYPES, SPEC_TYPES, DEFAULT_WORKFLOW_TYPE, DEFAULT_SPEC_TYPE, DOCUMENT_ORDER, uuid, parseSpecConfig, readSpecConfig, newSpecConfig, serializeSpecConfig, writeSpecConfig, documentOrder, requirementsFileOf, specDocumentRows, SPEC_NAME_PATTERN, SPEC_NAME_MAX, SPEC_NAME_FALLBACK, WORKFLOW_TYPE_PICKS, SPEC_TYPE_PICKS, specNameFromIdea, validateSpecName, existingSpecNames, createSpecFromIdea, specFolderOf, renameSpec, SPEC_DELETE_BUTTON, deleteSpec, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, invalidateSteeringCache, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, taskBlockEnd, findTask, serializeTask, makeAllTasksRequired, parseRequirements, findRequirement, parseProperties, findProperty, correctnessSection, buildSpecModel, loadSpecModel, specDirOf, specFileOf, SpecModelStore, specModelStore, SPEC_MODEL_DEBOUNCE_MS, SPEC_MODEL_FILES, TASK_SESSION_LINKS_KEY, TASK_SESSION_LINKS_MAX, LINK_OUTCOMES, normalizeLink, readLinks, pruneLinks, latestLink, linkMatchesFeature, latestLinkForTask, latestLinkForFeature, findLink, viewSessionTarget, resolveViewSessionLink, TASK_STATES, taskStateLink, taskState, TaskSessionLinks, taskSessionLinks, TASK_LENS_PATTERN, TASK_STATE_LENS_TITLES, TASK_LENS_RETRY, TASK_LENS_FIX, TASK_LENS_VIEW_SESSION, TASK_LENS_MAKE_REQUIRED, taskLensSpecs, optionalMarkRange, SpecTaskCodeLensProvider, TASK_DECORATION_COLORS, TASK_DECORATION_OPTIONAL_OPACITY, TASK_DECORATION_DEBOUNCE_MS, mergeLineRanges, taskDecorationRanges, SpecTaskDecorations, SPEC_CONTEXT_KEYS, SPEC_CONFIG_DIAGNOSTICS, specContextKeyValues, positionAt, specConfigDiagnostic, toVscodeDiagnostic, specDirUri, SpecContextKeys, SpecConfigDiagnostics, SPEC_TASK_DIAGNOSTICS, TASK_FORMAT_RULES, TASK_FORMAT_BOXES, TASK_FORMAT_INDENT, TASK_FORMAT_LINE, TASK_DIAGNOSTICS_DEBOUNCE_MS, taskFormatIssues, toTaskDiagnostic, createDiagnosticCollection, SpecTaskDiagnostics, TASK_FIX_TITLE, TASK_FIX_NUMBER_RULES, taskNumbersOf, fixTaskLine, rangesIntersect, taskFixAction, SpecTaskFixProvider, SPEC_HOVER_PATTERN, REVEAL_REQUIREMENT_COMMAND, requirementRefsAt, requirementRefsAfter, activeRefs, revealRequirementUri, requirementHoverMarkdown, hoverMarkdown, makeHover, requirementHoverResolver, PROPERTY_HOVER_FILE, propertyRefsAt, propertyHoverMarkdown, propertyAtLine, propertyHoverResolver, SpecRequirementHoverProvider, revealRequirement, SPEC_NAV_DOCUMENTS, SPEC_GOTO_COMMAND_PREFIX, SPEC_RESOURCE_WHEN, specDocumentName, specGotoCommand, specNavigationTargets, adjacentSpecDocument, specGotoMenuEntries, specGotoPaletteEntries, specCommandSource, specRunNode, gotoSpecDocument, stepSpecDocument, SPEC_CONTENT_KEY, SPEC_SYNC_WHEN, SPEC_NEXT_WHEN, SPEC_RUN_ALL_WHEN, specDocumentHasContent, nextDocumentDecision, SpecContentKey, specConfigFor, specDocumentState, syncSpecDocument, nextSpecDocument, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, SPEC_TURN_KINDS, specTurnDocument, specSiblings, specTurnText, specTurnDisplay, specTurnTitle, specSiblingContexts, SPEC_START_ANY, SPEC_START_NEW, SpecStartGuard, specStartKey, specTabRecord, specTabMatches, normalizeRow, findMatches, markTextNode, pendingApprovalCards, TOOL_CARD_DISPLAY_MODES, DEFAULT_TOOL_CARD_DISPLAY_MODE, toolRowShouldCollapse, findPathLinks, chatHtml, nextTabIndex, tabLabel, TAB_TITLE_MAX, validateTabTitle, sameDir, slotTime, slotActivity, ageLabel, HOOK_FILE_RE, HOOK_TRIGGERS, HOOK_MATCHER_TRIGGERS, HOOK_ACTION_KINDS, hookNameFromPath, parseHookFile, hookRowLabel, hookRowDescription, hookRowIcon, hookContextValue, hookRowTooltip, toggleHookEnabled, HooksTree, toggleHook, HOOK_RUN_COMMAND, HOOK_RUN_CONFIRM, HOOK_RUN_BUTTON, hookRunDisplay, hookTerminalName, hookRunDecision, hookTerminal, runHook, HOOK_TEMPLATE, HOOK_TRIGGER_DESCRIPTIONS, HOOK_FILE_TRIGGERS, HOOK_DEFAULT_FILE_MATCHER, HOOK_FILE_EXT, HOOK_DOCS_URL, HOOK_DOCS_COMMAND, HOOK_VIEW_MESSAGE, HOOK_VIEW_MESSAGE_PLAIN, setHookViewMessage, buildHookFile, serializeHookFile, hookFileName, hookScopePicks, createHookWizard, MCP_CONFIG_FILE, MCP_DOCS_URL, MCP_OPEN_CONFIG_COMMAND, MCP_CONFIG_ABSENT_MESSAGE, parseMcpConfig, mcpUrlHost, mcpRowDescription, mcpRowIcon, mcpRowTooltip, mcpServerLine, McpServersTree, openMcpConfig, STEERING_TEMPLATE, SKILL_TEMPLATE, STEERING_EMPTY_CONTEXT_KEY, STEERING_GENERATE_COMMAND, STEERING_GENERATE_DISPLAY, STEERING_GENERATE_FILES, STEERING_GENERATE_PROMPT, steeringIsEmpty, ensureSteeringDir, generateSteeringDocs, STEERING_REFINE_COMMAND, STEERING_REFINE_PROMPT, isSteeringDocument, steeringNameOf, steeringRefineDisplay, steeringDocLabel, refineSteeringDoc, STEERING_IMPORT_COMMAND, IMPORT_SOURCES, IMPORT_FIND_EXCLUDE, IMPORT_FIND_MAX, importStem, importTargetName, withSteeringFrontMatter, scanImportSources, importSteeringFromAssistants, SKILL_IMPORT_COMMAND, SKILL_FILE, SKILL_IMPORT_ROUTE, SKILL_NAME_RE, parseGithubSkillUrl, skillNameFromText, skillScopePicks, importSkillFolder, importSkillFromGithub, revealSkill, importSkill, AssetTree, mdToHtml, stageOf, specNameOf, continueAction, REVIEW_EXCERPT_MAX, reviewBlockId, reviewExcerpt, buildReviewTurn, SPEC_REVIEW_CONTEXT_KEYS, specEditorHtml, isSpecDocument, SpecEditorProvider, openSpecPreview, specReviewTarget, reviewSpecDocument, markSpecEditor, renderMarkdown, localizeImages, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, CONTEXT_FILE_KINDS, CONTEXT_PROVIDERS, CONTEXT_CAP, PROVIDER_CAP, TERMINAL_TAIL_LINES, TERMINAL_HISTORY_MAX, FOLDER_FILES_MAX, GIT_ABSENT_MESSAGE, byteLength, capText, tailLines, stripAnsi, formatProblems, formatFolder, formatSpec, formatGitDiff, providerEntry, contextChipLabel, contextChipTooltip, contextChipEcho, providerContext, plainDiagnostic, clipboardVia, trackTerminalOutput, resolveProblems, resolveTerminal, resolveGitDiff, resolveFolder, resolveSpec, pickContext, looksBinary, fileContextEntry, fileContext, sendTerminalToChat, EXPLORER_MAX_ITEMS, explorerSelection, addExplorerToChat, EDITOR_ACTION_IDS, EDITOR_ACTION_TITLES, DEFAULT_ACTION_PROMPTS, SELECTION_GLYPH, actionPrompt, fenceFor, buildSelectionContext, selectionInput, selectionContext, runEditorAction, fencedBlock, addCodeBlockToChat, COMMIT_MESSAGE_COMMAND, COMMIT_MESSAGE_SESSION_TITLE, COMMIT_MESSAGE_TIMEOUT_MS, COMMIT_MESSAGE_GIT_ABSENT, COMMIT_MESSAGE_NOTHING, COMMIT_MESSAGE_PROMPT, pickDiff, commitMessagePrompt, cleanCommitMessage, gitRepository, runBackgroundTurn, generateCommitMessage, DIAGNOSTIC_FIX_COMMAND, DIAGNOSTIC_FIX_TITLE, DIAGNOSTIC_TITLE_MAX, DIAGNOSTIC_GLYPH, DIAGNOSTIC_FIX_PROMPT, diagnosticTitle, plainRange, buildDiagnosticFixContext, diagnosticFixAction, AgentFixCodeActionProvider, runDiagnosticFix, clip, ChatView, Sessions, themeFor, STOCK_THEMES, mergeRosters, agentPicks, activate };
