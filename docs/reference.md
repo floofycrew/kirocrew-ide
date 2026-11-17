@@ -882,6 +882,11 @@ state, and **View session** on a task opens its `lastSessionId` (or the
 feature's spec session) as a Kiro-mode tab. These runs carry no run record,
 so the mod's own resume logic never touches them: a cut run-all resumes from
 Kiro's checkpoint on the next Run all. Task links record `engine: "kas"`.
+`<wsHash>` is KAS's hash of the workspace path *as it was handed over*, and
+the two sides can spell it differently (the hook passes the real path, the
+IDE the symlinked one), so 0.34.1 has `kas/tasks` and `kas/sessions` look
+under both spellings; found live on dev-dsk-testing, where `kas/tasks`
+answered `exists: false` for a spec whose lenses were already Done.
 
 Read-only sync-back: History's **Kiro modes (kiro-cli)** group lists this
 workspace's Kiro-mode sessions from `GET kas/sessions` (the hook's index

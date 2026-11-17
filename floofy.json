@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.34.0",
+  "version": "0.34.1",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -102,7 +102,7 @@
     },
     {
       "path": "docs/reference.md",
-      "sha256": "20e17852f645554ec7b403d787556e985dc0a898eac97e66a12e24c5d0e5284d"
+      "sha256": "e759cd0557edc7acf281e288d2b84de22120aceaab8f127f68e4be7599c71cf8"
     },
     {
       "path": "extension/extension.js",
@@ -118,7 +118,7 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "3eec9d765e25581e32885ae4f97f68f9339527a0f9e5eaee57a55de84467d140"
+      "sha256": "9f4edc5d8d7a0f127682c6feeda00fb67f2061fabcf9ea02a0ee4d637ab32348"
     },
     {
       "path": "hook/__init__.py",
@@ -130,7 +130,7 @@
     },
     {
       "path": "hook/kas.py",
-      "sha256": "eaa916e054784d534a9a551c4607b8b6ac4c305450dbb1ab0f480188e1e3ec33"
+      "sha256": "f29565ec9c319d8970685280cde5375b01c2893cfda8b0c1660f58596fbbc76b"
     },
     {
       "path": "preview/extension.js",
@@ -346,7 +346,7 @@
     },
     {
       "path": "tests/kas_acp_test.py",
-      "sha256": "f02fbda40a69b4afc41da9f558f9a79e7864119f2cd733fd41ecd87d551ab0db"
+      "sha256": "0efaaca48d4c9406711a1b93c10692a142f35139a6740678a4af48ad2c58f507"
     },
     {
       "path": "tests/kas_adapter.test.mjs",

@@ -129,6 +129,24 @@ def real_folder(folder):
     return os.path.realpath(os.path.expanduser(str(folder))).rstrip("/") or "/"
 
 
+def ws_hashes(folder):
+    """Every workspace hash a folder may sit under in KAS's stores, the spelling KAS was given first.
+
+    KAS hashes the path exactly as it received it: ``session/new {cwd}`` gets the
+    hook's real path, but ``_kiro/spec/resolveSession {workspacePaths}`` gets the
+    IDE's own spelling, which on a desk whose home is a symlink
+    (``/home/x`` → ``/local/home/x``) differs. Measured 2026-11-17 on
+    dev-dsk-testing: the spec session and ``~/.kiro/tasks`` landed under the
+    ``/home`` spelling while the child's sessions sat under ``/local/home``.
+    """
+    out = []
+    for p in (os.path.expanduser(str(folder)).rstrip("/") or "/", real_folder(folder)):
+        h = ws_hash(p)
+        if h not in out:
+            out.append(h)
+    return out
+
+
 def _now():
     return time.time()
 
@@ -1547,7 +1565,7 @@ def sessions_route(manager, home=None):
     rows = {r["sessionId"]: r for r in manager.index_rows()}
     known_hashes = {r.get("wsHash") for r in rows.values()} | set(manager.children)
     for folder in manager.workspaces() or []:
-        known_hashes.add(ws_hash(real_folder(folder)))
+        known_hashes.update(ws_hashes(folder))
     base = os.path.join(home, ".kiro", "sessions")
     for h in sorted(x for x in known_hashes if x):
         wsdir = os.path.join(base, h)
@@ -1598,7 +1616,14 @@ def tasks_route(manager, folder, feature, home=None):
     home = home or os.path.expanduser("~")
     if not isinstance(folder, str) or not folder or not isinstance(feature, str) or not re.match(r"^[A-Za-z0-9._-]{1,120}$", feature):
         return (400, {"error": "folder and a kebab-case feature are required"})
-    h = ws_hash(real_folder(folder))
+    # The spec session and its task metadata sit under the hash of the path the IDE passed to
+    # resolveSession (see ws_hashes); the first hash whose metadata or spec-session file exists wins.
+    hashes = ws_hashes(folder)
+    h = hashes[0]
+    for cand in hashes:
+        if os.path.isfile(os.path.join(home, ".kiro", "tasks", cand, feature + ".meta.json")) or os.path.isfile(os.path.join(home, ".kiro", "spec-sessions", cand + ".json")):
+            h = cand
+            break
     meta_path = os.path.join(home, ".kiro", "tasks", h, feature + ".meta.json")
     meta = _read_json_retry(meta_path)
     sessions_path = os.path.join(home, ".kiro", "spec-sessions", h + ".json")

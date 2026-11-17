@@ -299,6 +299,14 @@ async def test_spec_ops(m, link):
     # the task metadata route reads the fake's ~/.kiro-shaped tree
     doc = kas.tasks_route(m, ws, "feat", home=None if False else _fake_home(h_state=os.environ["FAKE_KAS_STATE"]))
     assert doc["tasks"]["1. First thing"]["executionStatus"] == "succeed" and doc["specSessionId"] == sid, doc
+    # The IDE may spell the folder through a symlink (a /home → /local/home desk): the route tries
+    # that spelling's hash too and finds the metadata KAS filed under the real path's hash.
+    alias = os.path.join(os.path.dirname(ws), "alias-to-ws")
+    if not os.path.islink(alias):
+        os.symlink(ws, alias)
+    via_alias = kas.tasks_route(m, alias, "feat", home=_fake_home(os.environ["FAKE_KAS_STATE"]))
+    assert via_alias["exists"] and via_alias["wsHash"] == doc["wsHash"] and via_alias["specSessionId"] == sid, via_alias
+    assert kas.ws_hashes(alias)[0] != kas.ws_hashes(alias)[1] and kas.ws_hashes(ws) == [kas.ws_hash(ws)]
     print("ok spec passthrough + taskStatusChanged relay + autopilot for executeTask")
 
 
