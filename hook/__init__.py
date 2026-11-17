@@ -45,11 +45,15 @@ import zipfile
 
 try:
     from . import gallery  # the Loader imports this file as the `hook` package
+    from . import kas
 except ImportError:  # the unit tests load it as a bare module from its path
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("kirocrew_ide_gallery", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gallery.py"))
     gallery = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(gallery)
+    _spec = _ilu.spec_from_file_location("kirocrew_ide_kas", os.path.join(os.path.dirname(os.path.abspath(__file__)), "kas.py"))
+    kas = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(kas)
 
 STATE_FILE = "server.json"
 ENGINE_LOG = "engine.log"
@@ -388,12 +392,18 @@ def _vendor_into(target):
 #: keys already present in the file are never overwritten. The built-in AI
 #: chat (the right-hand panel that wants a Copilot/GitHub sign-in) is turned off
 #: because KiroCrew's chat takes that place; the secondary side bar is opened
-#: so the KiroCrew Chat view, which the extension moves there, is visible.
+#: so the KiroCrew Chat view, which the extension moves there, is visible. The
+#: sashes (the drag handles between the KiroCrew side-bar sections, the side
+#: bar's edge, editor splits) are the stock 4px strip that lights up after a
+#: 300ms hover; inside the dashboard that is hard to catch, so they are
+#: served at 8px and light up after 100ms (both VS Code's own settings).
 MACHINE_SETTINGS = {
     "chat.disableAIFeatures": True,
     "chat.commandCenter.enabled": False,
     "workbench.secondarySideBar.defaultVisibility": "visible",
     "workbench.startupEditor": "none",
+    "workbench.sash.size": 8,
+    "workbench.sash.hoverDelay": 100,
     "security.workspace.trust.startupPrompt": "once",
     "telemetry.telemetryLevel": "off",
 }
@@ -2469,6 +2479,100 @@ def _inject_chrome_style(html):
     return html.replace("</head>", style + "</head>", 1)
 
 
+#: The side-bar sections (Specs, Steering, Skills, ... and every other view) are
+#: VS Code panes in one split view. A pane's body has a stock minimum of 120px
+#: (`Pane` in vs/base/browser/ui/splitview/paneview), so a section can never be
+#: dragged shorter than 142px with its header, and in a side bar too short for
+#: every section to have that much, every section sits AT its minimum: no
+#: neighbour can give, so VS Code disables every sash (no hover handle, no
+#: drag) until a section is collapsed. That is what a user sees as "the
+#: sections cannot be resized". The stock minimum is a constructor default in
+#: the workbench bundle, out of reach of an extension, so the proxy serves the
+#: bundle with that one literal rewritten: `typeof e.minimumBodySize=="number"
+#: ?e.minimumBodySize:this.z===1?200:120` -> the configured minimum (default 22,
+#: one tree row; the horizontal 200, the panel's, is untouched). The rewritten
+#: bundle is cached in memory per engine build; the served page's script URL
+#: carries the value as a query (`?kide-pane=22`), so a browser holding the
+#: stock copy (the engine serves it with max-age one year) fetches ours, and a
+#: changed value is a new URL. PANE_MIN_BODY_KEY is a mod config key: 120 (the
+#: stock value) turns the rewrite off, out-of-range values clamp to [0, 120].
+#: An engine whose bundle no longer has the literal is served untouched and
+#: logged once.
+PANE_MIN_BODY_KEY = "pane_min_body_px"
+PANE_MIN_BODY_DEFAULT = 22
+PANE_MIN_BODY_STOCK = 120
+_WORKBENCH_JS_SUFFIX = "/out/vs/code/browser/workbench/workbench.js"
+_PANE_MIN_RE = re.compile(r'(typeof (\w+)\.minimumBodySize=="number"\?\2\.minimumBodySize:this\.\w+===1\?200:)120\b')
+_PANE_MIN_QUERY = "kide-pane="
+_bundle_cache = {}  # (path, min) -> (bytes, content-type, cache-control): the rewritten bundle per engine build
+_bundle_unmatched = set()  # bundle paths whose text had no Pane minimum to rewrite (logged once each)
+
+
+def _pane_min_body():
+    """The configured pane minimum body size in px, clamped to [0, PANE_MIN_BODY_STOCK]."""
+    raw = _ctx.config.get(PANE_MIN_BODY_KEY) if _ctx else None
+    if raw is None:
+        return PANE_MIN_BODY_DEFAULT
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return PANE_MIN_BODY_DEFAULT
+    return min(PANE_MIN_BODY_STOCK, max(0, value))
+
+
+def _rewrite_pane_min(js, minimum):
+    """(bundle text with Pane's vertical minimum body size set to `minimum`, matched?)."""
+    out, count = _PANE_MIN_RE.subn(lambda m: m.group(1) + str(minimum), js, count=1)
+    return out, count == 1
+
+
+def _inject_pane_min_query(html, minimum=None):
+    """Version the workbench bundle's script URL with the pane minimum; stock value or no bundle tag = untouched."""
+    minimum = _pane_min_body() if minimum is None else minimum
+    if minimum >= PANE_MIN_BODY_STOCK or _PANE_MIN_QUERY in html:
+        return html
+    needle = _WORKBENCH_JS_SUFFIX + '"'
+    if needle not in html:
+        return html
+    return html.replace(needle, _WORKBENCH_JS_SUFFIX + "?" + _PANE_MIN_QUERY + str(minimum) + '"', 1)
+
+
+async def _serve_workbench_bundle(request, target, headers, minimum):
+    """The workbench bundle with the pane minimum rewritten, from the per-build cache or fetched whole once."""
+    import aiohttp
+    from aiohttp import web
+    key = (request.path, minimum)
+    hit = _bundle_cache.get(key)
+    if hit is None:
+        session = aiohttp.ClientSession()
+        try:
+            upstream = await session.get(target, headers=headers, allow_redirects=False)
+            status = upstream.status
+            ctype = upstream.headers.get("Content-Type", "text/javascript")
+            cache = upstream.headers.get("Cache-Control", "no-cache")
+            text = await upstream.text()
+        except Exception as error:  # noqa: BLE001
+            await session.close()
+            return web.Response(status=502, content_type="text/plain", text="KiroCrew IDE proxy: %s" % error)
+        await session.close()
+        if status != 200:
+            _log_proxied(request.method, request.path, status, note="workbench-js")
+            return web.Response(status=status, text=text, content_type=ctype.split(";")[0].strip() or "text/javascript")
+        text, matched = _rewrite_pane_min(text, minimum)
+        if not matched and request.path not in _bundle_unmatched:
+            _bundle_unmatched.add(request.path)
+            if _ctx is not None:
+                _ctx.log.warning("workbench bundle %s has no Pane minimum to rewrite; sections keep the stock %dpx minimum",
+                                 request.path, PANE_MIN_BODY_STOCK)
+        hit = (text.encode("utf-8"), ctype.split(";")[0].strip() or "text/javascript", cache)
+        _bundle_cache.clear()  # one engine build at a time; a relaunch on a new build drops the old copy
+        _bundle_cache[key] = hit
+    body, ctype, cache = hit
+    _log_proxied(request.method, request.path, 200, note="workbench-js pane-min=%d" % minimum)
+    return web.Response(status=200, body=body, content_type=ctype, charset="utf-8",
+                        headers={"Cache-Control": cache})
+
+
 #: The webview host page, served same-origin once _inject_webview_endpoint is in
 #: effect. Its parent-origin validation only knows the hashed-subdomain scheme.
 _PRE_INDEX_SUFFIX = "/static/out/vs/workbench/contrib/webview/browser/pre/index.html"
@@ -2650,6 +2754,56 @@ def _debug_proxylog(_request):
 #: told the proxy could not reach it (a loopback connect is milliseconds).
 WS_UPSTREAM_TIMEOUT_S = 10.0
 
+# ------------------------------------------------------------ Kiro modes (KAS)
+
+#: The Kas_Link path under the proxy's raw route (hook/kas.py handles the frames).
+KAS_WS_PATH = PROXY_BASE + "/_kirocrew/kas/ws"
+_kas = {"manager": None}
+
+
+def _kas_log(message):
+    if _ctx is not None:
+        _ctx.log.info("%s", message)
+
+
+def _kas_config(key, default=None):
+    value = _ctx.config.get(key) if _ctx is not None else None
+    return default if value is None else value
+
+
+def _kas_manager():
+    """The one KasManager of this hook module (built on first use; data dir known from early() on)."""
+    manager = _kas["manager"]
+    if manager is None:
+        data_dir = str(_ctx.data_dir) if _ctx is not None else _data_dir_hint["path"]
+        manager = kas.KasManager(data_dir, workspaces=lambda: _workspaces(_live_state()), config_get=_kas_config, log=_kas_log)
+        _kas["manager"] = manager
+    return manager
+
+
+async def _kas_status(_request):
+    """GET kas/status: kiro-cli path/version, login, availability, modes, per-workspace child facts."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _kas_manager().status)   # runs `kiro-cli --version` / `whoami` (cached) off the loop
+
+
+def _kas_sessions(_request):
+    """GET kas/sessions: the hook's index merged with KAS's own ~/.kiro/sessions/<wsHash>/ listing."""
+    return kas.sessions_route(_kas_manager())
+
+
+def _kas_transcript(request):
+    """GET kas/sessions/{id}/transcript: the persisted relayed frames of one session."""
+    return kas.transcript_route(_kas_manager(), (request.params or {}).get("id"))
+
+
+def _kas_tasks(request):
+    """GET kas/tasks?folder&feature: KAS's task metadata and the feature's spec session for one spec."""
+    query = request.query or {}
+    folder = (query.get("folder") or [""])[0]
+    feature = (query.get("feature") or [""])[0]
+    return kas.tasks_route(_kas_manager(), folder, feature)
+
 #: Request headers that belong to THIS hop's upgrade handshake; aiohttp's client
 #: writes its own for the upstream one.
 _WS_HANDSHAKE_HEADERS = frozenset(("sec-websocket-key", "sec-websocket-version",
@@ -2753,6 +2907,16 @@ async def _proxy(request):
     import aiohttp
     from aiohttp import web
 
+    # The hook's own WebSocket for Kiro-mode tabs (hook/kas.py) rides on this raw
+    # route: it is the one mod seam that carries an upgrade, and the trampoline
+    # means a mod update reaches it without a gateway restart. The engine never
+    # emits a `_kirocrew/` path (checked against openvscode-server 1.109.5), and
+    # the host's session middleware answers an unauthenticated upgrade itself.
+    if request.path.startswith(KAS_WS_PATH):
+        if request.headers.get("Upgrade", "").lower() != "websocket":
+            return web.Response(status=426, content_type="text/plain", text="KiroCrew IDE: WebSocket upgrade required")
+        return await kas.handle_ws(request, _kas_manager(), log=_kas_log)
+
     origin = _engine_origin()
     if not origin:
         return web.Response(
@@ -2801,6 +2965,7 @@ async def _proxy(request):
             body = _inject_new_window_profile(body)  # after the list seed (it needs the names), before the order seed (it reads the payload)
             body = _inject_activity_order(body)
             body = _inject_chrome_style(body)  # the command centre at half width (command_center_scale)
+            body = _inject_pane_min_query(body)  # the bundle URL carries the pane minimum (pane_min_body_px)
             # The App passes the dashboard's scheme on the frame URL (fresh at
             # every load); the file it also posts to is the fallback.
             body = _inject_theme_default(body, request.query.get("kideScheme") or _read_scheme())
@@ -2833,6 +2998,13 @@ async def _proxy(request):
     # WebSocket (the workbench's extension-host channel)
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return await _proxy_websocket(request, target, headers)
+
+    # The workbench bundle: served whole with the Pane minimum rewritten (see
+    # PANE_MIN_BODY_KEY); at the stock value it streams through like any asset.
+    if request.method == "GET" and request.path.endswith(_WORKBENCH_JS_SUFFIX):
+        minimum = _pane_min_body()
+        if minimum < PANE_MIN_BODY_STOCK:
+            return await _serve_workbench_bundle(request, target, headers, minimum)
 
     # Plain HTTP, streamed both ways
     session = aiohttp.ClientSession(auto_decompress=False)
@@ -3031,6 +3203,10 @@ def activate(ctx):
     ctx.routes.add("POST", "theme", _theme_set)
     ctx.routes.add("POST", "bridge/probe", _bridge_probe)
     ctx.routes.add("GET", "debug/proxylog", _debug_proxylog)
+    ctx.routes.add("GET", "kas/status", _kas_status)
+    ctx.routes.add("GET", "kas/sessions", _kas_sessions)
+    ctx.routes.add("GET", "kas/sessions/{id}/transcript", _kas_transcript)
+    ctx.routes.add("GET", "kas/tasks", _kas_tasks)
     state = _live_state()
     if state and _mode_mismatch(state):
         # Typically: the engine predates the gateway restart that armed the
@@ -3086,6 +3262,15 @@ def deactivate(ctx):
     if service:
         try:
             service.stop()
+        except Exception:  # noqa: BLE001
+            pass
+    # The kiro-cli children ARE closed: a reloaded hook would not know them, and a
+    # child it does not know holds its sessions against the one it spawns next.
+    manager = _kas["manager"]
+    _kas["manager"] = None
+    if manager is not None:
+        try:
+            manager.kill_all_sync()
         except Exception:  # noqa: BLE001
             pass
     _ctx = None

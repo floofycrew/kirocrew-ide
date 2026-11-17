@@ -318,15 +318,20 @@ Pain points → mechanisms:
 - **Approve from the editor** — a `chat_message` with role `permission`
   raises a notification (Approve / Reject / Open session) and an inline card
   in the chat; both POST `…/approve {action, request_id}`.
-- **Spec agent** — with the kiro-spec-plan mod (KAS backend), the Spec /
-  Quick Spec / Bug Fix / Plan agents are Kiro's own bundled modes, and a task
-  run sends the request Kiro's IDE sends its engine ("Run all tasks for this
-  spec." + resume suffix; "Execute the following task from the spec at …" +
-  task block + Task ID + Spec path), which the engine's spec sub-intent router
-  hands to its Task Orchestrator. Without it, the flow is carried by prompts
+- **Spec agent, two engines** — on the gateway (`kirocrew.specEngine:
+  "gateway"`, the default) the flow is carried by the mod's prompts
   (requirements → design → tasks with the Kiro artifact shapes, EARS
-  criteria, checkbox plan; task prompts carrying the same `<task>` block) sent
-  to whichever crew agent `kirocrew.specAgent` / `kirocrew.agent` names.
+  criteria, checkbox plan; task prompts carrying Kiro's `<task>` block) sent
+  to whichever crew agent `kirocrew.specAgent` / `kirocrew.agent` names. With
+  `"kas"` the mod's hook owns a `kiro-cli acp --agent-engine v3` child per
+  workspace and the spec actions are Kiro's own `_kiro/spec/*` operations
+  (resolveSession, invoke createSpec / generateDocument / executeTask /
+  runAllTasks / analyzeRequirements), opened as Kiro-mode tabs over the
+  hook's WebSocket on the proxy path; Kiro's Task Orchestrator writes the
+  boxes and the lenses read its task metadata. The gateway cannot run the
+  bundled modes itself: it rewrites their ids (`KAS_RESERVED_AGENT_IDS`) and
+  refuses an id the engine owns, which is why the earlier kiro-spec-plan
+  approach (agent files named after the modes) was retired.
 - **File browsing / diffs** — native workbench on the same folder the agent
   edits; changes show as ordinary git diffs.
 

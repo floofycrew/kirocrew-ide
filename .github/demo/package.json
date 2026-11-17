@@ -1,0 +1,21 @@
+{
+  "name": "kirocrew-ide-demo",
+  "private": true,
+  "description": "Renders the README demo GIF of the KiroCrew IDE from Playwright captures (see capture.py).",
+  "scripts": {
+    "studio": "remotion studio",
+    "render": "remotion render Demo out/demo.mp4 --codec h264 --crf 18",
+    "gif": "node gif.mjs"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.541",
+    "@remotion/transitions": "4.0.541",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "remotion": "4.0.541"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "typescript": "5.9.3"
+  }
+}

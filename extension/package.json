@@ -2,7 +2,7 @@
   "name": "kirocrew-ide-bridge",
   "displayName": "KiroCrew",
   "description": "KiroCrew chat (tabbed, with per-project history), agents, approvals, and the Kiro spec / steering / skills / hooks workflow inside the IDE. Sessions run in the KiroCrew gateway and survive a dropped connection. Installed by the kirocrew-ide FloofyCrew mod. Unofficial.",
-  "version": "0.32.2",
+  "version": "0.34.0",
   "publisher": "kirocrew-ide",
   "license": "MIT",
   "engines": {
@@ -185,6 +185,10 @@
       {
         "command": "kirocrew.spec.tasks",
         "title": "KiroCrew Spec: Write tasks"
+      },
+      {
+        "command": "kirocrew.spec.analyze",
+        "title": "KiroCrew Spec: Analyze requirements"
       },
       {
         "command": "kirocrew.spec.runTask",
@@ -678,6 +682,10 @@
           "when": "view == kirocrew.specs && viewItem =~ /^spec(-interrupted)?$/"
         },
         {
+          "command": "kirocrew.spec.analyze",
+          "when": "view == kirocrew.specs && viewItem =~ /^spec(-interrupted)?$/"
+        },
+        {
           "command": "kirocrew.spec.viewSession",
           "when": "view == kirocrew.specs && viewItem =~ /^(spec(-interrupted)?|task-(open|done|running))$/",
           "group": "inline@9"
@@ -849,10 +857,15 @@
           "default": "",
           "description": "KiroCrew agent used to execute spec tasks (empty = same as kirocrew.agent)."
         },
-        "kirocrew.kiroModeAgents": {
-          "type": "boolean",
-          "default": false,
-          "description": "Hand Spec / Quick Spec / Bug Fix / Plan turns to the kiro-spec-plan mod's mode agents (spec, quick-spec, bug-fix, plan) when they are installed. Off by default: on current kiro-cli, `--agent spec` loads that mod's tool-less handle file rather than Kiro's bundled Spec mode, so the IDE's own spec workflow runs on kirocrew.agent / kirocrew.specAgent instead."
+        "kirocrew.specEngine": {
+          "type": "string",
+          "enum": ["gateway", "kas"],
+          "default": "gateway",
+          "enumDescriptions": [
+            "Spec actions (create, Sync / Next, Start task, Run all) run as KiroCrew gateway sessions with the mod's own spec prompts on kirocrew.agent / kirocrew.specAgent.",
+            "Spec actions call Kiro's own spec engine in kiro-cli on the gateway host (_kiro/spec/* over the hook's ACP child) and open as Kiro-mode tabs; falls back to the gateway when kiro-cli is unavailable or does not implement a spec method."
+          ],
+          "description": "Which engine runs the spec actions: the KiroCrew gateway (default) or Kiro's spec engine in kiro-cli (Kiro-mode tabs)."
         },
         "kirocrew.specAutopilot": {
           "type": "boolean",

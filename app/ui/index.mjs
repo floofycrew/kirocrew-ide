@@ -79,9 +79,55 @@ function useLayerState() {
   return state;
 }
 
+/**
+ * The dashboard shell keeps its nav card 8px off the viewport's bottom edge and
+ * 8px left of the content column, and gives the content column itself no inset
+ * at all. The page ends on the nav card's line and keeps the same 8px on its
+ * right, so the docked IDE's bottom and right edges read like the shell's own.
+ */
+const EDGE_INSET = 8;
+
+/**
+ * The root's height, fitted to the space under it: from where the root starts
+ * to the bottom of the shell's content column (the nearest <main>; the document
+ * when there is none), less EDGE_INSET. A fixed `calc(100vh - N px)` guessed the
+ * chrome above the page and left a band under the IDE (seen live, 2026-11-17).
+ * Re-measured on viewport resizes and whenever the column or the page's parent
+ * changes size; null until measured (and when the measurement is unusable, as
+ * in a layout-less test DOM), when the fallback calc applies.
+ */
+function useFittedHeight(rootRef) {
+  const [height, setHeight] = React.useState(null);
+  React.useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!el) return undefined;
+    const column = () => el.closest("main") || el.ownerDocument.documentElement;
+    const fit = () => {
+      const col = column();
+      const colRect = col.getBoundingClientRect();
+      const colHeight = col === el.ownerDocument.documentElement ? (el.ownerDocument.defaultView || window).innerHeight : col.clientHeight;
+      // The root's offset inside the column, scroll-independent: a column scrolled by an earlier overflow must not inflate the fit.
+      const top = el.getBoundingClientRect().top - colRect.top + col.scrollTop;
+      const next = Math.floor(colHeight - top - EDGE_INSET);
+      setHeight(next >= 240 ? next : null);
+    };
+    fit();
+    const win = el.ownerDocument.defaultView || window;
+    win.addEventListener("resize", fit);
+    let ro = null;
+    if (typeof win.ResizeObserver === "function") {
+      ro = new win.ResizeObserver(fit);
+      ro.observe(column());
+      if (el.parentElement) ro.observe(el.parentElement);
+    }
+    return () => { win.removeEventListener("resize", fit); if (ro) ro.disconnect(); };
+  }, [rootRef]);
+  return height;
+}
+
 const border = "1px solid var(--border-color, #4444)";
 const styles = {
-  root: { display: "flex", flexDirection: "column", height: "calc(100vh - 90px)", gap: 8 },
+  root: { display: "flex", flexDirection: "column", height: "calc(100vh - 90px)", gap: 8, paddingRight: EDGE_INSET, boxSizing: "border-box" },
   bar: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", font: "13px system-ui" },
   button: { padding: "4px 12px", borderRadius: 6, cursor: "pointer", border, background: "transparent", color: "inherit" },
   primary: { padding: "4px 12px", borderRadius: 6, cursor: "pointer", border: "1px solid var(--accent, #7c5cff)", background: "var(--accent, #7c5cff)", color: "#fff" },
@@ -316,6 +362,8 @@ export default function KirocrewIdeApp() {
   const [busy, setBusy] = React.useState("");
   const [error, setError] = React.useState("");
   const layer = useLayerState();
+  const rootRef = React.useRef(null);
+  const fittedHeight = useFittedHeight(rootRef);
   const dockRef = React.useRef(null);
   const pickerRef = React.useRef(null);
   const running0 = React.useRef(false);
@@ -467,7 +515,7 @@ export default function KirocrewIdeApp() {
     main = h("div", { style: styles.notice }, error || "Engine ready. Pick a folder and press Start.");
   }
 
-  return h("div", { style: styles.root },
+  return h("div", { style: fittedHeight === null ? styles.root : { ...styles.root, height: fittedHeight }, ref: rootRef, "data-testid": "kirocrew-ide-root" },
     h("div", { style: styles.bar },
       h("span", { "data-testid": "kirocrew-ide-status" }, barText),
       h(FolderPicker, { value: folder, onChange: setFolder, disabled: !!busy, inputRef: pickerRef }),

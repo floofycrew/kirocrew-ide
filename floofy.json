@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.32.4",
+  "version": "0.34.0",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -74,7 +74,7 @@
   "files": [
     {
       "path": "DESIGN.md",
-      "sha256": "8624edc4561c02e092e108ace8b1c0b060e5a701ab9fbf49daf32806a1a6b6bb"
+      "sha256": "fa0ec7c1a947d24774829b7ff908e3379ad507db2ec622745d9752482b22a4dd"
     },
     {
       "path": "LICENSE",
@@ -82,11 +82,11 @@
     },
     {
       "path": "README.md",
-      "sha256": "9b5e1c38c51c9e9ffecb49df98a77c024e33385f55d84e4dcd47b171574d362a"
+      "sha256": "37c02b419c26360006706f8c768e8792922022f6851d85bc9c73a13c5386a854"
     },
     {
       "path": "app/app.json",
-      "sha256": "011cf3d266a2a038a84aaae279c9cc6389f1c04c0c308a9bfc6eeaab87a5f1da"
+      "sha256": "f61cea2ef2d29c7fa6c4989966f529f47b088112da1a85dfd06ad9b0051904a0"
     },
     {
       "path": "app/ui/art/fox.svg",
@@ -98,11 +98,15 @@
     },
     {
       "path": "app/ui/index.mjs",
-      "sha256": "ef26736557ca2e2945dd87df3ea5d37b166a74e421844191ef3266b31480c684"
+      "sha256": "f6f5dbff92fea371c0dbedb5a87cb9991268360384cb2c2cc18af7b1e089b4b6"
+    },
+    {
+      "path": "docs/reference.md",
+      "sha256": "20e17852f645554ec7b403d787556e985dc0a898eac97e66a12e24c5d0e5284d"
     },
     {
       "path": "extension/extension.js",
-      "sha256": "9394e7eab92103842d46f1c0538353c87388f6c9b8745584a836afd6e41e117d"
+      "sha256": "01ee7cf7bd5233cdc32bdb521975db505634bac85a4e9a0b41cb1eeb5b9c5b71"
     },
     {
       "path": "extension/media/fox.svg",
@@ -114,15 +118,19 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "d0b9cf38cdedfb1af329d122518494a4568d5c97a01ddfdf06da4b75b0e31655"
+      "sha256": "3eec9d765e25581e32885ae4f97f68f9339527a0f9e5eaee57a55de84467d140"
     },
     {
       "path": "hook/__init__.py",
-      "sha256": "516cde5ee8fbd2cf8231246bf2bcbfea34063af26f7a1861405888f61fe8b57b"
+      "sha256": "aa5c4189766e23c4f9d8f07fb3f52b937490b4dce63b13ddfcef57b956375c51"
     },
     {
       "path": "hook/gallery.py",
       "sha256": "4ae304ab0842eeb377f5537c4363084d0d9b670088b9e922cb957d4993886a0e"
+    },
+    {
+      "path": "hook/kas.py",
+      "sha256": "eaa916e054784d534a9a551c4607b8b6ac4c305450dbb1ab0f480188e1e3ec33"
     },
     {
       "path": "preview/extension.js",
@@ -142,7 +150,7 @@
     },
     {
       "path": "preview/package.json",
-      "sha256": "014e7351f4e0ed2f3a19a66c439257682f213a8238f566993a18937a2ea71beb"
+      "sha256": "2f50378bd6e6d751d304989578c84467c86aa06b93e470daa6f894c2c71c03e7"
     },
     {
       "path": "spa/hostmodel.mjs",
@@ -197,6 +205,10 @@
       "sha256": "9e9b7ccf01dbcf4a5f93ae819ea8383120f2a83fbfc6c27c486dfd137e3733db"
     },
     {
+      "path": "tests/e2e/fake_kas.py",
+      "sha256": "6524c21089b065f136caee92c86a410cdfa09d4103be6eff70457a8c04f4dca6"
+    },
+    {
       "path": "tests/e2e/probe_activity_order.py",
       "sha256": "8f882abdaddf21849e1059888a474290aa849c01a9bea455241eb9bb1e3fd7b7"
     },
@@ -225,6 +237,22 @@
       "sha256": "c0addafe94a447db23e9ad484a76f4bc5e7278c868037811056f6048ab7725ee"
     },
     {
+      "path": "tests/e2e/probe_kas_acp.py",
+      "sha256": "789736290183631d09723f4bf2615ad1783c58e634f2f6c9a37f1332fd25751c"
+    },
+    {
+      "path": "tests/e2e/probe_kas_live.py",
+      "sha256": "6408197c6be1bd8c53424ed58fe51ed8f8446d757edc1c2d30a3b3c6752050bc"
+    },
+    {
+      "path": "tests/e2e/probe_kas_spec.py",
+      "sha256": "31e1dc5bd54ff9be22863c55534788a0456f212123a4d6839b4cb4e630d772cd"
+    },
+    {
+      "path": "tests/e2e/probe_kas_tab.py",
+      "sha256": "7761aa6383145beb12292d56cd4c476a71b8118e37d6fd33e63816209fd6712d"
+    },
+    {
       "path": "tests/e2e/probe_markdown.py",
       "sha256": "fa150dac8a06fc444148cb4e23e75f05be99a23980fe33dd3d6227f3a19a4150"
     },
@@ -233,8 +261,20 @@
       "sha256": "3f8fb89596ed4675f25f4c20fd5ae70b22b32cdc3eb70b1a799aa17c6bc2e134"
     },
     {
+      "path": "tests/e2e/probe_mod_page_kas.py",
+      "sha256": "4a8acdce990d3e4ff0b894b05c3313e632b2d8152463a3819fb5e64fec665b75"
+    },
+    {
+      "path": "tests/e2e/probe_pane_resize.py",
+      "sha256": "5c982e9bddf185ce9fdfc4fd381de252cee168d46c13ecc2c0bfb06d2f83cc2e"
+    },
+    {
       "path": "tests/e2e/probe_profile.py",
       "sha256": "b5a16464d269f4eb710f8a2a82afad6533b008fc23b37b2f4193099c3a83710d"
+    },
+    {
+      "path": "tests/e2e/probe_proxy_bundle.py",
+      "sha256": "ce17b66314f0ef70aef0a83fa3e92b279cf2db185da330362b5450c8f4cafcc9"
     },
     {
       "path": "tests/e2e/probe_review_comments.py",
@@ -282,7 +322,7 @@
     },
     {
       "path": "tests/extension_unit.test.mjs",
-      "sha256": "634d7d4be1c77fe8df4f5e072eb74c0e3d816164ea29173121474c09eb762d8a"
+      "sha256": "4cd763f58a7696acdc2e83b7b61e5ba4a56cdd652f11e44e21bf80003bb82cb7"
     },
     {
       "path": "tests/gallery_test.py",
@@ -305,6 +345,18 @@
       "sha256": "e31f605803b223761efc11245a6e089b61dc1dbbd12d856e242ed199878e40c2"
     },
     {
+      "path": "tests/kas_acp_test.py",
+      "sha256": "f02fbda40a69b4afc41da9f558f9a79e7864119f2cd733fd41ecd87d551ab0db"
+    },
+    {
+      "path": "tests/kas_adapter.test.mjs",
+      "sha256": "bc07f8c8732edbdc5ab36fea4a8b79959ed4888fb37368e4d8667725961f2f04"
+    },
+    {
+      "path": "tests/kas_link_test.py",
+      "sha256": "cd6090bbc191c5f98b50a5369262e08586ceaa8576cb833bc00848f67476c16c"
+    },
+    {
       "path": "tests/layer.test.mjs",
       "sha256": "7dae85cca4d31307acf3181724dcecb52060b1d2647764a67305317e4e1225a5"
     },
@@ -318,7 +370,7 @@
     },
     {
       "path": "tests/machine_settings_test.py",
-      "sha256": "bb3a0fc37c42658a6c48ffc8f6c81d0b32a274253cb33d3511cb391d681b0eb1"
+      "sha256": "8cc30efd0ef2cab1d54c5464b776a6168e988ec9d5ad35a72537b483289460cb"
     },
     {
       "path": "tests/marketplace_install_test.py",
@@ -339,6 +391,10 @@
     {
       "path": "tests/new_window_profile_test.py",
       "sha256": "d6947cf8a1246dec05f1b1d14fb8e297eb251f5dc8e513b472e38dee1091e976"
+    },
+    {
+      "path": "tests/pane_min_test.py",
+      "sha256": "a7415e113136ef7bcfef6f63f1cc66982e20c4ac2c91036044015f17668e6e40"
     },
     {
       "path": "tests/preview_highlight.test.mjs",
@@ -446,7 +502,7 @@
     },
     {
       "path": "ui/page.mjs",
-      "sha256": "a411f07bfee31355a9603edd8910a6df18a69f58006abc09240f8f2e1f1624b3"
+      "sha256": "1f19cb3ac8f3c023138b667042ef605af561655a1e5c17245b96b2d156ec1ab5"
     }
   ]
 }

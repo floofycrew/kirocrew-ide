@@ -407,14 +407,16 @@ class ChatView {
     this.agent = cfg("agent", "");
     this.nextId = 1;
     this.lastSettings = null; // a new tab inherits the previous tab's picks
+    this.kas = null;          // the KasLink of this workspace (Kiro-mode tabs), opened on first use
+    this.kasSpecListeners = new Set(); // spec machinery listening for specEvent frames (task state)
     feed.on((frame) => this.onFrame(frame));
     sessions.onDidChange(() => this.pushTabs());
     this.restoreTabs();
   }
   storageKey() { return "kirocrew.tabs:" + (this.sessions.projectPath() || "-"); }
-  /** Per-tab composer picks: agent, model, reasoning effort, workflow mode, Autopilot. */
+  /** Per-tab composer picks: agent, model, reasoning effort, workflow mode, Autopilot; `engine` is "kas" for a Kiro-mode pick. */
   defaultSettings() {
-    return Object.assign({ agent: this.agent || "", model: "", effort: "", mode: "default", autopilot: false }, this.lastSettings || {});
+    return Object.assign({ agent: this.agent || "", model: "", effort: "", mode: "default", autopilot: false, engine: "" }, this.lastSettings || {});
   }
   /**
    * The tabs as they were when the window closed, and the one that was in front.
@@ -427,7 +429,7 @@ class ChatView {
   restoreTabs() {
     const saved = this.context.workspaceState.get(this.storageKey());
     if (saved && Array.isArray(saved.tabs) && saved.tabs.length) {
-      this.tabs = saved.tabs.filter((t) => t && t.key).map((t) => ({ id: this.nextId++, key: t.key, title: t.title || t.key, renamed: Boolean(t.renamed && t.title), settings: Object.assign(this.defaultSettings(), t.settings || {}), kind: t.kind || undefined, run: t.run && typeof t.run === "object" ? t.run : null, spec: specTabRecord(t.spec), link: typeof t.link === "string" && t.link ? t.link : null }));
+      this.tabs = saved.tabs.filter((t) => t && t.key).map((t) => ({ id: this.nextId++, key: t.key, title: t.title || t.key, renamed: Boolean(t.renamed && t.title), settings: Object.assign(this.defaultSettings(), t.settings || {}), kind: t.kind || undefined, run: t.run && typeof t.run === "object" ? t.run : null, spec: specTabRecord(t.spec), link: typeof t.link === "string" && t.link ? t.link : null, kas: t.kind === "kas" ? kasTabState(t.kas) : undefined }));
       const front = (typeof saved.active === "string" && this.tabForKey(saved.active)) || this.tabs[this.tabs.length - 1] || null;
       this.active = front ? front.id : null;
       if (this.tabs.length) this.lastSettings = Object.assign({}, this.tabs[this.tabs.length - 1].settings);
@@ -437,7 +439,7 @@ class ChatView {
   saveTabs() {
     const front = this.tab(this.active);
     this.context.workspaceState.update(this.storageKey(), {
-      tabs: this.tabs.filter((t) => t.key).map((t) => ({ key: t.key, title: t.title, renamed: Boolean(t.renamed), settings: t.settings, kind: t.kind, run: t.run || null, spec: t.spec || null, link: t.link || null })),
+      tabs: this.tabs.filter((t) => t.key).map((t) => ({ key: t.key, title: t.title, renamed: Boolean(t.renamed), settings: t.settings, kind: t.kind, run: t.run || null, spec: t.spec || null, link: t.link || null, kas: t.kind === "kas" ? kasTabRecord(t.kas) : null })),
       active: (front && front.key) || null,
     });
   }
@@ -533,12 +535,12 @@ class ChatView {
   /** The pick lists behind the composer bar: agents, models, effort levels, workflows. */
   async pushChoices() {
     await this.sessions.refresh().catch(() => undefined);
-    const [models, efforts] = await Promise.all([this.sessions.models(), this.sessions.effortLevels(this.key)]);
+    const [models, efforts, kas] = await Promise.all([this.sessions.models(), this.sessions.effortLevels(this.key), kasStatus()]);
     const dropped = this.pruneRetiredModels(models);
     if (dropped.length) log("dropped retired model pick(s) " + dropped.join(", ") + "; those tabs use the agent's model");
     this.post({
       type: "choices",
-      agents: agentPicks(this.sessions.agents),
+      agents: kasPicks(kas).concat(agentPicks(this.sessions.agents)),
       models: [{ id: "", label: "agent's model", description: "the agent's configured default" }].concat(models.map((m) => ({ id: m.id, label: m.label || m.id, description: m.id !== m.label ? m.id : "" }))),
       efforts: [{ id: "", label: "default effort", description: "the model's default" }].concat(efforts.map((e) => ({ id: e, label: e[0].toUpperCase() + e.slice(1), description: "" }))),
     });
@@ -554,22 +556,26 @@ class ChatView {
     this.post({ type: "steering", items: docs.map((d) => ({ name: d.name, label: d.label, scope: d.scope, inclusion: d.inclusion, mode: steeringModeLabel(d), description: d.description, path: d.path })) });
   }
   /**
-   * The picker's hint row was clicked: Kiro's mode agents are not installed.
-   * Says which mod brings them and hands over the install command; "Check
-   * again" re-reads the roster so a just-installed mod shows up without a
-   * reload.
+   * The picker's hint row was clicked. `kas`: Kiro's modes are unavailable on
+   * this host (kiro-cli missing, too old, or not logged in); the reason from
+   * `kas/status` is shown and "Check again" re-reads it.
    */
   async explainModes() {
-    const command = "floofy install " + MODES_MOD;
-    const choice = await vscode.window.showInformationMessage(
-      "Kiro's own Spec, Quick Spec, Bug Fix and Plan come from the " + MODES_MOD + " mod, which is not installed on this host. " +
-      "Until it is, those picks run a prompt-guided version on your default agent. Install it from the FloofyCrew page in the dashboard, or run: " + command,
-      "Copy command", "Check again");
-    if (choice === "Copy command") await vscode.env.clipboard.writeText(command);
-    if (choice === "Check again") await this.pushChoices();
+    const status = await kasStatus(true);
+    const reason = status.available ? "kiro-cli is usable now; reopen the picker." : String(status.reason || "kiro-cli is not usable on the gateway host");
+    const choice = await vscode.window.showInformationMessage("Kiro modes (Spec, Quick Spec, Bug Fix, Plan) run in kiro-cli on the gateway host. " + reason, "Check again");
+    if (choice === "Check again") { invalidateKasStatus(); await this.pushChoices(); }
   }
   pushTabs() {
     const rows = this.tabs.map((t) => {
+      if (isKasTab(t)) {
+        // A Kiro-mode tab has no gateway slot: its state is what the Kas_Link reported.
+        const k = t.kas || (t.kas = kasTabState());
+        t.live = {};
+        const shown = Object.assign({}, t.settings, { engine: "kas", mode: k.mode || t.settings.mode, autopilot: k.sessionId ? k.autopilot : Boolean(t.settings.autopilot) });
+        return { id: t.id, key: t.key, title: tabLabel(t, null), settings: shown, engine: "kas", kasState: k.state,
+          running: Boolean(k.running), waiting: Object.keys(k.asks || {}).length > 0 };
+      }
       const slot = t.key ? this.sessions.slot(t.key) : null;
       // A live slot is the truth for what the session RUNS with (the dashboard
       // may have changed them, and the host fills a slot's model with the one it
@@ -637,9 +643,11 @@ class ChatView {
     const t = this.tab(this.active);
     if (!t) return;
     const slot = t.key ? this.sessions.slot(t.key) : null;
-    if (slot && slot.running) {
+    const running = isKasTab(t) ? Boolean(t.kas && t.kas.running) : Boolean(slot && slot.running);
+    if (running) {
       const label = tabLabel(t, slot);
-      const pick = await vscode.window.showWarningMessage("Close the running tab “" + label + "”?", { modal: true, detail: "The session keeps running in the gateway; find it again under History." }, "Close");
+      const detail = isKasTab(t) ? "The session keeps running in kiro-cli on the gateway host; find it again under History (Kiro modes)." : "The session keeps running in the gateway; find it again under History.";
+      const pick = await vscode.window.showWarningMessage("Close the running tab “" + label + "”?", { modal: true, detail }, "Close");
       if (pick !== "Close") return;
     }
     this.post({ type: "tabs.close" });
@@ -686,11 +694,309 @@ class ChatView {
     await this.load(t);
   }
   async load(t) {
+    if (isKasTab(t) && t.kas && t.kas.sessionId) { await this.kasAttach(t, "load"); return; }
     this.post({ type: "clear", id: t.id });
     this.post({ type: "session", id: t.id, key: t.key });
     const rows = await this.sessions.transcript(t.key).catch(() => []);
     for (const row of rows) this.post({ type: "row", id: t.id, row: normalizeRow(row) });
     this.post({ type: "scroll", id: t.id });
+  }
+  /**
+   * Open a Kiro-mode session (from History's "Kiro modes" group or a spec
+   * action) in a tab: the open one when the session already has a tab, else a
+   * fresh Kas_Tab attached with `since: 0`, so the hook replays everything it
+   * holds (or `session/load`s the session into a new kiro-cli child).
+   */
+  async openKas(sessionId, { mode, title, select = true } = {}) {
+    const key = "kas:" + sessionId;
+    let t = this.tabForKey(key);
+    if (!t) {
+      const draft = this.tabs.find((x) => !x.key && x.id === this.active) || null;
+      t = draft || this.newTab(false);
+      t.key = key;
+      t.kind = "kas";
+      t.kas = kasTabState({ sessionId, mode: mode || "", state: "detached" });
+      t.settings.engine = "kas";
+      if (mode) t.settings.mode = mode;
+      t.title = title || "Kiro " + (mode || "mode");
+      this.saveTabs();
+    }
+    if (select) this.select(t.id);
+    await this.kasAttach(t, "open");
+    return t;
+  }
+  // -- Kiro-mode tabs (hook/kas.py over the Kas_Link) -----------------------
+  /** This workspace's Kas_Link, created on first use; its frames feed onKasFrame. */
+  kasLink() {
+    if (!this.kas) {
+      this.kas = new KasLink(this.sessions.projectPath());
+      this.kas.on((frame) => this.onKasFrame(frame));
+      this.context.subscriptions.push({ dispose: () => { if (this.kas) this.kas.dispose(); } });
+    }
+    return this.kas;
+  }
+  /** Every open Kiro-mode tab with a session. */
+  kasTabs() { return this.tabs.filter((t) => isKasTab(t) && t.kas && t.kas.sessionId); }
+  /**
+   * Attach (or re-attach) a Kiro-mode tab to its session: `attach {sessionId,
+   * since: lastSeq}`; the hook replays what the tab missed, or `clear`s and
+   * replays everything after a `session/load` into a fresh child. `why` is
+   * "load" (startup), "open", "reconnect" (the link came back) or "reload"
+   * (the user's button on a detached session).
+   */
+  async kasAttach(t, why) {
+    const k = t.kas;
+    if (!k || !k.sessionId) return false;
+    this.post({ type: "session", id: t.id, key: t.key, engine: "kas" });
+    if (why === "load" || why === "open") { this.post({ type: "clear", id: t.id }); k.lastSeq = 0; k.asks = {}; }
+    const link = this.kasLink();
+    try {
+      await link.ready();
+      await link.request({ op: "attach", sessionId: k.sessionId, since: k.lastSeq });
+      k.state = "live";
+      if (why === "load" || why === "open") this.post({ type: "scroll", id: t.id });
+      this.saveTabs();
+      this.pushTabs();
+      return true;
+    } catch (error) {
+      k.state = "detached";
+      this.pushTabs();
+      const text = error && error.frame && error.frame.login ? String(error.message) + " — run `kiro-cli login` on the gateway host." : "Kiro-mode session: " + (error && error.message || error);
+      this.post({ type: "error", id: t.id, text });
+      this.post({ type: "interrupted", id: t.id, text: "This Kiro-mode session is detached.", resume: true, label: "Reload session", hint: "Attach again (the hook starts kiro-cli for this workspace if needed and loads the session)." });
+      return false;
+    }
+  }
+  /** A frame from the Kas_Link: link events, spec events, and per-session frames through the Adapter. */
+  onKasFrame(frame) {
+    if (!frame || typeof frame !== "object") return;
+    if (frame.kind === "_open") {
+      // The link (re)opened: every Kiro-mode tab attaches again with what it last saw.
+      for (const t of this.kasTabs()) this.kasAttach(t, "reconnect").catch((e) => log("kas re-attach " + t.key + ": " + e.message));
+      invalidateKasStatus();
+      return;
+    }
+    if (frame.kind === "_closed") {
+      for (const t of this.kasTabs()) { t.kas.state = "reconnecting"; this.post({ type: "status", id: t.id, text: "Reconnecting to kiro-cli…" }); }
+      this.pushTabs();
+      return;
+    }
+    if (frame.kind === "_helloFailed") {
+      for (const t of this.kasTabs()) this.post({ type: "error", id: t.id, text: "kiro-cli: " + frame.error });
+      return;
+    }
+    if (frame.kind === "specEvent" || frame.kind === "sessionsChanged") {
+      for (const fn of this.kasSpecListeners) { try { fn(frame); } catch (e) { log("kas spec listener: " + e.message); } }
+      if (frame.kind === "sessionsChanged") return;
+    }
+    if (frame.kind === "childState") {
+      // Not per session: every tab of the workspace whose child exited learns it.
+      const ids = new Set(Array.isArray(frame.sessions) ? frame.sessions : []);
+      for (const t of this.kasTabs()) if (!ids.size || ids.has(t.kas.sessionId) || frame.wsHash === t.kas.wsHash) this.applyKasMessages(t, kasFramesToMessages(frame, t.kas));
+      this.pushTabs();
+      return;
+    }
+    if (!frame.sessionId) return;
+    const t = this.tabForKey("kas:" + frame.sessionId);
+    if (!t || !t.kas) return;
+    this.applyKasMessages(t, kasFramesToMessages(frame, t.kas));
+  }
+  /** Post the Adapter's messages to the tab's pane; the `_`-prefixed ones update the tab record instead. */
+  applyKasMessages(t, messages) {
+    let tabsChanged = false;
+    for (const m of messages) {
+      if (m.type === "_attached") { tabsChanged = true; if (m.title && !t.renamed && (t.title === "New chat" || /^Kiro /.test(t.title))) t.title = String(m.title).slice(0, 60); continue; }
+      if (m.type === "_mode") { t.settings.mode = m.mode; tabsChanged = true; continue; }
+      if (m.type === "_config") {
+        if (m.autopilot !== undefined) t.settings.autopilot = m.autopilot;
+        if (m.model !== undefined) t.settings.model = m.model;
+        if (m.effort !== undefined) t.settings.effort = m.effort;
+        if (m.mode) t.settings.mode = m.mode;
+        tabsChanged = true;
+        continue;
+      }
+      if (m.type === "_title") { if (!t.renamed && (t.title === "New chat" || /^Kiro /.test(t.title))) { t.title = String(m.title).slice(0, 60); tabsChanged = true; } continue; }
+      if (m.type === "done" || m.type === "row" || m.type === "question" || m.type === "questionResolved") tabsChanged = true;
+      this.post(Object.assign({ id: t.id }, m));
+      if (m.type === "done") this.noteKasTurnEnd(t);
+    }
+    if (tabsChanged) { this.saveTabs(); this.pushTabs(); }
+    else if (messages.length) this.saveTabs();
+  }
+  /** A Kiro-mode turn ended: the task-run link (if any) learns its outcome. */
+  noteKasTurnEnd(t) {
+    if (t.link) this.noteLinkOutcome(t, t.stopped ? "stopped" : "ok");
+    t.stopped = false;
+  }
+  /**
+   * Send from a Kiro-mode tab (requirements 3.2, 3.8): open the link, create
+   * the session on first use (`new` with the mode and the tab's picks), say the
+   * once-per-tab notice, upload non-image attachments, build the ACP prompt
+   * blocks and send `prompt`. The `#` contexts travel as text blocks, images
+   * inline; steering is KAS's own.
+   */
+  async kasSend(t, msg) {
+    const text = String(msg.text || "");
+    const files = Array.isArray(msg.files) ? msg.files : [];
+    const contexts = Array.isArray(msg.contexts) ? msg.contexts : [];
+    if (!text.trim() && !files.length && !contexts.length) return;
+    const k = t.kas || (t.kas = kasTabState());
+    t.kind = "kas";
+    t.settings.engine = "kas";
+    t.turnError = ""; t.stopped = false;
+    const link = this.kasLink();
+    const hello = await link.ready();
+    if (hello && hello.login === false) throw new Error((hello.message || "kiro-cli is not logged in") + " — run `kiro-cli login` on the gateway host.");
+    if (k.running) throw new Error("this Kiro-mode session is still running; wait for the turn to end or press Stop");
+    if (!k.sessionId) {
+      const mode = KAS_MODES.includes(t.settings.mode) ? t.settings.mode : (KAS_MODES.includes(k.mode) ? k.mode : "spec");
+      const created = await link.request({ op: "new", mode, autopilot: Boolean(t.settings.autopilot), model: t.settings.model || undefined, effort: t.settings.effort || undefined, title: t.pendingTitle || (t.renamed ? t.title : undefined), tabRef: String(t.id) });
+      k.sessionId = created.sessionId; k.mode = created.mode || mode; k.wsHash = created.wsHash || ""; k.state = "live"; k.autopilot = Boolean(t.settings.autopilot);
+      t.key = "kas:" + k.sessionId;
+      if (!t.renamed) t.title = t.pendingTitle || (text || (files[0] && files[0].name) || "Kiro " + mode).slice(0, 40);
+      delete t.pendingTitle;
+      for (const note of created.notes || []) this.post({ type: "status", id: t.id, text: String(note) });
+      this.saveTabs();
+      this.pushTabs();
+      this.post({ type: "session", id: t.id, key: t.key, engine: "kas" });
+      if (t.link && taskSessionLinks()) taskSessionLinks().setSession(t.link, t.key);
+    }
+    if (!k.noticeShown) { this.post({ type: "status", id: t.id, text: KAS_TAB_NOTICE }); k.noticeShown = true; this.saveTabs(); }
+    const attached = [];
+    for (const f of files) {
+      const image = /^image\//.test(f.mime || "");
+      if (image) {
+        const size = Math.floor(String(f.data || "").length * 3 / 4);
+        attached.push({ name: f.name, image: true, mime: f.mime, data: f.data, preview: size <= IMAGE_PREVIEW_MAX ? "data:" + f.mime + ";base64," + f.data : undefined });
+      } else {
+        const bytes = Uint8Array.from(atob(f.data || ""), (c) => c.charCodeAt(0));
+        const path = await this.sessions.upload(f.name || "attachment", bytes, f.mime);
+        attached.push({ name: f.name, image: false, path });
+      }
+    }
+    const blocks = kasPromptBlocks(text, contexts, attached);
+    this.post({ type: "user", id: t.id, local: msg.local || undefined, text: msg.display || text.trim() || blocks[blocks.length - 1].text, contexts: contexts.map((c) => contextChipEcho(c)), files: attached.map((a) => ({ name: a.name, path: a.path, image: a.image, data: a.preview })) });
+    const accepted = await link.request({ op: "prompt", sessionId: k.sessionId, blocks });
+    this.applyKasMessages(t, kasFramesToMessages(accepted, k));
+    this.pushTabs();
+  }
+  /** Approve / Reject on a Kiro-mode approval card: the parked request is answered with the matching ACP option. */
+  async kasApprove(t, requestId, action) {
+    const k = t.kas;
+    const rid = /^\d+$/.test(String(requestId)) ? Number(requestId) : String(requestId);
+    const ask = (k && k.asks && k.asks[rid]) || null;
+    const choice = kasPermissionChoice(ask ? ask.options : [], action);
+    await this.kasLink().ready();
+    this.kasLink().send({ op: "answer", requestId: rid, optionId: choice || undefined, cancel: !choice });
+  }
+  /** A Kiro-mode question card: the chosen option's title is the `_kiro/userInput` answer; Dismiss cancels it. */
+  async kasAnswer(t, askId, answers, dismissed) {
+    const raw = String(askId || "").replace(/^kas:/, "");
+    const rid = /^\d+$/.test(raw) ? Number(raw) : raw;
+    const answer = Object.values(answers || {}).map((v) => String(v)).filter(Boolean)[0] || "";
+    await this.kasLink().ready();
+    this.kasLink().send({ op: "answer", requestId: rid, answer: dismissed ? undefined : answer, cancel: Boolean(dismissed) || !answer });
+  }
+  /** Stop on a Kiro-mode tab: `session/cancel`; the turn ends with stopReason `cancelled`. */
+  async kasStop(t) {
+    if (!t.kas || !t.kas.sessionId) return;
+    t.stopped = true;
+    await this.kasLink().ready();
+    this.kasLink().send({ op: "cancel", sessionId: t.kas.sessionId });
+  }
+  /** Autopilot / model / effort / mode on a live Kiro-mode tab go to KAS through `config`. */
+  async kasConfig(t, patch) {
+    if (!t.kas || !t.kas.sessionId) return;
+    const link = this.kasLink();
+    await link.ready();
+    const reply = await link.request(Object.assign({ op: "config", sessionId: t.kas.sessionId }, patch));
+    if (reply && reply.autopilot !== undefined) { t.kas.autopilot = Boolean(reply.autopilot); t.settings.autopilot = t.kas.autopilot; }
+    if (reply && reply.mode) { t.kas.mode = reply.mode; t.settings.mode = reply.mode; }
+    for (const note of (reply && reply.notes) || []) this.post({ type: "status", id: t.id, text: String(note) });
+    this.saveTabs();
+    this.pushTabs();
+  }
+  // -- spec actions on Kiro's engine (requirements 5.1–5.3, 5.6, 5.7) -----------
+  /** The engine spec actions run on: "kas" when `kirocrew.specEngine` is kas AND kiro-cli is usable, else "gateway". */
+  async specEngine() {
+    if (cfg("specEngine", "gateway") !== "kas") return "gateway";
+    const status = await kasStatus();
+    return status && status.available ? "kas" : "gateway";
+  }
+  /** One `_kiro/spec/*` call through the Kas_Link; a method the installed KAS lacks rejects with `.methodNotFound`. */
+  async kasSpec(method, params) {
+    const link = this.kasLink();
+    await link.ready();
+    try {
+      const reply = await link.request({ op: "spec", method, params });
+      return reply && reply.result;
+    } catch (error) {
+      if (error && error.frame && error.frame.code === -32601) error.methodNotFound = true;
+      throw error;
+    }
+  }
+  /**
+   * Run a spec action on the engine `specEngine()` picks: `viaKas()` on Kiro's
+   * engine, else `viaGateway()` (the existing Send_Path, unchanged). A spec
+   * method the installed KAS does not implement (-32601) falls back to the
+   * gateway once, with a status row and a status-bar note saying so; any other
+   * KAS error is the caller's.
+   */
+  async specAction(viaKas, viaGateway) {
+    if ((await this.specEngine()) !== "kas") return viaGateway();
+    try {
+      return await viaKas();
+    } catch (error) {
+      if (!(error && error.methodNotFound)) throw error;
+      log("Kiro's engine lacks a spec method (" + error.message + "); this action runs on the gateway");
+      vscode.window.setStatusBarMessage("KiroCrew: Kiro's engine does not implement this spec method; running it on the gateway", 6000);
+      const t = this.tab(this.active);
+      if (t) this.post({ type: "status", id: t.id, text: "Kiro's engine (kiro-cli) does not implement this spec method; the mod's own version runs on the gateway instead." });
+      return viaGateway();
+    }
+  }
+  /**
+   * A spec action on Kiro's engine (design §Spec operations): resolve the
+   * feature's spec session (`fresh` for createSpec, `reuse` otherwise), open or
+   * focus it as a Kiro-mode tab, then `_kiro/spec/invoke` with `op` and `args`.
+   * The tab carries the spec (findSpecTab) and the task link (engine kas) but
+   * NO run record: Kiro's orchestrator owns resume through its checkpoint, so
+   * the mod's resume logic never touches these tabs. Returns the tab.
+   */
+  async runKasSpec(op, args, { feature, dir, title, link } = {}) {
+    const root = this.sessions.projectPath();
+    const params = { strategy: op === "createSpec" ? "fresh" : "reuse", workspacePaths: [root] };
+    if (feature && op !== "createSpec") params.featureName = feature;
+    const resolved = await this.kasSpec("_kiro/spec/resolveSession", params);
+    const sessionId = resolved && resolved.sessionId;
+    if (!sessionId) throw new Error("_kiro/spec/resolveSession returned no session");
+    await vscode.commands.executeCommand("kirocrew.chat.focus").then(undefined, () => undefined);
+    const t = await this.openKas(sessionId, { mode: "spec", title: title || ("Kiro spec" + (feature ? ": " + feature : "")) });
+    t.kind = "kas";
+    t.spec = feature ? specTabRecord({ name: feature, dir: dir && dir.path !== undefined ? dir.path : dir }) : null;
+    t.run = null;
+    t.link = typeof link === "string" && link ? link : null;
+    t.stopped = false;
+    if (title && !t.renamed) t.title = String(title).slice(0, 60);
+    if (!t.kas.noticeShown) { this.post({ type: "status", id: t.id, text: KAS_TAB_NOTICE }); t.kas.noticeShown = true; }
+    this.saveTabs();
+    this.pushTabs();
+    if (t.link && taskSessionLinks()) taskSessionLinks().setSession(t.link, sessionId);
+    await this.kasSpec("_kiro/spec/invoke", Object.assign({ operation: op, sessionId }, args));
+    t.kas.running = true;   // the invoke's turn (KAS echoes its user message; turnEnd closes it)
+    this.pushTabs();
+    // The task metadata is polled while this run is live (requirement 5.4), event or not.
+    if (feature && kasTasks() && (op === "executeTask" || op === "runAllTasks")) kasTasks().track(feature, () => Boolean(t.kas && t.kas.running));
+    return t;
+  }
+  /**
+   * The spec's existing documents as absolute paths — `specDocuments` of the
+   * `_kiro/spec/invoke` operations — and its tasks.md path.
+   */
+  static kasSpecDocuments(spec) {
+    const dir = spec.dir.path !== undefined ? spec.dir.path : String(spec.dir);
+    const files = SPEC_MODEL_FILES.filter((f) => spec.present && spec.present[f]);
+    return { specDocuments: files.map((f) => dir + "/" + f), tasksFilePath: dir + "/tasks.md" };
   }
   async onMessage(msg) {
     try {
@@ -726,16 +1032,26 @@ class ChatView {
         if (item) this.post({ type: "context", id: t.id, item });
       } else if (msg.type === "image" && msg.path) {
         this.post(Object.assign({ type: "image", id: t.id, path: msg.path }, await imageData(msg.path)));
+      } else if (msg.type === "stop" && isKasTab(t)) {
+        await this.kasStop(t);
       } else if (msg.type === "stop" && t.key) {
         t.stopped = true; // a run the user stopped is not resumed on its own
         this.noteLinkOutcome(t, "stopped");
         await this.sessions.stop(t.key);
+      } else if (msg.type === "resume" && isKasTab(t)) {
+        await this.kasAttach(t, "reload");
       } else if (msg.type === "resume" && t.key) {
         await this.resume(t, "button");
+      } else if (msg.type === "approve" && isKasTab(t)) {
+        await this.kasApprove(t, msg.requestId, msg.action);
       } else if (msg.type === "approve" && t.key) {
         await this.sessions.approve(t.key, msg.requestId, msg.action);
+      } else if (msg.type === "dashboard" && isKasTab(t)) {
+        this.post({ type: "status", id: t.id, text: "Kiro-mode sessions live in kiro-cli's own store on the gateway host (not in KiroCrew's); the mod's FloofyCrew page lists them." });
       } else if (msg.type === "dashboard" && t.key) {
         vscode.env.openExternal(vscode.Uri.parse(ORIGIN + "/chat/" + encodeURIComponent(t.key)));
+      } else if (msg.type === "answer" && isKasTab(t) && msg.card && /^kas:/.test(String(msg.card.ask_id || ""))) {
+        await this.kasAnswer(t, msg.card.ask_id, msg.answers || {}, Boolean(msg.dismissed));
       } else if (msg.type === "answer" && t.key) {
         await this.answer(t.key, msg.card, msg.answers || {}, Boolean(msg.dismissed));
       } else if (msg.type === "open") {
@@ -763,6 +1079,10 @@ class ChatView {
     // The page drew this turn's bubble already (`msg.local`) and set its pane to running;
     // should anything below throw, the error row lands under it and the pane is released.
     const release = () => { if (msg.local) this.post({ type: "done", id: t.id }); };
+    if (isKasTab(t)) {
+      try { await this.kasSend(t, msg); } catch (error) { release(); throw error; }
+      return;
+    }
     try { await this._send(t, msg, text, files, contexts); } catch (error) { release(); throw error; }
   }
   async _send(t, msg, text, files, contexts) {
@@ -771,12 +1091,9 @@ class ChatView {
     // A new turn supersedes the judgement of the last one.
     if (t.runCheck) { clearTimeout(t.runCheck); t.runCheck = null; }
     t.turnError = ""; t.stopped = false; t.lastAssistant = "";
-    // A Kiro Spec & Plan agent for this mode runs Kiro's real workflow; it
-    // replaces both the agent pick and the frame — unless this host refuses the
-    // mode ids (KiroCrew 0.8.0.9+ reserves KAS's bundled ids before the wire, see
-    // RESERVED_MODE_AGENTS); then the prompt-guided workflow runs on the pick.
-    const kasAgent = this.modeAgentsRefused ? null : kasAgentFor(s.mode, this.sessions.agents);
-    const agent = kasAgent || s.agent;
+    // Kiro's own modes run in kiro-cli through a Kiro-mode tab (kasSend); a gateway tab
+    // runs the mod's prompt-guided workflow frame on the picked agent.
+    const agent = s.agent;
     const fresh = !t.key;
     if (!t.key) {
       // A draft tab the user renamed keeps that title and hands it to the new session.
@@ -829,7 +1146,7 @@ class ChatView {
     for (const c of contexts) {
       if (c && c.content) await this.sessions.inject(t.key, "[" + c.label + "]\n" + c.content, "kirocrew-ide #" + (c.kind || "context")).catch((e) => this.post({ type: "error", id: t.id, text: "context: " + e.message }));
     }
-    const frame = kasAgent ? "" : workflowContext(s.mode, this.sessions.projectPath());
+    const frame = workflowContext(s.mode, this.sessions.projectPath());
     if (frame) await this.sessions.inject(t.key, frame, "kirocrew-ide workflow").catch((e) => this.post({ type: "error", id: t.id, text: "workflow: " + e.message }));
     if (!text.trim()) text = attached.length ? "See the attached file(s)." : "See the context provided.";
     // A session's first turn says what steers it (Kiro's IDE shows the included steering as context).
@@ -839,44 +1156,7 @@ class ChatView {
     // `local` names the bubble the page drew at send time, which this message completes.
     this.post({ type: "user", id: t.id, local: msg.local || undefined, text: msg.display || typed || text, contexts: contexts.map((c) => contextChipEcho(c)), files: attached.map((a) => ({ name: a.name, path: a.path, image: a.image, data: a.data })) });
     const meta = attached.length ? { files: attached.map((a) => a.path) } : undefined;
-    // The host accepts the turn (`/chat?ws=1` answers 200 at once) and runs it
-    // asynchronously, so a refusal of Kiro's mode agent usually arrives later
-    // as a streamed error row (onFrame), not as a rejected send. Remember what
-    // this turn was so either path can re-send it on the fallback agent.
-    t.pendingTurn = kasAgent ? { text, meta, kasAgent } : null;
-    try {
-      await this.sessions.send(t.key, text, agent, meta);
-    } catch (error) {
-      if (kasAgent && isReservedModeRefusal(error.message)) { await this.fallBackFromModeAgent(t); return; }
-      throw error;
-    }
-  }
-  /**
-   * The host will not run a session on Kiro's bundled mode id (KiroCrew
-   * 0.8.0.9+ reserves them). Remember that for this window, retarget the tab's
-   * slot to the user's pick with the prompt-guided frame, and send the
-   * remembered turn once more. Idempotent per turn: the second trigger (a
-   * rejected send AND its error row, or two error rows) finds nothing pending.
-   */
-  async fallBackFromModeAgent(t) {
-    const pending = t.pendingTurn;
-    if (!pending) return false;
-    t.pendingTurn = null;
-    const s = t.settings;
-    this.modeAgentsRefused = true;
-    log("host refuses the Kiro mode agent " + pending.kasAgent + "; falling back to the prompt-guided workflow");
-    this.post({ type: "error", id: t.id, text: "This KiroCrew refuses Kiro's mode agent \"" + pending.kasAgent + "\" (it reserves the bundled mode ids). Running the " + s.mode + " workflow as a prompt-guided frame on " + (s.agent || "the crew default") + " instead; update kiro-spec-plan when a fixed version exists." });
-    await this.sessions.setSlotAgent(t.key, s.agent || "").catch(() => undefined);
-    const frame = workflowContext(s.mode, this.sessions.projectPath());
-    if (frame) await this.sessions.inject(t.key, frame, "kirocrew-ide workflow").catch(() => undefined);
-    // The receipt already posted named the refused mode agent; say what steers the agent that runs.
-    try {
-      const docs = await listSteering(this.sessions.projectPath());
-      const note = docs.length ? await this.steeringNote(docs, s.agent) : null;
-      if (note) this.post({ type: "status", id: t.id, text: note });
-    } catch (e) { log("steering (fallback): " + e.message); }
-    await this.sessions.send(t.key, pending.text, s.agent, pending.meta);
-    return true;
+    await this.sessions.send(t.key, text, agent, meta);
   }
   /**
    * The steering of one turn: { contexts, note }. `contexts` are the fileMatch
@@ -904,8 +1184,7 @@ class ChatView {
    * The one-line "steered by" receipt for `agentName`: the always-included
    * files per tier (they load with the agent — on KAS for every agent, on the
    * legacy engine only through the agent's `resources`), then the rest with
-   * their modes. Names the agent, since a Spec tab can change agent on the host's
-   * mode-id refusal (fallBackFromModeAgent re-posts it for the fallback agent).
+   * their modes. Names the agent.
    */
   async steeringNote(docs, agentName) {
     const backend = await readAcpBackend();
@@ -928,9 +1207,9 @@ class ChatView {
    * Specs view): a fresh tab with the given mode (and agent when forced),
    * everything else inherited from the current picks, then the same send path
    * a typed message takes — so the workflow frame is injected and the tab's
-   * bar shows the mode. `text` may be a function of the Kiro agent that will
-   * run the turn (null on the crew agent), so a task run can send Kiro's own
-   * engine request to Kiro's Spec agent and a paraphrase otherwise. `display`
+   * bar shows the mode. `text` may be a function (called with null; the
+   * callers' task-run texts take the engine's own request or the mod's own,
+   * and on the gateway path it is always the mod's). `display`
    * is what the transcript shows for the turn (Kiro shows "Execute Task: …"
    * while sending the engine its longer request); `autopilot` approves every
    * tool of the session, as Kiro's IDE does for task runs. Neither is
@@ -941,8 +1220,12 @@ class ChatView {
    * TaskSessionLinks record of a task run: the tab fills in its session id
    * once created and its outcome when the turn ends. Returns the session key.
    */
-  async dispatch(text, { mode, agent, title, kind, display, autopilot, run, spec, contexts, link } = {}) {
+  async dispatch(text, { mode, agent, title, kind, display, autopilot, run, spec, contexts, link, engine } = {}) {
     const t = this.newTab(true);
+    // A spec turn runs on the gateway path unless the caller asks for Kiro's engine
+    // (task 7's specEngine); the inherited `engine: "kas"` of the last tab must not decide it.
+    t.settings.engine = engine === "kas" ? "kas" : "";
+    if (engine === "kas") { t.kind = "kas"; t.kas = kasTabState({ mode: mode || "spec" }); }
     if (mode) t.settings.mode = mode;
     if (agent) t.settings.agent = agent;
     if (autopilot) t.settings.autopilot = true;
@@ -954,7 +1237,7 @@ class ChatView {
     t.link = typeof link === "string" && link ? link : null;
     t.pendingTitle = title;
     this.pushTabs();
-    const body = typeof text === "function" ? text(kasAgentFor(t.settings.mode, this.sessions.agents)) : text;
+    const body = typeof text === "function" ? text(null) : text;
     await this.send(t, { text: body, display, contexts: Array.isArray(contexts) ? contexts.slice() : undefined });
     return t.key;
   }
@@ -969,7 +1252,7 @@ class ChatView {
   findSpecTab(feature, dir) {
     const name = String(feature || "");
     if (!name) return null;
-    const matches = this.tabs.filter((x) => x.key && specTabMatches(x, name, dir));
+    const matches = this.tabs.filter((x) => x.key && !isKasTab(x) && specTabMatches(x, name, dir));
     if (!matches.length) return null;
     const idle = matches.filter((x) => { const slot = this.sessions.slot(x.key); return !(slot && slot.running); });
     return (idle.length ? idle : matches)[(idle.length ? idle : matches).length - 1];
@@ -978,7 +1261,7 @@ class ChatView {
    * Send one spec turn (`kind`: create | generate | update | fix | review; see
    * specTurnText) on the spec `feature`, the way the title-bar actions, the
    * Specs view and the review comments do: the Spec_Agent (`kirocrew.specAgent`,
-   * Spec mode, so Kiro's Spec agent runs it when kiro-spec-plan is installed),
+   * Spec mode) on the gateway, or Kiro's own engine when `kirocrew.specEngine` is kas,
    * the spec's own tab when findSpecTab finds one that is idle (the same rule
    * the resume feature uses) and a fresh Spec tab otherwise, the sibling
    * documents that exist attached as `#file` contexts through the Send_Path,
@@ -1002,6 +1285,39 @@ class ChatView {
     const text = specTurnText(kind, file, Object.assign({}, opts, { spec }));
     const display = opts.displayText || specTurnDisplay(kind, file, Object.assign({}, opts, { spec }));
     const title = opts.title || specTurnTitle(kind, file, Object.assign({}, opts, { spec }));
+    if ((await this.specEngine()) === "kas") {
+      // Kiro's engine: createSpec / generateDocument are its own operations (design §Spec
+      // operations); a review or fix turn is the mod's text, sent as a prompt into the
+      // spec's KAS session. A method KAS lacks falls back to the gateway path below.
+      const viaKas = async () => {
+        const docs = ChatView.kasSpecDocuments(spec);
+        if (kind === "create") {
+          const t = await this.runKasSpec("createSpec", { userPrompt: String(opts.idea || text) }, { feature: spec.name, dir: spec.dir, title });
+          return { key: t.key, reused: false, engine: "kas" };
+        }
+        if (kind === "generate" || kind === "update") {
+          const documentType = String(file || "").replace(/\.md$/, "") || "requirements";
+          const t = await this.runKasSpec("generateDocument", { featureName: spec.name, specDocuments: docs.specDocuments, documentType, action: kind === "generate" ? "create" : "update" }, { feature: spec.name, dir: spec.dir, title });
+          return { key: t.key, reused: true, engine: "kas" };
+        }
+        const resolved = await this.kasSpec("_kiro/spec/resolveSession", { featureName: spec.name, strategy: "reuse", workspacePaths: [this.sessions.projectPath()] });
+        await vscode.commands.executeCommand("kirocrew.chat.focus").then(undefined, () => undefined);
+        const t = await this.openKas(resolved.sessionId, { mode: "spec", title });
+        t.spec = specTabRecord({ name: spec.name, dir: spec.dir.path });
+        await this.send(t, { text, display, contexts: await specSiblingContexts(spec, file) });
+        return { key: t.key, reused: true, engine: "kas" };
+      };
+      try {
+        const out = await viaKas();
+        vscode.window.setStatusBarMessage("KiroCrew: " + display + " — Kiro's engine, session " + out.key.replace(/^kas:/, ""), 5000);
+        return out;
+      } catch (error) {
+        if (!(error && error.methodNotFound)) throw error;
+        vscode.window.setStatusBarMessage("KiroCrew: Kiro's engine does not implement this spec method; running it on the gateway", 6000);
+        const t = this.tab(this.active);
+        if (t) this.post({ type: "status", id: t.id, text: "Kiro's engine (kiro-cli) does not implement this spec method; the mod's own version runs on the gateway instead." });
+      }
+    }
     const contexts = await specSiblingContexts(spec, file);
     await vscode.commands.executeCommand("kirocrew.chat.focus").then(undefined, () => undefined);
     const existing = this.findSpecTab(spec.name, spec.dir.path);
@@ -1029,8 +1345,9 @@ class ChatView {
    */
   idleTab() {
     const t = this.tab(this.active);
-    const slot = t && t.key ? this.sessions.slot(t.key) : null;
-    if (t && !(slot && slot.running)) return t;
+    const slot = t && t.key && !isKasTab(t) ? this.sessions.slot(t.key) : null;
+    const running = isKasTab(t) ? Boolean(t.kas && t.kas.running) : Boolean(slot && slot.running);
+    if (t && !running) return t;
     return this.newTab(true);
   }
   /** Resolves once the page has said `ready` (or after `timeout` ms): a message posted before that is lost. */
@@ -1092,8 +1409,7 @@ class ChatView {
     const slot = this.sessions.slot(t.key);
     if (slot && slot.running) { this.post({ type: "status", id: t.id, text: "The session is still running; nothing to resume." }); return false; }
     if (t.run) {
-      const kas = this.modeAgentsRefused ? null : kasAgentFor(t.settings.mode, this.sessions.agents);
-      const r = await resumeRequest(t.run, kas);
+      const r = await resumeRequest(t.run, null);
       if (!r.text) { this.post({ type: "status", id: t.id, text: "Nothing to resume: " + r.reason + "." }); return false; }
       log("resume (" + why + ") " + t.key + ": " + r.display);
       await this.send(t, { text: r.text, display: r.display });
@@ -1243,32 +1559,48 @@ class ChatView {
   /** A composer pick changed: remember it on the tab (and as the default for new tabs), apply it live when the session exists. */
   async setSetting(t, key, value) {
     if (!["agent", "model", "effort", "mode", "autopilot", "pick"].includes(key)) return;
+    const liveKas = isKasTab(t) && t.kas && t.kas.sessionId;
     if (key === "pick") {
-      // One picker, Kiro-style: a Kiro-mode agent IS the mode; a prompt workflow is a mode on the crew default; else a plain agent.
+      // One picker, Kiro-style: a Kiro mode (kas:<mode>) runs in kiro-cli; a Kiro-mode agent IS the
+      // mode; a prompt workflow is a mode on the crew default; else a plain agent.
       const pick = String(value || "");
       const [kind, ...rest] = pick.split(":");
       const name = rest.join(":");
-      if (kind === "workflow") { t.settings.mode = name || "default"; t.settings.agent = t.settings.baseAgent || ""; }
-      else { t.settings.agent = kind === "agent" ? name : ""; t.settings.baseAgent = t.settings.agent; t.settings.mode = modeOfAgent(t.settings.agent) || "default"; }
+      if (kind === "kas") {
+        if (!KAS_MODES.includes(name)) return;
+        if (liveKas) { await this.kasConfig(t, { mode: name }); this.lastSettings = Object.assign({}, t.settings); return; }
+        if (t.key) { this.post({ type: "status", id: t.id, text: "A Kiro mode runs in kiro-cli, not in this gateway session: open a new tab for it." }); this.pushTabs(); return; }
+        t.settings.engine = "kas"; t.settings.mode = name; t.kind = "kas";
+        t.kas = t.kas || kasTabState({ mode: name });
+        t.kas.mode = name;
+      } else {
+        if (liveKas) { this.post({ type: "status", id: t.id, text: "This tab runs in kiro-cli; open a new tab for a crew agent." }); this.pushTabs(); return; }
+        if (t.settings.engine === "kas") { t.settings.engine = ""; t.kind = undefined; t.kas = undefined; }
+        if (kind === "workflow") { t.settings.mode = name || "default"; t.settings.agent = t.settings.baseAgent || ""; }
+        else { t.settings.agent = kind === "agent" ? name : ""; t.settings.baseAgent = t.settings.agent; t.settings.mode = "default"; }
+      }
       this.lastSettings = Object.assign({}, t.settings);
       this.saveTabs();
-      if (t.key) await this.sessions.setSlotAgent(t.key, t.settings.agent).catch(() => undefined);
+      if (t.key && !isKasTab(t)) await this.sessions.setSlotAgent(t.key, t.settings.agent).catch(() => undefined);
       this.pushTabs();
       return;
     }
     t.settings[key] = key === "autopilot" ? Boolean(value) : String(value || (key === "mode" ? "default" : ""));
     this.lastSettings = Object.assign({}, t.settings);
     this.saveTabs();
+    if (liveKas) {
+      if (key === "autopilot") await this.kasConfig(t, { autopilot: t.settings.autopilot });
+      else if (key === "model") await this.kasConfig(t, { model: t.settings.model || "auto" });
+      else if (key === "effort") await this.kasConfig(t, { effort: t.settings.effort });
+      else if (key === "mode" && KAS_MODES.includes(t.settings.mode)) await this.kasConfig(t, { mode: t.settings.mode });
+      this.pushTabs();
+      return;
+    }
     if (t.key) {
       if (key === "model") await this.sessions.setModel(t.key, t.settings.model);
       else if (key === "effort") await this.sessions.setEffort(t.key, t.settings.effort);
       else if (key === "autopilot") await this.sessions.setTrust(t.key, t.settings.autopilot);
       else if (key === "agent") await this.sessions.setSlotAgent(t.key, t.settings.agent).catch(() => undefined);
-      else if (key === "mode") {
-        // On a live session a Kiro mode is an agent switch (the host re-activates the slot's agent).
-        const kasAgent = kasAgentFor(t.settings.mode, this.sessions.agents);
-        if (kasAgent) await this.sessions.setSlotAgent(t.key, kasAgent).catch(() => undefined);
-      }
     }
     this.pushTabs();
   }
@@ -1304,12 +1636,6 @@ class ChatView {
       case "chat_status": this.post({ type: "status", id, text: frame.data.status || frame.data.text || "" }); break;
       case "chat_message": {
         const row = normalizeRow(frame.data);
-        // The refusal of a Kiro mode agent lands here as the turn's error row
-        // (the send itself was accepted); the fallback re-sends on the pick.
-        if (t.pendingTurn && isErrorRow(row) && isReservedModeRefusal(row.content)) {
-          this.fallBackFromModeAgent(t).catch((e) => this.post({ type: "error", id, text: "fallback: " + e.message }));
-          break;
-        }
         this.post({ type: "row", id, row });
         // The answer's text decides later whether a stop was a question; a
         // failure row (the ceiling card included) is the reason the run check
@@ -3780,7 +4106,7 @@ function row(id, r){
   if(r.role==='chunk'||r.role==='done'||r.role==='streaming'||r.role==='queued') return;
   if(r.role==='permission'){
     const box = el(st,'permission'); box.dataset.testid='approval-card';
-    const m = r.meta||{}; const title = m.tool_title||m.tool_name||'tool';
+    const m = r.meta||{}; const title = m.tool_title||m.tool_name||'tool'; box.dataset.requestId=String(m.request_id||m.approval_id||'');
     box.textContent = 'Approval needed: '+title+(m.full_command?'\\n$ '+m.full_command:(m.tool_input?'\\n'+String(m.tool_input).slice(0,400):''));
     // One handler per decision; the buttons and approve-all / reject-all (requirement 8.4) all go through it.
     const decide=(action)=>{ vscode.postMessage({type:'approve',id,requestId:m.request_id||m.approval_id||'',action}); box.remove(); };
@@ -3808,7 +4134,7 @@ function row(id, r){
 function interrupted(id, m){
   const st=pane(id); dropResume(st);
   const d = el(st,'assistant pause'); d.dataset.testid='run-card'; linkify(d, m.text||'');
-  if(m.resume) resumeButton(st, d, id, 'Resume run', 'Re-read tasks.md and send the run\\'s request again from the next unfinished task.');
+  if(m.resume) resumeButton(st, d, id, m.label||'Resume run', m.hint||'Re-read tasks.md and send the run\\'s request again from the next unfinished task.');
   scrollLog(st);
 }
 /* The host's turn-ceiling card ("⏱️ This turn hit the 4-hour limit and was stopped … Send a
@@ -3866,7 +4192,7 @@ function renderTabs(tabs, act){
   tabsEl.innerHTML='';
   tabOrder = tabs.map((t)=>t.id);
   for(const t of tabs){
-    const st=pane(t.id); st.running=Boolean(t.running); st.settings=t.settings||st.settings; st.key=t.key; setWork(st); for(const d of st.log.querySelectorAll('.row.tool.call')) toolLive(st, d);
+    const st=pane(t.id); st.running=Boolean(t.running); st.settings=t.settings||st.settings; st.key=t.key; st.engine=t.engine||''; setWork(st); for(const d of st.log.querySelectorAll('.row.tool.call')) toolLive(st, d);
     const d=document.createElement('div'); d.className='tab'+(t.id===act?' on':''); d.title=(t.key||'new chat')+' — double-click to rename'; d.dataset.id=String(t.id);
     d.ondblclick=(e)=>{ e.preventDefault(); vscode.postMessage({type:'rename', id:t.id}); };
     d.oncontextmenu=(e)=>{ e.preventDefault(); e.stopPropagation(); openMenu(d, null, [{id:'rename', label:'Rename'}, {id:'close', label:'Close tab'}], '', (it)=>vscode.postMessage({type:it.id, id:t.id})); };
@@ -3905,7 +4231,9 @@ function renderCompose(){
     const rm=document.createElement('button'); rm.className='rm'; rm.textContent='×'; rm.title='Remove'; rm.onclick=(e)=>{ e.stopPropagation(); st.files.splice(it.i,1); renderCompose(); }; ch.appendChild(rm); chipsEl.appendChild(ch); }
   renderHint();
 }
-function renderHint(){ const st=state.get(active); $('hint').textContent = st&&st.key ? 'session '+st.key+' — runs in the gateway; find it again under History.' : 'Sessions run in the KiroCrew gateway and keep going if this window disconnects.'; }
+function renderHint(){ const st=state.get(active); const kas = st && (st.engine==='kas' || (st.settings&&st.settings.engine==='kas'));
+  $('hint').textContent = kas ? (st.key ? 'Kiro-mode session '+st.key.replace(/^kas:/,'')+' — runs in kiro-cli on the gateway host; find it again under History.' : "Kiro's own engine: this tab will run in kiro-cli on the gateway host (KAS permissions and Autopilot apply).")
+    : (st&&st.key ? 'session '+st.key+' — runs in the gateway; find it again under History.' : 'Sessions run in the KiroCrew gateway and keep going if this window disconnects.'); }
 // In-page popover menu (never window.prompt/confirm: those are no-ops in the desktop app).
 function openMenu(anchor, header, items, current, onPick){
   menu.innerHTML=''; if(header){ const h=document.createElement('div'); h.className='h'; h.textContent=header; menu.appendChild(h); }
@@ -3923,8 +4251,8 @@ document.addEventListener('mousedown', (e)=>{ if(menu.classList.contains('on') &
 document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeMenu(); });
 function setting(key, value){ const st=state.get(active); if(!st) return; st.settings[key]=value; renderCompose(); vscode.postMessage({type:'setting', id:active, key, value}); }
 // The effective pick of a tab, in the picker's own id space (see agentPicks on the extension side).
-function pickId(s){ if(s.mode && s.mode!=='default'){ const kiro=(choices.agents||[]).find(x=>x.kiro && x.id==='agent:'+s.agent); return kiro ? kiro.id : 'workflow:'+s.mode; } return s.agent ? 'agent:'+s.agent : ''; }
-function pickLabel(s){ const id=pickId(s); const it=(choices.agents||[]).find(x=>x.id===id); if(it) return it.label; return s.agent || 'Default'; }
+function pickId(s){ if(s.engine==='kas') return 'kas:'+(s.mode||'spec'); if(s.mode && s.mode!=='default'){ const kiro=(choices.agents||[]).find(x=>x.kiro && x.id==='agent:'+s.agent); return kiro ? kiro.id : 'workflow:'+s.mode; } return s.agent ? 'agent:'+s.agent : ''; }
+function pickLabel(s){ const id=pickId(s); const it=(choices.agents||[]).find(x=>x.id===id); if(it) return it.label + (s.engine==='kas' ? ' · kiro-cli' : ''); if(s.engine==='kas') return (s.mode||'Kiro mode')+' · kiro-cli'; return s.agent || 'Default'; }
 for(const [id,key,header] of [['p-model','model','Model'],['p-effort','effort','Reasoning effort']]){
   $(id).onclick=(e)=>{ const list = key==='model'?choices.models:choices.efforts; const st=state.get(active);
     if(!list.length){ vscode.postMessage({type:'choices'}); return; }
@@ -3935,7 +4263,12 @@ $('p-agent').onclick=(e)=>{ const st=state.get(active); if(!choices.agents.lengt
     // Mirror the extension's derivation so the bar updates before the round trip.
     const [kind, ...rest]=it.id.split(':'); const name=rest.join(':');
     if(kind==='hint'){ vscode.postMessage({type:'hint', value:name}); return; }
-    if(kind==='workflow'){ st.settings.mode=name; st.settings.agent=st.settings.baseAgent||''; } else { st.settings.agent = kind==='agent'?name:''; st.settings.baseAgent=st.settings.agent; st.settings.mode = it.kiro ? it.label.toLowerCase().replace(' ','-') : 'default'; }
+    if(kind==='kashint'){ vscode.postMessage({type:'hint', value:'kas'}); return; }
+    // Mirror the extension's derivation so the bar updates before the round trip (a live tab's
+    // engine cannot change; the extension's tabs push restores the bar if the pick was refused).
+    if(kind==='kas'){ if(!st.key) st.settings.engine='kas'; if(!st.key || st.engine==='kas') st.settings.mode=name; }
+    else { if(!st.key) st.settings.engine='';
+      if(kind==='workflow'){ st.settings.mode=name; st.settings.agent=st.settings.baseAgent||''; } else { st.settings.agent = kind==='agent'?name:''; st.settings.baseAgent=st.settings.agent; st.settings.mode = it.kiro ? it.label.toLowerCase().replace(' ','-') : 'default'; } }
     renderCompose(); vscode.postMessage({type:'setting', id:active, key:'pick', value:it.id}); }); };
 $('auto').onclick=()=>{ const st=state.get(active); setting('autopilot', !(st&&st.settings.autopilot)); };
 // Message font size: the transcript only (a CSS variable on .log); the tabs, bar and composer keep the workbench size.
@@ -4057,7 +4390,9 @@ window.addEventListener('message', (e)=>{
     case 'steering': steering = Array.isArray(m.items) ? m.items : []; renderSteering(); break;
     case 'closed': { const s=state.get(m.id); if(s){ s.log.remove(); state.delete(m.id);} break; }
     case 'clear': st.log.innerHTML=''; st.log.appendChild(st.work); st.streaming=null; st.buf=''; st.seen=new Set(); st.cards.clear(); st.empty=null; thinkClose(st); st.think=null; setWork(st); st.follow=true; st.unseen=false; jumpUpdate(st); pinSchedule(); break;
-    case 'session': st.key=m.key; if(m.id===active) renderHint(); break;
+    case 'session': st.key=m.key; st.engine=m.engine||''; if(m.id===active) renderHint(); break;
+    // A Kiro-mode approval answered elsewhere (another window, Autopilot turned on): its card goes.
+    case 'permissionResolved': st.log.querySelectorAll('.row.permission[data-request-id="'+String(m.requestId)+'"]').forEach((b)=>b.remove()); break;
     case 'context': st.contexts.push(m.item); if(m.id===active) renderCompose(); break;
     // The editor's "Ask about this" staged its chip and leaves the question to the user.
     case 'compose.focus': text.focus(); break;
@@ -6138,6 +6473,9 @@ function normalizeLink(raw) {
     startedAt: Number.isFinite(Number(raw.startedAt)) ? Number(raw.startedAt) : 0,
   };
   if (LINK_OUTCOMES.includes(raw.outcome)) link.outcome = raw.outcome;
+  // The engine the run went to: "kas" for Kiro's spec engine in kiro-cli (its session id is a
+  // KAS session, opened as a Kiro-mode tab; the mod's resume logic leaves it alone); else the gateway.
+  if (raw.engine === "kas") link.engine = "kas";
   return link;
 }
 
@@ -6261,7 +6599,13 @@ function taskState(task, links, opts) {
   if (fromBox !== "not_started") return fromBox;
   const feature = typeof o.feature === "string" && o.feature ? o.feature : typeof t.feature === "string" ? t.feature : "";
   const dir = o.dir !== undefined ? o.dir : t.dir;
-  const link = taskStateLink(links, feature, typeof t.id === "string" ? t.id : t.id === undefined || t.id === null ? "" : String(t.id), dir);
+  const taskId = typeof t.id === "string" ? t.id : t.id === undefined || t.id === null ? "" : String(t.id);
+  // A run on Kiro's engine reports the live execution status before the box changes.
+  if (typeof o.kasExec === "function") {
+    const live = mergeKasTaskState("not_started", o.kasExec(feature, dir, taskId));
+    if (live !== "not_started") return live;
+  }
+  const link = taskStateLink(links, feature, taskId, dir);
   if (!link) return "not_started";
   if (link.outcome === "error") return "failed";
   if (link.outcome === "stopped") {
@@ -6270,6 +6614,131 @@ function taskState(task, links, opts) {
   }
   return "not_started";
 }
+
+// ------------------------------------------- task state from Kiro's engine (requirement 5.4, 5.5)
+//
+// A spec run on Kiro's engine (kirocrew.specEngine = kas) writes its task states to
+// `~/.kiro/tasks/<wsHash>/<feature>.meta.json` and announces them as
+// `_kiro/spec/taskStatusChanged`; the box in tasks.md follows a step later (KAS ticks it
+// through fs/write_text_file when a task succeeds). The hook relays the events over the
+// Kas_Link (`specEvent`) and serves the file through `GET kas/tasks?folder&feature`; the
+// store below keeps both per feature, the lenses, borders and Specs view merge them with
+// the box, and "View session" opens the task's `lastSessionId` (or the feature's spec
+// session) as a Kiro-mode tab.
+
+const KAS_TASKS_ROUTE = "/apps/floofycrew/mods/" + IDE_TAG + "/api/kas/tasks";
+/** Poll period of the task metadata while a Kiro-mode spec run is live (the web host cannot watch ~/.kiro). */
+const KAS_TASK_POLL_MS = 2000;
+/** KAS execution statuses → Task_States for a task whose box is still `[ ]`. */
+const KAS_EXEC_STATES = { queued: "queued", running: "in_progress", in_progress: "in_progress", failed: "failed", error: "failed", aborted: "aborted", cancelled: "aborted", stopped: "aborted" };
+/**
+ * The merge table (box × executionStatus), pure: the box on the line wins whenever it says
+ * anything (`[x]` completed, `[~]` queued, `[-]` in progress); a `[ ]` task shows KAS's live
+ * execution status (queued, running → in progress, failed, cancelled/aborted → stopped);
+ * `succeed` on a `[ ]` box stays not started — the file is the truth, and KAS ticks the box
+ * itself when a task succeeds. Unknown statuses change nothing.
+ */
+function mergeKasTaskState(boxState, executionStatus) {
+  if (boxState && boxState !== "not_started") return boxState;
+  return KAS_EXEC_STATES[String(executionStatus || "").toLowerCase()] || "not_started";
+}
+/** The feature a `taskStatusChanged.tasksFilePath` names (`…/.kiro/specs/<feature>/tasks.md`), or null. */
+function kasFeatureOfPath(tasksFilePath) {
+  const m = /[\\/]\.kiro[\\/]specs[\\/]([^\\/]+)[\\/]tasks\.md$/.exec(String(tasksFilePath || ""));
+  return m ? m[1] : null;
+}
+/**
+ * The session "View session" opens for `target` ({ feature, dir, taskId }) when the spec ran
+ * on Kiro's engine, pure: the task's `lastSessionId` from the KAS task state, else the
+ * feature's spec session (`~/.kiro/spec-sessions/<wsHash>.json`), else a kas task link's
+ * session. `{ sessionId, engine: "kas" }` or null. `store` is a KasTaskStore (or anything
+ * with `statusOf`-shaped `entry(feature, dir)`), `links` the TaskSessionLinks (or array).
+ */
+function resolveKasViewSession(target, store, links) {
+  if (!target || !target.feature) return null;
+  const entry = store && typeof store.entry === "function" ? store.entry(target.feature, target.dir) : null;
+  if (entry) {
+    const row = target.taskId && entry.tasks ? entry.tasks[target.taskId] : null;
+    if (row && row.lastSessionId) return { sessionId: row.lastSessionId, engine: "kas" };
+    if (entry.specSessionId) return { sessionId: entry.specSessionId, engine: "kas" };
+  }
+  const all = Array.isArray(links) ? links : links && typeof links.all === "function" ? links.all() : [];
+  const kasLink = resolveViewSessionLink(all.filter((l) => l.engine === "kas"), target);
+  return kasLink ? { sessionId: kasLink.sessionId, engine: "kas" } : null;
+}
+/**
+ * The KAS task states of this workspace's specs: `{ tasks: { <taskId>: { executionStatus,
+ * lastSessionId, lastExecutionId, updatedAt } }, specSessionId }` per feature, from the
+ * `taskStatusChanged` events (applied at once) and the hook's `kas/tasks` route (fetched on
+ * each event and every KAS_TASK_POLL_MS while a run is live). `onDidChange` fires on every
+ * update; the activation refreshes the lenses and the Specs view from it.
+ */
+class KasTaskStore {
+  constructor(folder, options) {
+    const o = options || {};
+    this.folder = folder || "";
+    this.fetchImpl = typeof o.fetch === "function" ? o.fetch : (feature) => api(KAS_TASKS_ROUTE + "?folder=" + encodeURIComponent(this.folder) + "&feature=" + encodeURIComponent(feature));
+    this.byFeature = new Map();
+    this.polling = new Map();     // feature -> timer
+    this._change = new vscode.EventEmitter();
+    this.onDidChange = this._change.event;
+  }
+  entry(feature) { return this.byFeature.get(String(feature || "")) || null; }
+  statusOf(feature, dir, taskId) {
+    const e = this.entry(feature);
+    const row = e && e.tasks ? e.tasks[taskId] : null;
+    return row ? row.executionStatus : undefined;
+  }
+  sessionOf(feature, dir, taskId) {
+    return (resolveKasViewSession({ feature, dir, taskId }, this, []) || {}).sessionId || null;
+  }
+  /** A `specEvent` frame from the Kas_Link: `taskStatusChanged` changes are applied at once, then the file is read. */
+  applyEvent(frame) {
+    if (!frame || frame.kind !== "specEvent" || frame.method !== "_kiro/spec/taskStatusChanged") return false;
+    const params = frame.params || {};
+    const feature = kasFeatureOfPath(params.tasksFilePath);
+    if (!feature) return false;
+    const e = this.byFeature.get(feature) || { tasks: {}, specSessionId: null };
+    for (const c of Array.isArray(params.changes) ? params.changes : []) {
+      if (!c || typeof c.taskId !== "string") continue;
+      e.tasks[c.taskId] = Object.assign({}, e.tasks[c.taskId] || {}, { executionStatus: c.executionStatus, lastSessionId: c.lastSessionId || params.sessionId || null, lastExecutionId: c.lastExecutionId || null, updatedAt: Date.now() });
+    }
+    if (params.sessionId && !e.specSessionId) e.specSessionId = params.sessionId;
+    this.byFeature.set(feature, e);
+    this._change.fire({ feature });
+    this.fetch(feature).catch(() => undefined);
+    return true;
+  }
+  /** Read the hook's `kas/tasks` for `feature` and replace the entry (the file is the authority once written). */
+  async fetch(feature) {
+    const doc = await this.fetchImpl(feature);
+    if (!doc || typeof doc !== "object") return null;
+    const prev = this.byFeature.get(feature) || { tasks: {}, specSessionId: null };
+    const tasks = doc.exists && doc.tasks && typeof doc.tasks === "object" ? doc.tasks : prev.tasks;
+    const e = { tasks, specSessionId: doc.specSessionId || prev.specSessionId || null, fetchedAt: Date.now() };
+    const changed = JSON.stringify(e.tasks) !== JSON.stringify(prev.tasks) || e.specSessionId !== prev.specSessionId;
+    this.byFeature.set(feature, e);
+    if (changed) this._change.fire({ feature });
+    return e;
+  }
+  /** Poll `feature` every KAS_TASK_POLL_MS while `isLive()` holds, then once more. */
+  track(feature, isLive) {
+    if (!feature || this.polling.has(feature)) return;
+    const tick = async () => {
+      await this.fetch(feature).catch(() => undefined);
+      if (isLive()) this.polling.set(feature, setTimeout(tick, KAS_TASK_POLL_MS));
+      else { this.polling.delete(feature); await this.fetch(feature).catch(() => undefined); }
+    };
+    this.polling.set(feature, setTimeout(tick, 0));
+  }
+  dispose() {
+    for (const timer of this.polling.values()) clearTimeout(timer);
+    this.polling.clear();
+    this._change.dispose();
+  }
+}
+let kasTaskStore = null; // the activation's store; the Specs view and the lenses read it
+function kasTasks() { return kasTaskStore; }
 
 /**
  * The store. `record(link)` adds a run (returns the stored record, with its
@@ -6427,6 +6896,7 @@ class SpecTaskCodeLensProvider {
     const o = options || {};
     this._links = typeof o.links === "function" ? o.links : () => taskSessionLinks();
     this._isRunning = typeof o.isRunning === "function" ? o.isRunning : () => false;
+    this._kas = typeof o.kas === "function" ? o.kas : () => kasTasks();   // the KasTaskStore (requirement 5.4)
     this._change = new vscode.EventEmitter();
     this.onDidChangeCodeLenses = this._change.event;
   }
@@ -6451,12 +6921,14 @@ class SpecTaskCodeLensProvider {
     const links = this._links() || [];
     const all = Array.isArray(links) ? readLinks(links) : typeof links.all === "function" ? links.all() : [];
     const dir = spec.dir.path;
-    const opts = { feature: spec.name, dir, isRunning: this._isRunning };
-    // "View session" needs a run that included the task AND knows its session (requirement 4.3).
+    const kas = this._kas();
+    const opts = { feature: spec.name, dir, isRunning: this._isRunning, kasExec: kas ? (f, d, id) => kas.statusOf(f, d, id) : undefined };
+    // "View session" needs a run that included the task AND knows its session (requirement 4.3);
+    // a run on Kiro's engine knows it from the task's metadata (requirement 5.5).
     const known = all.filter((l) => l.sessionId);
     return parseTasks(text).map((task) => {
       const state = taskState(task, all, opts);
-      const hasLink = Boolean(latestLinkForTask(known, spec.name, task.id, dir));
+      const hasLink = Boolean(latestLinkForTask(known, spec.name, task.id, dir)) || Boolean(kas && kas.sessionOf(spec.name, dir, task.id));
       return { line: task.line, endLine: task.endLine, state, optional: Boolean(task.optional), lenses: taskLensSpecs(task, state, { hasLink, spec, uri }) };
     });
   }
@@ -7733,15 +8205,21 @@ class SpecsTree {
           : { command: "kirocrew.spec." + stem, title: "Write", arguments: [node] };
         return item;
       });
+      const kas = kasTasks();
       const tasks = spec.tasks.map((task) => {
         const label = (task.number ? task.number + " " : "") + task.title;
         const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
-        // Kiro's four states: the orchestrator writes `[~]` when it queues a task and `[-]` while it runs.
-        item.contextValue = task.done ? "task-done" : task.partial ? "task-running" : "task-open";
-        item.iconPath = new vscode.ThemeIcon(task.done ? "pass-filled" : task.partial ? "loading~spin" : task.queued ? "clock" : "circle-large-outline");
+        // Kiro's four states: the orchestrator writes `[~]` when it queues a task and `[-]` while it
+        // runs; a run on Kiro's engine (kirocrew.specEngine = kas) reports queued / running / failed
+        // through its task metadata before the box changes (requirement 5.4).
+        const boxState = task.done ? "completed" : task.partial ? "in_progress" : task.queued ? "queued" : "not_started";
+        const state = mergeKasTaskState(boxState, kas ? kas.statusOf(spec.name, spec.dir.path, task.id) : undefined);
+        const partial = state === "in_progress", queued = state === "queued", failed = state === "failed", aborted = state === "aborted";
+        item.contextValue = task.done ? "task-done" : partial ? "task-running" : "task-open";
+        item.iconPath = new vscode.ThemeIcon(task.done ? "pass-filled" : partial ? "loading~spin" : queued ? "clock" : failed ? "error" : aborted ? "warning" : "circle-large-outline");
         item.spec = spec;
         item.task = task;
-        item.description = task.partial ? "in progress" : task.queued ? "queued" : task.optional ? "optional" : undefined;
+        item.description = partial ? "in progress" : queued ? "queued" : failed ? "failed" : aborted ? "stopped" : task.optional ? "optional" : undefined;
         item.command = { command: "kirocrew.spec.open", title: "Open", arguments: [vscode.Uri.joinPath(spec.dir, "tasks.md"), task.line] };
         return item;
       });
@@ -7939,17 +8417,17 @@ function tasksPathOf(spec) {
 /**
  * Task requests, in two flavours.
  *
- * With a Kiro Spec & Plan agent (the KAS backend runs Kiro's own Spec agent),
- * the message is the one Kiro's IDE itself sends its engine — read from
- * @kiro/agent's `handleSpecExecuteTask` / `handleSpecRunAllTasks` — so the
- * engine's spec sub-intent router ("execute the following task", "run all
- * tasks" are in its local pattern list) hands the turn to its Task
- * Orchestrator, which queues every not-started required task, runs them
- * through its task-execution sub-agent one after another without stopping,
- * and writes `[~]` / `[-]` / `[x]` back into tasks.md as it goes.
+ * `kiroTaskRequest` / `kiroRunAllRequest` are the messages Kiro's IDE itself
+ * sends its engine — read from @kiro/agent's `handleSpecExecuteTask` /
+ * `handleSpecRunAllTasks` — kept for the resume path and for tests; on
+ * Kiro's engine the mod now sends the operation itself (`_kiro/spec/invoke`,
+ * kirocrew.specEngine = kas), so the engine's spec sub-intent router hands the
+ * turn to its Task Orchestrator, which queues every not-started required
+ * task, runs them through its task-execution sub-agent one after another
+ * without stopping, and writes `[~]` / `[-]` / `[x]` back into tasks.md.
  *
- * Without one, a paraphrase on the crew agent carries the same `<task>` block
- * and asks for the same non-stop loop.
+ * On the gateway, a paraphrase on the crew agent carries the same `<task>`
+ * block and asks for the same non-stop loop.
  */
 function kiroTaskRequest(spec, task) {
   const path = tasksPathOf(spec);
@@ -8030,36 +8508,6 @@ function workflowContext(mode, root) {
     default:
       return "";
   }
-}
-
-/**
- * The Kiro Spec & Plan mod (kiro-spec-plan) ships agents named after Kiro's
- * bundled mode ids; on the KAS backend picking one runs Kiro's OWN workflow.
- * When such an agent exists for the chosen mode, the tab uses it and the
- * prompt frame above is not injected — the real thing beats the paraphrase.
- * Pure: returns the agent name, or null to fall back to the frame.
- */
-const MODE_AGENTS = { spec: "spec", "quick-spec": "quick-spec", "bug-fix": "bug-fix", plan: "plan" };
-/**
- * KiroCrew 0.8.0.9 reserves KAS's bundled mode ids (`agent_files.KAS_RESERVED_AGENT_IDS`)
- * and refuses, before the wire, any session whose agent carries one — the
- * protection against a crewmate being silently replaced by a built-in is
- * exactly the substitution kiro-spec-plan's handles rely on. The refusal text
- * is the host's; matched loosely so a reworded message still counts.
- *
- * KiroCrew 0.11 refuses differently: a reserved id is renamed on the wire
- * (`spec` registers as `spec-crewmate`) and, when nothing registers under that
- * alias (kiro-spec-plan before 0.2.2 strips the entry), the start fails with
- * "Agent mode 'spec' is not available on this session (advertised modes: [...
- * 'spec' ...]); its ~/.kiro/agents/spec.json is likely missing". The same
- * sentence names a genuinely missing agent of any other name, so only the four
- * mode ids count here: for them the file is there and the id looked for was
- * the alias, which is the reserved-id refusal in a new coat.
- */
-function isReservedModeRefusal(message) {
-  const m = String(message || "");
-  if (/reserved for a built-in agent/i.test(m) || /reserved by the KAS agent engine/i.test(m) || /template_name_reserved_by_engine/.test(m)) return true;
-  return /Agent mode ['"“]?(spec|quick-spec|bug-fix|plan)['"”]? is not available on this session/i.test(m);
 }
 
 /** A host failure row: the `error` role the session log writes, or the
@@ -8160,28 +8608,6 @@ async function resumeRequest(run, kiro) {
   return { text: (kiro ? kiroRunAllRequest(spec) : runAllPrompt(spec)) + RESUME_NOTE, display: "Resume: " + (run.display || "Run all tasks") + " (" + remaining + " left)", remaining };
 }
 /**
- * Off by default (`kirocrew.kiroModeAgents`). Seen live on 2026-11-07 (host
- * 0.11.2.1, kiro-cli 2.22.1, kiro-spec-plan 0.1.0): the host no longer refused
- * the id, so the turn went to `spec` — and kiro-cli loaded the mod's handle
- * file ~/.kiro/agents/spec.json by that name instead of Kiro's bundled Spec
- * mode. The handle has no tools and its whole prompt is "if you are reading
- * this, KiroCrew is not on the KAS backend" (the backend WAS kas). On kiro-cli
- * 3.1 the bundled Spec agent is only reachable through the TUI's /agent picker,
- * never `--agent spec`, so there is no host today where the substitution
- * works. The IDE's own prompt-guided workflow therefore runs the phases unless
- * the user opts the mode agents back in with the setting.
- */
-function modeAgentsEnabled() {
-  return cfg("kiroModeAgents", false) === true;
-}
-function kasAgentFor(mode, agents, enabled = modeAgentsEnabled()) {
-  if (!enabled) return null;
-  const name = MODE_AGENTS[mode];
-  if (!name) return null;
-  return (agents || []).some((a) => a && a.name === name) ? name : null;
-}
-
-/**
  * What a live slot reports it runs with, in the composer's own keys. Only the
  * fields the slot carries are present, so the result can be laid over the
  * user's picks for display without inventing values.
@@ -8195,43 +8621,20 @@ function liveSettings(slot) {
   return live;
 }
 
-/** The mode a Kiro Spec & Plan agent name stands for, or null for an ordinary agent. */
-function modeOfAgent(name) {
-  return Object.keys(MODE_AGENTS).find((m) => MODE_AGENTS[m] === name) || null;
-}
-
-/** The mod that ships Kiro's mode agents; named in the picker when they are missing. */
-const MODES_MOD = "kiro-spec-plan";
-const MODES_HINT = {
-  id: "hint:" + MODES_MOD,
-  label: "Kiro's own modes: install " + MODES_MOD,
-  description: "Spec, Quick Spec, Bug Fix and Plan below are prompt-guided stand-ins on your default agent. The " + MODES_MOD +
-    " mod adds Kiro's real mode agents; install it from the FloofyCrew page (or `floofy install " + MODES_MOD + "`) and reopen this menu.",
-  section: "Workflows (prompt-guided)",
-  hint: true,
-};
-
 /**
- * The single Agent picker, sectioned like Kiro's: Kiro's own modes when the
- * Kiro Spec & Plan agents are installed, else the prompt-guided workflows
- * headed by a row that says where the real ones come from; then the crew
- * default and every other agent. Each entry's id encodes the kind so the
- * webview stays dumb: `agent:<name>`, `workflow:<mode>`, `hint:<mod>`, or "".
+ * The single Agent picker, sectioned like Kiro's: the Kiro-modes group is
+ * prepended by the caller (kasPicks, from kas/status), then the mod's
+ * prompt-guided workflows, then the crew default and every other agent. Each
+ * entry's id encodes the kind so the webview stays dumb: `agent:<name>`,
+ * `workflow:<mode>`, `kas:<mode>`, `kashint:`, or "".
  */
-function agentPicks(agents, enabled = modeAgentsEnabled()) {
-  const kiro = WORKFLOWS.filter((w) => w.id !== "default" && kasAgentFor(w.id, agents, enabled));
+const WORKFLOWS_SECTION = "Workflows (prompt-guided)";
+function agentPicks(agents) {
   const out = [];
-  if (kiro.length) {
-    for (const w of kiro) out.push({ id: "agent:" + MODE_AGENTS[w.id], label: w.label, description: w.description, section: "Kiro modes", kiro: true });
-  } else {
-    // The install hint only when the user opted into the mode agents and they are missing;
-    // with the setting off (the default) the workflows are the real thing, not stand-ins.
-    if (enabled) out.push(MODES_HINT);
-    for (const w of WORKFLOWS) if (w.id !== "default") out.push({ id: "workflow:" + w.id, label: w.label, description: w.description, section: MODES_HINT.section });
-  }
+  for (const w of WORKFLOWS) if (w.id !== "default") out.push({ id: "workflow:" + w.id, label: w.label, description: w.description, section: WORKFLOWS_SECTION });
   out.push({ id: "", label: "Default", description: "the crew default agent — general coding assistance", section: "Your agents" });
   for (const a of agents || []) {
-    if (modeOfAgent(a.name) || /^kirocrew(-lite|-skill-view-)/.test(a.name)) continue;
+    if (/^kirocrew(-lite|-skill-view-)/.test(a.name)) continue;
     out.push({ id: "agent:" + a.name, label: a.name, description: a.description || a.model || "", section: "Your agents" });
   }
   return out;
@@ -8243,6 +8646,422 @@ function splitOptions(text) {
   if (!m) return { text: text || "", options: [] };
   const options = m[1].split("|").map((s) => s.trim()).filter(Boolean);
   return { text: (text || "").slice(0, m.index).replace(/\s+$/, ""), options };
+}
+
+// ------------------------------------------------------- Kiro modes (KAS)
+//
+// Kiro's real Spec, Quick Spec, Bug Fix and Plan engines live in KAS, the bundle
+// `kiro-cli acp --agent-engine v3` runs. The gateway cannot run them (it rewrites
+// the built-in agent ids), so the mod's hook owns one kiro-cli child per
+// workspace and this side talks to it over a WebSocket on the same-origin proxy
+// path (hook/kas.py, the Kas_Link). A tab of kind `kas` is such a session: the
+// hook relays the raw ACP `session/update` stream with sequence numbers, the
+// Adapter below turns it into the messages the chat webview already draws, and
+// a reconnect asks for everything after the last sequence it saw. KAS's own
+// permissions and Autopilot apply to these tabs; KiroCrew policy, approvals,
+// memory and the mod's steering injection do not (KAS loads .kiro/steering).
+
+/** The Kas_Link path on the dashboard origin (hook: KAS_WS_PATH). */
+const KAS_WS_PATH = "/kirocrew-ide/_kirocrew/kas/ws";
+const KAS_STATUS_ROUTE = "/apps/floofycrew/mods/" + IDE_TAG + "/api/kas/status";
+const KAS_STATUS_TTL_MS = 60000;
+/** The spec-family modes a Kiro-mode tab may run; `vibe` and user agents stay with the gateway path. */
+const KAS_MODES = ["spec", "quick-spec", "bug-fix", "plan"];
+const KAS_SECTION = "Kiro modes (kiro-cli)";
+/** Said once per Kiro-mode tab (requirement 3.7). */
+const KAS_TAB_NOTICE = "This tab runs in Kiro's own engine (kiro-cli on the gateway host). KAS's permissions and Autopilot apply; KiroCrew policy, approvals and memory do not. Steering is loaded by KAS itself.";
+const KAS_REQUEST_TIMEOUT_MS = 90000;
+
+const KAS_SESSIONS_ROUTE = "/apps/floofycrew/mods/" + IDE_TAG + "/api/kas/sessions";
+/**
+ * The History picker's Kiro-mode rows (requirement 6.3), pure: the `kas/sessions` rows of
+ * THIS workspace (same folder), newest first, each with the mode, state and age, a check
+ * when a tab is open on it (`isOpen(sessionId)`), and `kas: sessionId` for the handler.
+ */
+function kasHistoryItems(rows, projectPath, isOpen) {
+  const out = [];
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!r || typeof r.sessionId !== "string" || !r.sessionId) continue;
+    if (projectPath && r.folder && !sameDir(r.folder, projectPath)) continue;
+    const state = r.state === "running" ? "$(sync~spin) running" : r.pendingAsks ? "$(bell) waiting" : r.state === "detached" ? "detached" : "";
+    const when = ageLabel(slotTime(r.lastActivity));
+    const open = typeof isOpen === "function" && isOpen(r.sessionId);
+    out.push({ label: (open ? "$(check) " : "") + (r.title || r.sessionId), description: ["kiro-cli " + (r.mode || "mode"), r.feature ? "spec " + r.feature : "", state, when].filter(Boolean).join("  ·  "),
+      detail: r.source === "kas" ? "in kiro-cli's own store (not relayed by this IDE yet)" : "", kas: r.sessionId, mode: r.mode || "", title: r.title || "" });
+  }
+  return out;
+}
+
+let kasStatusCache = { at: 0, value: null, promise: null };
+/** `GET kas/status` from the hook, cached KAS_STATUS_TTL_MS; `{available: false, reason}` when the route fails. */
+async function kasStatus(force) {
+  const now = Date.now();
+  if (!force && kasStatusCache.value && now - kasStatusCache.at < KAS_STATUS_TTL_MS) return kasStatusCache.value;
+  if (kasStatusCache.promise) return kasStatusCache.promise;
+  kasStatusCache.promise = api(KAS_STATUS_ROUTE)
+    .then((doc) => doc && typeof doc === "object" ? doc : { available: false, reason: "kas/status answered nothing" })
+    .catch((error) => ({ available: false, reason: "kas/status unavailable: " + (error && error.message || error) }))
+    .then((value) => { kasStatusCache = { at: Date.now(), value, promise: null }; return value; });
+  return kasStatusCache.promise;
+}
+function invalidateKasStatus() { kasStatusCache = { at: 0, value: null, promise: null }; }
+
+/**
+ * The picker entries of the "Kiro modes" group (requirements 3.1, 7.1, 7.4):
+ * one `kas:<mode>` pick per spec-family mode the hook's status advertises, or a
+ * single non-selectable hint row naming the reason when KAS is unavailable.
+ * Pure; `status` is the `kas/status` document (or null before the first read).
+ */
+function kasPicks(status) {
+  if (!status) return [];
+  if (!status.available) {
+    return [{ id: "kashint:", label: "Kiro modes unavailable", description: String(status.reason || "kiro-cli is not usable on the gateway host"), section: KAS_SECTION, hint: true }];
+  }
+  const advertised = Array.isArray(status.modes) ? status.modes : [];
+  const out = [];
+  for (const id of KAS_MODES) {
+    const m = advertised.find((x) => x && x.id === id);
+    if (!m) continue;
+    out.push({ id: "kas:" + id, label: m.name || id, description: m.description || "", section: KAS_SECTION, kas: true, mode: id });
+  }
+  return out;
+}
+
+/** A tab that runs (or will run) in Kiro's engine: created there, or a draft whose pick is a Kiro mode. */
+function isKasTab(t) {
+  return Boolean(t) && (t.kind === "kas" || Boolean(t.settings && t.settings.engine === "kas"));
+}
+/** The persisted/live state of a Kiro-mode tab (design: KasTabState). `asks` and the stream bookkeeping are not persisted. */
+function kasTabState(saved) {
+  const s = saved && typeof saved === "object" ? saved : {};
+  return {
+    sessionId: typeof s.sessionId === "string" ? s.sessionId : "",
+    mode: typeof s.mode === "string" ? s.mode : "",
+    wsHash: typeof s.wsHash === "string" ? s.wsHash : "",
+    lastSeq: Number.isFinite(Number(s.lastSeq)) ? Number(s.lastSeq) : 0,
+    state: typeof s.state === "string" ? s.state : "new",
+    autopilot: Boolean(s.autopilot),
+    noticeShown: Boolean(s.noticeShown),
+    running: false, replayUntil: 0, pendingUser: "", sentLocally: false, skipEcho: false, streaming: false, asks: {},
+  };
+}
+function kasTabRecord(k) {
+  if (!k) return null;
+  return { sessionId: k.sessionId, mode: k.mode, wsHash: k.wsHash, lastSeq: k.lastSeq, state: k.state, autopilot: k.autopilot, noticeShown: k.noticeShown };
+}
+
+/**
+ * The ACP prompt content blocks of one turn (requirement 3.8): `#` contexts as
+ * text blocks headed by their label, attachments as image blocks (inline) or a
+ * text block naming the uploaded path, then the typed text. Pure.
+ * `attached`: [{ name, image, mime, data (base64, images), path (others) }].
+ */
+function kasPromptBlocks(text, contexts, attached) {
+  const blocks = [];
+  for (const c of contexts || []) if (c && c.content) blocks.push({ type: "text", text: "[" + (c.label || c.kind || "context") + "]\n" + String(c.content) });
+  for (const a of attached || []) {
+    if (!a) continue;
+    if (a.image && a.data) blocks.push({ type: "image", mimeType: a.mime || "image/png", data: a.data });
+    else if (a.path) blocks.push({ type: "text", text: "[attached_file] " + a.path });
+  }
+  const typed = String(text || "").trim();
+  if (typed) blocks.push({ type: "text", text: typed });
+  else if (blocks.length) blocks.push({ type: "text", text: attached && attached.length ? "See the attached file(s)." : "See the context provided." });
+  return blocks;
+}
+
+/** The text of an ACP content block (text blocks; others as a short marker). */
+function kasContentText(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (content.type === "text") return String(content.text || "");
+  if (content.type === "image") return "";
+  if (content.type === "resource_link") return String(content.uri || content.name || "");
+  if (content.type === "resource" && content.resource) return String(content.resource.text || content.resource.uri || "");
+  return "";
+}
+function kasImageMarkdown(content) {
+  if (!content || content.type !== "image" || !content.data) return "";
+  return "![image](data:" + (content.mimeType || "image/png") + ";base64," + content.data + ")";
+}
+/** The output text of a `tool_call_update.content` list (text blocks joined; diffs as a path note). */
+function kasToolOutput(content) {
+  const parts = [];
+  for (const c of content || []) {
+    if (!c) continue;
+    if (c.type === "content") parts.push(kasContentText(c.content));
+    else if (c.type === "diff") parts.push("edit " + (c.path || "") + (c.newText !== undefined ? "\n" + String(c.newText).slice(0, 4000) : ""));
+    else if (c.type === "terminal") parts.push("terminal " + (c.terminalId || ""));
+  }
+  return parts.filter(Boolean).join("\n");
+}
+/** The option a card decision maps to: Approve → the first `allow*` option, Reject → the first `reject*` one (null = cancel). */
+function kasPermissionChoice(options, action) {
+  const list = Array.isArray(options) ? options : [];
+  const want = action === "approved" ? "allow" : "reject";
+  const hit = list.find((o) => o && String(o.kind || "").startsWith(want));
+  return hit ? hit.optionId : null;
+}
+
+/**
+ * The Adapter (requirements 3.3–3.5, 4.1, 7.3): one Kas_Link frame → the
+ * webview messages for its tab (without `id`), mutating `ts` (kasTabState).
+ * Frames with `seq <= ts.lastSeq` are duplicates of what the tab has drawn
+ * and yield nothing; `attached {cleared}` restarts the numbering with a
+ * `clear`. Replayed `user_message_chunk`s (seq within the attach's window, or
+ * a turn this bridge did not send) become `user` rows; the live echo of a
+ * prompt sent here is consumed, since the page drew the bubble at send time.
+ * Messages whose type starts with `_` are for the ChatView itself (tab badge,
+ * config echo, title), never posted to the page.
+ */
+function kasFramesToMessages(frame, ts) {
+  const out = [];
+  if (!frame || typeof frame !== "object") return out;
+  if (frame.seq !== undefined && frame.seq !== null) {
+    if (frame.seq <= ts.lastSeq) return out;
+    ts.lastSeq = frame.seq;
+  }
+  const replay = frame.seq !== undefined && frame.seq <= (ts.replayUntil || 0);
+  if (frame.kind !== "userPrompt" && !(frame.kind === "update" && (frame.update || {}).sessionUpdate === "user_message_chunk")) ts.skipEcho = false;
+  const flushUser = () => { if (ts.pendingUser) { out.push({ type: "row", row: { role: "user", content: ts.pendingUser, ts: "", cls: "", meta: {} } }); ts.pendingUser = ""; } };
+  const endStream = () => { if (ts.streaming) { out.push({ type: "segment" }); ts.streaming = false; } };
+  switch (frame.kind) {
+    case "attached": {
+      ts.state = "live";
+      ts.running = Boolean(frame.running);
+      if (frame.mode) ts.mode = frame.mode;
+      if (frame.autopilot !== undefined) ts.autopilot = Boolean(frame.autopilot);
+      if (frame.cleared) { ts.lastSeq = 0; ts.asks = {}; ts.pendingUser = ""; ts.streaming = false; out.push({ type: "clear" }); }
+      ts.replayUntil = Number(frame.lastSeq) || 0;
+      out.push({ type: "_attached", running: ts.running, mode: ts.mode, title: frame.title || "" });
+      break;
+    }
+    case "clear": ts.asks = {}; ts.pendingUser = ""; ts.streaming = false; out.push({ type: "clear" }); break;
+    case "accepted": if (frame.op === "prompt") { ts.running = true; ts.sentLocally = true; } break;
+    case "userPrompt": {
+      // The hook's record of a prompt (KAS does not echo live prompts): drawn on replay, or when
+      // another window sent it; the sender's own page drew the bubble at send time.
+      if (replay || !ts.sentLocally) { flushUser(); ts.pendingUser = String(frame.text || ""); ts.skipEcho = true; }
+      break;
+    }
+    case "update": {
+      const u = frame.update || {};
+      const kind = u.sessionUpdate;
+      if (kind === "user_message_chunk") {
+        if (ts.skipEcho) break;   // the same prompt, echoed by KAS right after the hook's record
+        const text = kasContentText(u.content) || (u.content && u.content.type === "image" ? "[image]" : "");
+        if (replay || !ts.sentLocally) ts.pendingUser += text;
+        break;
+      }
+      flushUser();
+      if (kind !== "session_info_update" && kind !== "config_option_update" && kind !== "available_commands_update") ts.sentLocally = false;
+      switch (kind) {
+        case "agent_message_chunk": {
+          const img = kasImageMarkdown(u.content);
+          if (img) { endStream(); out.push({ type: "row", row: { role: "assistant", content: img, ts: "", cls: "", meta: {} } }); break; }
+          const text = kasContentText(u.content);
+          if (text) { ts.streaming = true; out.push({ type: "chunk", text, seq: frame.seq }); }
+          break;
+        }
+        case "agent_thought_chunk": { const text = kasContentText(u.content); if (text) out.push({ type: "thinking", text }); break; }
+        case "tool_call": {
+          endStream();
+          const done = u.status === "completed" || u.status === "failed";
+          out.push({ type: "row", row: { role: "tool", content: String(u.title || u.kind || "tool"), ts: "", cls: "", meta: { tool_call_id: u.toolCallId || "", tool_name: u.kind || "", kind: u.kind || "", input: u.rawInput, done, mid: frame.seq !== undefined ? "kas:" + frame.seq : undefined } } });
+          if (done) out.push({ type: "toolResult", tcid: u.toolCallId || "", output: kasToolOutput(u.content) || (u.rawOutput !== undefined ? JSON.stringify(u.rawOutput, null, 2) : (u.status === "failed" ? "❌ failed" : "")) });
+          break;
+        }
+        case "tool_call_update": {
+          const tcid = u.toolCallId || "";
+          if (u.title || u.rawInput !== undefined) out.push({ type: "toolUpdate", tcid, title: u.title || "", input: u.rawInput });
+          const output = kasToolOutput(u.content);
+          if (output || u.status === "completed" || u.status === "failed") {
+            const text = output || (u.rawOutput !== undefined ? JSON.stringify(u.rawOutput, null, 2) : "");
+            out.push({ type: "toolResult", tcid, output: u.status === "failed" ? "❌ " + (text || "failed") : text });
+          }
+          break;
+        }
+        case "plan": {
+          const entries = Array.isArray(u.entries) ? u.entries : [];
+          if (entries.length) out.push({ type: "status", text: "Plan:\n" + entries.map((e) => (e.status === "completed" ? "☑ " : e.status === "in_progress" ? "◐ " : "☐ ") + String(e.content || "")).join("\n") });
+          break;
+        }
+        case "current_mode_update": if (u.currentModeId) { ts.mode = u.currentModeId; out.push({ type: "_mode", mode: u.currentModeId }); } break;
+        case "config_option_update": {
+          const opts = Array.isArray(u.configOptions) ? u.configOptions : [];
+          const cfgMsg = { type: "_config" };
+          for (const o of opts) {
+            if (!o) continue;
+            if (o.id === "autopilot") cfgMsg.autopilot = o.currentValue === "on";
+            else if (o.id === "model") cfgMsg.model = o.currentValue === "auto" ? "" : String(o.currentValue || "");
+            else if (o.id === "effortLevel") cfgMsg.effort = String(o.currentValue || "");
+            else if (o.id === "mode" && o.currentValue) cfgMsg.mode = String(o.currentValue);
+          }
+          if (Object.keys(cfgMsg).length > 1) { if (cfgMsg.autopilot !== undefined) ts.autopilot = cfgMsg.autopilot; if (cfgMsg.mode) ts.mode = cfgMsg.mode; out.push(cfgMsg); }
+          break;
+        }
+        case "session_info_update": {
+          const kiro = (u._meta && u._meta.kiro) || {};
+          if (kiro.kind === "turn_start") ts.running = true;
+          if (u.title || kiro.title) out.push({ type: "_title", title: String(u.title || kiro.title) });
+          break;
+        }
+        default: break;
+      }
+      break;
+    }
+    case "ask": {
+      flushUser();
+      const rid = frame.requestId;
+      if (frame.ask === "permission") {
+        endStream();
+        ts.asks[rid] = { kind: "permission", options: frame.options || [] };
+        out.push({ type: "row", row: { role: "permission", content: String(frame.title || "tool"), ts: "", cls: "", meta: { request_id: String(rid), tool_title: String(frame.title || "tool"), tool_input: frame.rawInput !== undefined ? toolInputPreview(frame.rawInput) : undefined, options: frame.options || [] } } });
+      } else {
+        ts.asks[rid] = { kind: "userInput" };
+        const options = Array.isArray(frame.options) ? frame.options : [];
+        out.push({ type: "question", card: { ask_id: "kas:" + rid, questions: [{ key: "answer", question: String(frame.question || "").replace(/^\*\*|\*\*$/g, ""), options: options.map((o) => ({ label: String(o.title || ""), value: String(o.title || ""), description: o.description || (o.recommended ? "recommended" : "") })) }] } });
+      }
+      break;
+    }
+    case "askResolved": {
+      const ask = ts.asks[frame.requestId];
+      delete ts.asks[frame.requestId];
+      if (ask && ask.kind === "userInput") out.push({ type: "questionResolved", qid: "kas:" + frame.requestId });
+      else out.push({ type: "permissionResolved", requestId: String(frame.requestId) });
+      break;
+    }
+    case "turnEnd": {
+      flushUser();
+      ts.running = false; ts.streaming = false; ts.sentLocally = false;
+      out.push({ type: "done" });
+      if (frame.stopReason && frame.stopReason !== "end_turn") out.push({ type: "status", text: "Turn ended: " + frame.stopReason });
+      break;
+    }
+    case "error": {
+      let text = String(frame.message || "error");
+      if (frame.login) text += " — run `kiro-cli login` on the gateway host, then send again.";
+      out.push({ type: "error", text });
+      if (frame.op === "prompt" || frame.op === "new") { ts.running = false; out.push({ type: "done" }); }
+      break;
+    }
+    case "childState": {
+      if (frame.state !== "exited") break;
+      flushUser();
+      ts.state = "exited"; ts.running = false; ts.streaming = false; ts.asks = {};
+      out.push({ type: "done" });
+      const why = frame.reason === "login" ? "kiro-cli is not logged in: run `kiro-cli login` on the gateway host."
+        : frame.reason === "idle" ? "kiro-cli for this workspace was stopped after idling."
+        : "kiro-cli exited (code " + (frame.code === null || frame.code === undefined ? "?" : frame.code) + ")" + (frame.reason && frame.reason !== "exited" ? " — " + frame.reason : "") + ".";
+      out.push({ type: "error", text: why });
+      out.push({ type: "interrupted", text: "This Kiro-mode session is detached. Reload brings kiro-cli back and replays the transcript from Kiro's own store.", resume: true, label: "Reload session", hint: "Start kiro-cli for this workspace again and load this session (session/load)." });
+      break;
+    }
+    default: break;
+  }
+  return out;
+}
+/** A short preview of a tool call's arguments for the approval card (JSON, clipped). */
+function toolInputPreview(input) {
+  if (input === undefined || input === null) return undefined;
+  if (typeof input === "string") return input.slice(0, 400);
+  try { return JSON.stringify(input, null, 1).slice(0, 400); } catch { return String(input).slice(0, 400); }
+}
+
+/**
+ * The Kas_Link (requirements 4.1, 4.3): one WebSocket per workspace to the
+ * hook, reconnecting with the Feed's backoff (1 s doubling to 30 s), `hello`
+ * on every open (the hook spawns or reuses the kiro-cli child), request/reply
+ * correlation by `ref` for the ops that answer (`new`, `attach`, `config`,
+ * `spec`, `prompt`'s `accepted`), and every frame fanned out to listeners.
+ * Listeners also get `{kind: "_open"}` after a successful hello and
+ * `{kind: "_closed"}` when the socket drops, so the ChatView re-attaches its
+ * Kiro-mode tabs and shows "reconnecting".
+ */
+class KasLink {
+  constructor(folder) {
+    this.folder = folder;
+    this.ws = null;
+    this.delay = 1000;
+    this.closed = false;
+    this.listeners = new Set();
+    this.pending = new Map();   // ref -> { resolve, reject, timer }
+    this.nextRef = 1;
+    this.hello = null;          // the last hello reply
+    this.state = "idle";        // idle | connecting | open | reconnecting
+    this.waiters = [];
+  }
+  url() { return ORIGIN.replace(/^http/, "ws") + KAS_WS_PATH; }
+  start() {
+    if (!ORIGIN || this.closed || this.ws) return;
+    this.state = this.hello ? "reconnecting" : "connecting";
+    let ws;
+    try { ws = new WebSocket(this.url()); } catch (error) { this.retry(); return; }
+    this.ws = ws;
+    ws.onopen = () => {
+      this.delay = 1000;
+      this.request({ op: "hello", folder: this.folder }).then((reply) => {
+        this.hello = reply;
+        this.state = "open";
+        for (const w of this.waiters.splice(0)) w.resolve(reply);
+        this.emit({ kind: "_open", hello: reply });
+      }).catch((error) => {
+        this.state = "error";
+        for (const w of this.waiters.splice(0)) w.reject(error);
+        this.emit({ kind: "_helloFailed", error: String(error && error.message || error) });
+      });
+    };
+    ws.onmessage = (event) => {
+      let frame;
+      try { frame = JSON.parse(event.data); } catch { return; }
+      if (frame && frame.ref !== undefined && frame.ref !== null && this.pending.has(String(frame.ref))) {
+        const p = this.pending.get(String(frame.ref));
+        if (frame.kind === "error") { this.pending.delete(String(frame.ref)); clearTimeout(p.timer); const err = new Error(frame.message || "KAS error"); err.frame = frame; p.reject(err); return; }
+        if (frame.kind !== "update") { this.pending.delete(String(frame.ref)); clearTimeout(p.timer); p.resolve(frame); }
+        if (frame.kind === "hello" || frame.kind === "created" || frame.kind === "configured" || frame.kind === "specResult" || frame.kind === "accepted") return;
+      }
+      this.emit(frame);
+    };
+    ws.onclose = () => { this.ws = null; const was = this.state; this.state = "reconnecting"; this.failPending("the connection to kiro-cli dropped"); if (was === "open" || was === "reconnecting") this.emit({ kind: "_closed" }); this.retry(); };
+    ws.onerror = () => { try { ws.close(); } catch { /* closing */ } };
+  }
+  retry() {
+    if (this.closed) return;
+    setTimeout(() => this.start(), this.delay);
+    this.delay = Math.min(this.delay * 2, 30000);
+  }
+  failPending(why) {
+    for (const [ref, p] of this.pending) { clearTimeout(p.timer); p.reject(new Error(why)); this.pending.delete(ref); }
+  }
+  /** Resolves with the hello reply once the link is open (connecting if needed). */
+  ready(timeout = KAS_REQUEST_TIMEOUT_MS) {
+    if (this.state === "open" && this.ws && this.ws.readyState === 1) return Promise.resolve(this.hello);
+    if (!this.ws) { this.delay = 1000; this.start(); }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.waiters = this.waiters.filter((w) => w.timer !== timer); reject(new Error("kiro-cli did not answer in time (hello)")); }, timeout);
+      this.waiters.push({ resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); }, timer });
+    });
+  }
+  send(frame) {
+    if (!this.ws || this.ws.readyState !== 1) throw new Error("the connection to kiro-cli is not open" + (this.state === "reconnecting" ? " (reconnecting)" : ""));
+    this.ws.send(JSON.stringify(frame));
+  }
+  /** Send a frame and resolve with its reply (matched by `ref`); rejects on an `error` reply or the timeout. */
+  request(frame, timeout = KAS_REQUEST_TIMEOUT_MS) {
+    const ref = "r" + (this.nextRef++);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(ref); reject(new Error(frame.op + " timed out")); }, timeout);
+      this.pending.set(ref, { resolve, reject, timer });
+      try { this.send(Object.assign({}, frame, { ref })); } catch (error) { this.pending.delete(ref); clearTimeout(timer); reject(error); }
+    });
+  }
+  emit(frame) {
+    for (const fn of this.listeners) {
+      try { fn(frame); } catch (error) { console.warn("[kirocrew] kas listener failed", error); }
+    }
+  }
+  on(fn) { this.listeners.add(fn); return { dispose: () => this.listeners.delete(fn) }; }
+  dispose() { this.closed = true; this.failPending("closed"); try { this.ws && this.ws.close(); } catch { /* closing */ } }
 }
 
 // ------------------------------------------------------------ spec editor
@@ -9743,7 +10562,17 @@ function activate(context) {
       taskDecorations.applyAll();
     }, TASK_UI_REFRESH_DEBOUNCE_MS);
   }
+  // Task state from Kiro's engine (requirement 5.4): the store takes the Kas_Link's specEvents and
+  // polls kas/tasks while a Kiro-mode spec run is live; the lenses, borders and Specs view follow.
+  kasTaskStore = new KasTaskStore(sessions.projectPath());
+  chat.kasSpecListeners.add((frame) => {
+    if (!kasTaskStore.applyEvent(frame)) return;
+    const feature = kasFeatureOfPath((frame.params || {}).tasksFilePath);
+    if (feature) kasTaskStore.track(feature, () => chat.kasTabs().some((t) => t.kas.running && t.spec && t.spec.name === feature));
+  });
   context.subscriptions.push(
+    kasTaskStore,
+    kasTaskStore.onDidChange(() => { scheduleTaskUiRefresh(); specsTree.refresh(); }),
     specModels.onDidChange(() => scheduleTaskUiRefresh()),
     taskLinks.onDidChange(() => scheduleTaskUiRefresh()),
     { dispose: () => { if (taskUiRefreshTimer) clearTimeout(taskUiRefreshTimer); taskUiRefreshTimer = null; } },
@@ -9897,17 +10726,29 @@ function activate(context) {
     vscode.commands.registerCommand("kirocrew.openInDashboard", (key) => vscode.env.openExternal(vscode.Uri.parse(ORIGIN + "/chat/" + encodeURIComponent(typeof key === "string" ? key : chat.key || "")))),
     vscode.commands.registerCommand("kirocrew.stopSession", (key) => sessions.stop(typeof key === "string" ? key : chat.key).catch((e) => vscode.window.showErrorMessage(e.message))),
     vscode.commands.registerCommand("kirocrew.history", async () => {
-      await sessions.refresh().catch(() => undefined);
+      const [, kasDoc] = await Promise.all([sessions.refresh().catch(() => undefined), api(KAS_SESSIONS_ROUTE).catch(() => null)]);
       const rows = sessions.history();
       const project = sessions.projectPath();
-      if (!rows.length) return vscode.window.showInformationMessage("No KiroCrew sessions for " + (project || "this workspace") + " yet — send a message to start one.");
+      const kasRows = kasHistoryItems(kasDoc && kasDoc.sessions, project, (sid) => Boolean(chat.tabForKey("kas:" + sid)));
+      if (!rows.length && !kasRows.length) return vscode.window.showInformationMessage("No KiroCrew sessions for " + (project || "this workspace") + " yet — send a message to start one.");
       const items = rows.map((s) => {
         const busy = s.running ? "$(sync~spin) running" : (s.pending_approval || s.needs_input || s.waiting_for_input) ? "$(bell) waiting" : "";
         const when = ageLabel(slotActivity(s));
         return { label: (chat.tabForKey(s.key) ? "$(check) " : "") + (s.title || s.label || s.key), description: [s.effective_agent || s.agent, busy, when].filter(Boolean).join("  ·  "), detail: (s.last_message || s.prompt_preview || "").toString().slice(0, 120), key: s.key };
       });
-      const picked = await vscode.window.showQuickPick(items, { placeHolder: "Sessions of " + (project || "this workspace") + " — newest first, created here or in the dashboard", matchOnDescription: true, matchOnDetail: true });
-      if (picked) { await vscode.commands.executeCommand("kirocrew.chat.focus"); await chat.open(picked.key); }
+      // The Kiro-mode sessions of this workspace (requirement 6.3), from the hook's index and
+      // kiro-cli's own store, as a second group; a row opens the session as a Kiro-mode tab.
+      const separator = typeof vscode.QuickPickItemKind === "object" ? vscode.QuickPickItemKind.Separator : undefined;
+      const all = [];
+      if (items.length && kasRows.length && separator !== undefined) all.push({ label: "KiroCrew sessions", kind: separator });
+      all.push(...items);
+      if (kasRows.length && separator !== undefined) all.push({ label: KAS_SECTION, kind: separator });
+      all.push(...kasRows);
+      const picked = await vscode.window.showQuickPick(all, { placeHolder: "Sessions of " + (project || "this workspace") + " — newest first, created here or in the dashboard" + (kasRows.length ? ", Kiro-mode sessions below" : ""), matchOnDescription: true, matchOnDetail: true });
+      if (!picked) return;
+      await vscode.commands.executeCommand("kirocrew.chat.focus");
+      if (picked.kas) await chat.openKas(picked.kas, { mode: picked.mode || "", title: picked.title || "" });
+      else await chat.open(picked.key);
     }),
     vscode.commands.registerCommand("kirocrew.openFile", async (uri) => {
       const doc = await vscode.workspace.openTextDocument(uri);
@@ -9981,6 +10822,18 @@ function activate(context) {
       const spec = await specOf(node);
       if (!spec.present["design.md"]) return vscode.window.showWarningMessage("Write the design first — tasks are derived from it.");
       await dispatch(spec, phasePrompt("tasks", spec), "spec", "spec " + spec.name + ": tasks");
+    }),
+    // Analyze requirements (requirement 5.1): Kiro's own `analyzeRequirements` on its engine; on the
+    // gateway, the mod's read-only review of the requirements document.
+    vscode.commands.registerCommand("kirocrew.spec.analyze", async (node) => {
+      const spec = await specOf(node);
+      const reqFile = requirementsFileOf(spec.config);
+      if (!spec.present[reqFile]) return vscode.window.showWarningMessage("Write the requirements first — there is nothing to analyze.");
+      const title = "spec " + spec.name + ": analyze requirements";
+      const docs = ChatView.kasSpecDocuments(spec);
+      await chat.specAction(
+        () => chat.runKasSpec("analyzeRequirements", { featureName: spec.name, specDocuments: docs.specDocuments }, { feature: spec.name, dir: spec.dir, title: "Analyze requirements: " + spec.name }),
+        () => dispatch(spec, "Analyze the requirements of the spec `" + spec.name + "` (" + spec.dir.path + "/" + reqFile + "). For each acceptance criterion check: EARS form (WHEN/IF … THEN the system SHALL …), testability, ambiguity, overlap with other criteria, and gaps against the introduction and user stories. Report the findings as a numbered list with the criterion quoted and a suggested rewording where one is needed. Do not edit any file.", "spec", title));
     }),
     vscode.commands.registerCommand("kirocrew.spec.runTask", async (node) => {
       if (!node || !node.task) return vscode.window.showWarningMessage("Pick a task in the Specs view.");
@@ -10099,8 +10952,17 @@ function activate(context) {
     const target = viewSessionTarget(arg) || viewSessionTarget(specRunNode(arg, await listSpecs(), specEditors));
     if (!target) return vscode.window.showWarningMessage("Pick a spec or a task in the Specs view, or open one of the spec's documents.");
     const link = resolveViewSessionLink(taskSessionLinks(), target);
+    // A run on Kiro's engine: the task's lastSessionId (or the feature's spec session) opens as a
+    // Kiro-mode tab (requirement 5.5); it wins over an older gateway run of the same task.
+    const kas = resolveKasViewSession(target, kasTasks(), taskSessionLinks());
+    if (kas && (!link || link.engine === "kas" || !(kas.sessionId === link.sessionId))) {
+      await vscode.commands.executeCommand("kirocrew.chat.focus");
+      await chat.openKas(kas.sessionId, { mode: "spec", title: "Kiro spec: " + target.feature });
+      return;
+    }
     if (!link) return vscode.window.showInformationMessage("No session has run " + target.feature + (target.taskId ? " (task " + target.taskId + ")" : "") + " yet.");
     await vscode.commands.executeCommand("kirocrew.chat.focus");
+    if (link.engine === "kas") { await chat.openKas(link.sessionId, { mode: "spec", title: "Kiro spec: " + target.feature }); return; }
     const tab = chat.tabForKey(link.sessionId);
     if (tab) chat.select(tab.id);
     else await vscode.commands.executeCommand("kirocrew.openSession", link.sessionId);
@@ -10153,11 +11015,25 @@ function activate(context) {
    */
   async function runTasks(spec, text, display, kind, run, taskIds) {
     await vscode.commands.executeCommand("kirocrew.chat.focus");
+    const engine = await chat.specEngine();
     const links = taskSessionLinks();
-    const link = links ? links.record({ feature: spec.name, dir: spec.dir.path, taskIds: Array.isArray(taskIds) ? taskIds : [], sessionId: null, startedAt: Date.now() }) : null;
+    const link = links ? links.record({ feature: spec.name, dir: spec.dir.path, taskIds: Array.isArray(taskIds) ? taskIds : [], sessionId: null, startedAt: Date.now(), engine: engine === "kas" ? "kas" : undefined }) : null;
     let key;
     try {
-      key = await chat.dispatch(text, { mode: "spec", agent: cfg("specAgent", "") || undefined, title: display, kind, display, autopilot: cfg("specAutopilot", true) !== false, run: run || null, spec: { name: spec.name, dir: spec.dir }, link: link ? link.id : null });
+      // Kiro's engine (kirocrew.specEngine = kas): executeTask / runAllTasks with Kiro IDE's argument
+      // shapes; the hook turns Autopilot on for the session first. No run record: Kiro's own
+      // checkpoint resumes a run-all, and a method KAS lacks falls back to the gateway path.
+      const docs = ChatView.kasSpecDocuments(spec);
+      const viaKas = async () => {
+        const op = run && run.task ? "executeTask" : "runAllTasks";
+        const args = op === "executeTask"
+          ? { featureName: spec.name, specDocuments: docs.specDocuments, tasksFilePath: docs.tasksFilePath, taskId: run.task }
+          : { featureName: spec.name, specDocuments: docs.specDocuments, tasksFilePath: docs.tasksFilePath, makeAllRequired: Boolean(run && run.optional) };
+        const t = await chat.runKasSpec(op, args, { feature: spec.name, dir: spec.dir, title: display, link: link ? link.id : null });
+        return t.key;
+      };
+      const viaGateway = () => chat.dispatch(text, { mode: "spec", agent: cfg("specAgent", "") || undefined, title: display, kind, display, autopilot: cfg("specAutopilot", true) !== false, run: run || null, spec: { name: spec.name, dir: spec.dir }, link: link ? link.id : null });
+      key = run ? await chat.specAction(viaKas, viaGateway) : await viaGateway();
     } catch (error) {
       if (link) links.setOutcome(link.id, "error");
       throw error;
@@ -10169,4 +11045,4 @@ function activate(context) {
 
 module.exports = { activate, deactivate() {} };
 // Pure helpers, exposed for `tests/extension_unit.test.mjs` (never used by the host).
-module.exports.__test = { isReservedModeRefusal, isErrorRow, isTurnLimitRow, turnLimitOf, resumeRequest, isSpecTab, runState, describeLeft, looksLikeQuestion, listSpecs, imageData, IMAGE_PREVIEW_MAX, RESUME_CHAT_TEXT, RESUME_NOTE, readText, readWholeText, SPEC_CONFIG_FILE, WORKFLOW_TYPES, SPEC_TYPES, DEFAULT_WORKFLOW_TYPE, DEFAULT_SPEC_TYPE, DOCUMENT_ORDER, uuid, parseSpecConfig, readSpecConfig, newSpecConfig, serializeSpecConfig, writeSpecConfig, documentOrder, requirementsFileOf, specDocumentRows, SPEC_NAME_PATTERN, SPEC_NAME_MAX, SPEC_NAME_FALLBACK, WORKFLOW_TYPE_PICKS, SPEC_TYPE_PICKS, specNameFromIdea, validateSpecName, existingSpecNames, createSpecFromIdea, specFolderOf, renameSpec, SPEC_DELETE_BUTTON, deleteSpec, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, invalidateSteeringCache, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, taskBlockEnd, findTask, serializeTask, makeAllTasksRequired, parseRequirements, findRequirement, parseProperties, findProperty, correctnessSection, buildSpecModel, loadSpecModel, specDirOf, specFileOf, SpecModelStore, specModelStore, SPEC_MODEL_DEBOUNCE_MS, SPEC_MODEL_FILES, TASK_SESSION_LINKS_KEY, TASK_SESSION_LINKS_MAX, LINK_OUTCOMES, normalizeLink, readLinks, pruneLinks, latestLink, linkMatchesFeature, latestLinkForTask, latestLinkForFeature, findLink, viewSessionTarget, resolveViewSessionLink, TASK_STATES, taskStateLink, taskState, TaskSessionLinks, taskSessionLinks, TASK_LENS_PATTERN, TASK_STATE_LENS_TITLES, TASK_LENS_RETRY, TASK_LENS_FIX, TASK_LENS_VIEW_SESSION, TASK_LENS_MAKE_REQUIRED, taskLensSpecs, optionalMarkRange, SpecTaskCodeLensProvider, TASK_DECORATION_COLORS, TASK_DECORATION_OPTIONAL_OPACITY, TASK_DECORATION_DEBOUNCE_MS, mergeLineRanges, taskDecorationRanges, SpecTaskDecorations, SPEC_CONTEXT_KEYS, SPEC_CONFIG_DIAGNOSTICS, specContextKeyValues, positionAt, specConfigDiagnostic, toVscodeDiagnostic, specDirUri, SpecContextKeys, SpecConfigDiagnostics, SPEC_TASK_DIAGNOSTICS, TASK_FORMAT_RULES, TASK_FORMAT_BOXES, TASK_FORMAT_INDENT, TASK_FORMAT_LINE, TASK_DIAGNOSTICS_DEBOUNCE_MS, taskFormatIssues, toTaskDiagnostic, createDiagnosticCollection, SpecTaskDiagnostics, TASK_FIX_TITLE, TASK_FIX_NUMBER_RULES, taskNumbersOf, fixTaskLine, rangesIntersect, taskFixAction, SpecTaskFixProvider, SPEC_HOVER_PATTERN, REVEAL_REQUIREMENT_COMMAND, requirementRefsAt, requirementRefsAfter, activeRefs, revealRequirementUri, requirementHoverMarkdown, hoverMarkdown, makeHover, requirementHoverResolver, PROPERTY_HOVER_FILE, propertyRefsAt, propertyHoverMarkdown, propertyAtLine, propertyHoverResolver, SpecRequirementHoverProvider, revealRequirement, SPEC_NAV_DOCUMENTS, SPEC_GOTO_COMMAND_PREFIX, SPEC_RESOURCE_WHEN, specDocumentName, specGotoCommand, specNavigationTargets, adjacentSpecDocument, specGotoMenuEntries, specGotoPaletteEntries, specCommandSource, specRunNode, gotoSpecDocument, stepSpecDocument, SPEC_CONTENT_KEY, SPEC_SYNC_WHEN, SPEC_NEXT_WHEN, SPEC_RUN_ALL_WHEN, specDocumentHasContent, nextDocumentDecision, SpecContentKey, specConfigFor, specDocumentState, syncSpecDocument, nextSpecDocument, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, SPEC_TURN_KINDS, specTurnDocument, specSiblings, specTurnText, specTurnDisplay, specTurnTitle, specSiblingContexts, specTabRecord, specTabMatches, normalizeRow, findMatches, markTextNode, pendingApprovalCards, TOOL_CARD_DISPLAY_MODES, DEFAULT_TOOL_CARD_DISPLAY_MODE, toolRowShouldCollapse, findPathLinks, chatHtml, nextTabIndex, tabLabel, TAB_TITLE_MAX, validateTabTitle, sameDir, slotTime, slotActivity, ageLabel, HOOK_FILE_RE, HOOK_TRIGGERS, HOOK_MATCHER_TRIGGERS, HOOK_ACTION_KINDS, hookNameFromPath, parseHookFile, hookRowLabel, hookRowDescription, hookRowIcon, hookContextValue, hookRowTooltip, toggleHookEnabled, HooksTree, toggleHook, HOOK_RUN_COMMAND, HOOK_RUN_CONFIRM, HOOK_RUN_BUTTON, hookRunDisplay, hookTerminalName, hookRunDecision, hookTerminal, runHook, HOOK_TEMPLATE, HOOK_TRIGGER_DESCRIPTIONS, HOOK_FILE_TRIGGERS, HOOK_DEFAULT_FILE_MATCHER, HOOK_FILE_EXT, HOOK_DOCS_URL, HOOK_DOCS_COMMAND, HOOK_VIEW_MESSAGE, HOOK_VIEW_MESSAGE_PLAIN, setHookViewMessage, buildHookFile, serializeHookFile, hookFileName, hookScopePicks, createHookWizard, MCP_CONFIG_FILE, MCP_DOCS_URL, MCP_OPEN_CONFIG_COMMAND, MCP_CONFIG_ABSENT_MESSAGE, parseMcpConfig, mcpUrlHost, mcpRowDescription, mcpRowIcon, mcpRowTooltip, mcpServerLine, McpServersTree, openMcpConfig, STEERING_TEMPLATE, SKILL_TEMPLATE, STEERING_EMPTY_CONTEXT_KEY, STEERING_GENERATE_COMMAND, STEERING_GENERATE_DISPLAY, STEERING_GENERATE_FILES, STEERING_GENERATE_PROMPT, steeringIsEmpty, ensureSteeringDir, generateSteeringDocs, STEERING_REFINE_COMMAND, STEERING_REFINE_PROMPT, isSteeringDocument, steeringNameOf, steeringRefineDisplay, steeringDocLabel, refineSteeringDoc, STEERING_IMPORT_COMMAND, IMPORT_SOURCES, IMPORT_FIND_EXCLUDE, IMPORT_FIND_MAX, importStem, importTargetName, withSteeringFrontMatter, scanImportSources, importSteeringFromAssistants, SKILL_IMPORT_COMMAND, SKILL_FILE, SKILL_IMPORT_ROUTE, SKILL_NAME_RE, parseGithubSkillUrl, skillNameFromText, skillScopePicks, importSkillFolder, importSkillFromGithub, revealSkill, importSkill, AssetTree, mdToHtml, stageOf, specNameOf, continueAction, REVIEW_EXCERPT_MAX, reviewBlockId, reviewExcerpt, buildReviewTurn, SPEC_REVIEW_CONTEXT_KEYS, specEditorHtml, isSpecDocument, SpecEditorProvider, openSpecPreview, specReviewTarget, reviewSpecDocument, markSpecEditor, renderMarkdown, localizeImages, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, CONTEXT_FILE_KINDS, CONTEXT_PROVIDERS, CONTEXT_CAP, PROVIDER_CAP, TERMINAL_TAIL_LINES, TERMINAL_HISTORY_MAX, FOLDER_FILES_MAX, GIT_ABSENT_MESSAGE, byteLength, capText, tailLines, stripAnsi, formatProblems, formatFolder, formatSpec, formatGitDiff, providerEntry, contextChipLabel, contextChipTooltip, contextChipEcho, providerContext, plainDiagnostic, clipboardVia, trackTerminalOutput, resolveProblems, resolveTerminal, resolveGitDiff, resolveFolder, resolveSpec, pickContext, looksBinary, fileContextEntry, fileContext, sendTerminalToChat, EXPLORER_MAX_ITEMS, explorerSelection, addExplorerToChat, EDITOR_ACTION_IDS, EDITOR_ACTION_TITLES, DEFAULT_ACTION_PROMPTS, SELECTION_GLYPH, actionPrompt, fenceFor, buildSelectionContext, selectionInput, selectionContext, runEditorAction, fencedBlock, addCodeBlockToChat, COMMIT_MESSAGE_COMMAND, COMMIT_MESSAGE_SESSION_TITLE, COMMIT_MESSAGE_TIMEOUT_MS, COMMIT_MESSAGE_GIT_ABSENT, COMMIT_MESSAGE_NOTHING, COMMIT_MESSAGE_PROMPT, pickDiff, commitMessagePrompt, cleanCommitMessage, gitRepository, runBackgroundTurn, generateCommitMessage, DIAGNOSTIC_FIX_COMMAND, DIAGNOSTIC_FIX_TITLE, DIAGNOSTIC_TITLE_MAX, DIAGNOSTIC_GLYPH, DIAGNOSTIC_FIX_PROMPT, diagnosticTitle, plainRange, buildDiagnosticFixContext, diagnosticFixAction, AgentFixCodeActionProvider, runDiagnosticFix, clip, ChatView, Sessions, themeFor, STOCK_THEMES, kasAgentFor, modeAgentsEnabled, mergeRosters, agentPicks, modeOfAgent, activate };
+module.exports.__test = { kasHistoryItems, KAS_SESSIONS_ROUTE, mergeKasTaskState, kasFeatureOfPath, resolveKasViewSession, KasTaskStore, KAS_TASK_POLL_MS, KAS_WS_PATH, KAS_MODES, KAS_SECTION, KAS_TAB_NOTICE, kasStatus, invalidateKasStatus, kasPicks, isKasTab, kasTabState, kasTabRecord, kasPromptBlocks, kasContentText, kasToolOutput, kasPermissionChoice, kasFramesToMessages, toolInputPreview, KasLink, isErrorRow, isTurnLimitRow, turnLimitOf, resumeRequest, isSpecTab, runState, describeLeft, looksLikeQuestion, listSpecs, imageData, IMAGE_PREVIEW_MAX, RESUME_CHAT_TEXT, RESUME_NOTE, readText, readWholeText, SPEC_CONFIG_FILE, WORKFLOW_TYPES, SPEC_TYPES, DEFAULT_WORKFLOW_TYPE, DEFAULT_SPEC_TYPE, DOCUMENT_ORDER, uuid, parseSpecConfig, readSpecConfig, newSpecConfig, serializeSpecConfig, writeSpecConfig, documentOrder, requirementsFileOf, specDocumentRows, SPEC_NAME_PATTERN, SPEC_NAME_MAX, SPEC_NAME_FALLBACK, WORKFLOW_TYPE_PICKS, SPEC_TYPE_PICKS, specNameFromIdea, validateSpecName, existingSpecNames, createSpecFromIdea, specFolderOf, renameSpec, SPEC_DELETE_BUTTON, deleteSpec, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, invalidateSteeringCache, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, taskBlockEnd, findTask, serializeTask, makeAllTasksRequired, parseRequirements, findRequirement, parseProperties, findProperty, correctnessSection, buildSpecModel, loadSpecModel, specDirOf, specFileOf, SpecModelStore, specModelStore, SPEC_MODEL_DEBOUNCE_MS, SPEC_MODEL_FILES, TASK_SESSION_LINKS_KEY, TASK_SESSION_LINKS_MAX, LINK_OUTCOMES, normalizeLink, readLinks, pruneLinks, latestLink, linkMatchesFeature, latestLinkForTask, latestLinkForFeature, findLink, viewSessionTarget, resolveViewSessionLink, TASK_STATES, taskStateLink, taskState, TaskSessionLinks, taskSessionLinks, TASK_LENS_PATTERN, TASK_STATE_LENS_TITLES, TASK_LENS_RETRY, TASK_LENS_FIX, TASK_LENS_VIEW_SESSION, TASK_LENS_MAKE_REQUIRED, taskLensSpecs, optionalMarkRange, SpecTaskCodeLensProvider, TASK_DECORATION_COLORS, TASK_DECORATION_OPTIONAL_OPACITY, TASK_DECORATION_DEBOUNCE_MS, mergeLineRanges, taskDecorationRanges, SpecTaskDecorations, SPEC_CONTEXT_KEYS, SPEC_CONFIG_DIAGNOSTICS, specContextKeyValues, positionAt, specConfigDiagnostic, toVscodeDiagnostic, specDirUri, SpecContextKeys, SpecConfigDiagnostics, SPEC_TASK_DIAGNOSTICS, TASK_FORMAT_RULES, TASK_FORMAT_BOXES, TASK_FORMAT_INDENT, TASK_FORMAT_LINE, TASK_DIAGNOSTICS_DEBOUNCE_MS, taskFormatIssues, toTaskDiagnostic, createDiagnosticCollection, SpecTaskDiagnostics, TASK_FIX_TITLE, TASK_FIX_NUMBER_RULES, taskNumbersOf, fixTaskLine, rangesIntersect, taskFixAction, SpecTaskFixProvider, SPEC_HOVER_PATTERN, REVEAL_REQUIREMENT_COMMAND, requirementRefsAt, requirementRefsAfter, activeRefs, revealRequirementUri, requirementHoverMarkdown, hoverMarkdown, makeHover, requirementHoverResolver, PROPERTY_HOVER_FILE, propertyRefsAt, propertyHoverMarkdown, propertyAtLine, propertyHoverResolver, SpecRequirementHoverProvider, revealRequirement, SPEC_NAV_DOCUMENTS, SPEC_GOTO_COMMAND_PREFIX, SPEC_RESOURCE_WHEN, specDocumentName, specGotoCommand, specNavigationTargets, adjacentSpecDocument, specGotoMenuEntries, specGotoPaletteEntries, specCommandSource, specRunNode, gotoSpecDocument, stepSpecDocument, SPEC_CONTENT_KEY, SPEC_SYNC_WHEN, SPEC_NEXT_WHEN, SPEC_RUN_ALL_WHEN, specDocumentHasContent, nextDocumentDecision, SpecContentKey, specConfigFor, specDocumentState, syncSpecDocument, nextSpecDocument, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, SPEC_TURN_KINDS, specTurnDocument, specSiblings, specTurnText, specTurnDisplay, specTurnTitle, specSiblingContexts, specTabRecord, specTabMatches, normalizeRow, findMatches, markTextNode, pendingApprovalCards, TOOL_CARD_DISPLAY_MODES, DEFAULT_TOOL_CARD_DISPLAY_MODE, toolRowShouldCollapse, findPathLinks, chatHtml, nextTabIndex, tabLabel, TAB_TITLE_MAX, validateTabTitle, sameDir, slotTime, slotActivity, ageLabel, HOOK_FILE_RE, HOOK_TRIGGERS, HOOK_MATCHER_TRIGGERS, HOOK_ACTION_KINDS, hookNameFromPath, parseHookFile, hookRowLabel, hookRowDescription, hookRowIcon, hookContextValue, hookRowTooltip, toggleHookEnabled, HooksTree, toggleHook, HOOK_RUN_COMMAND, HOOK_RUN_CONFIRM, HOOK_RUN_BUTTON, hookRunDisplay, hookTerminalName, hookRunDecision, hookTerminal, runHook, HOOK_TEMPLATE, HOOK_TRIGGER_DESCRIPTIONS, HOOK_FILE_TRIGGERS, HOOK_DEFAULT_FILE_MATCHER, HOOK_FILE_EXT, HOOK_DOCS_URL, HOOK_DOCS_COMMAND, HOOK_VIEW_MESSAGE, HOOK_VIEW_MESSAGE_PLAIN, setHookViewMessage, buildHookFile, serializeHookFile, hookFileName, hookScopePicks, createHookWizard, MCP_CONFIG_FILE, MCP_DOCS_URL, MCP_OPEN_CONFIG_COMMAND, MCP_CONFIG_ABSENT_MESSAGE, parseMcpConfig, mcpUrlHost, mcpRowDescription, mcpRowIcon, mcpRowTooltip, mcpServerLine, McpServersTree, openMcpConfig, STEERING_TEMPLATE, SKILL_TEMPLATE, STEERING_EMPTY_CONTEXT_KEY, STEERING_GENERATE_COMMAND, STEERING_GENERATE_DISPLAY, STEERING_GENERATE_FILES, STEERING_GENERATE_PROMPT, steeringIsEmpty, ensureSteeringDir, generateSteeringDocs, STEERING_REFINE_COMMAND, STEERING_REFINE_PROMPT, isSteeringDocument, steeringNameOf, steeringRefineDisplay, steeringDocLabel, refineSteeringDoc, STEERING_IMPORT_COMMAND, IMPORT_SOURCES, IMPORT_FIND_EXCLUDE, IMPORT_FIND_MAX, importStem, importTargetName, withSteeringFrontMatter, scanImportSources, importSteeringFromAssistants, SKILL_IMPORT_COMMAND, SKILL_FILE, SKILL_IMPORT_ROUTE, SKILL_NAME_RE, parseGithubSkillUrl, skillNameFromText, skillScopePicks, importSkillFolder, importSkillFromGithub, revealSkill, importSkill, AssetTree, mdToHtml, stageOf, specNameOf, continueAction, REVIEW_EXCERPT_MAX, reviewBlockId, reviewExcerpt, buildReviewTurn, SPEC_REVIEW_CONTEXT_KEYS, specEditorHtml, isSpecDocument, SpecEditorProvider, openSpecPreview, specReviewTarget, reviewSpecDocument, markSpecEditor, renderMarkdown, localizeImages, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, CONTEXT_FILE_KINDS, CONTEXT_PROVIDERS, CONTEXT_CAP, PROVIDER_CAP, TERMINAL_TAIL_LINES, TERMINAL_HISTORY_MAX, FOLDER_FILES_MAX, GIT_ABSENT_MESSAGE, byteLength, capText, tailLines, stripAnsi, formatProblems, formatFolder, formatSpec, formatGitDiff, providerEntry, contextChipLabel, contextChipTooltip, contextChipEcho, providerContext, plainDiagnostic, clipboardVia, trackTerminalOutput, resolveProblems, resolveTerminal, resolveGitDiff, resolveFolder, resolveSpec, pickContext, looksBinary, fileContextEntry, fileContext, sendTerminalToChat, EXPLORER_MAX_ITEMS, explorerSelection, addExplorerToChat, EDITOR_ACTION_IDS, EDITOR_ACTION_TITLES, DEFAULT_ACTION_PROMPTS, SELECTION_GLYPH, actionPrompt, fenceFor, buildSelectionContext, selectionInput, selectionContext, runEditorAction, fencedBlock, addCodeBlockToChat, COMMIT_MESSAGE_COMMAND, COMMIT_MESSAGE_SESSION_TITLE, COMMIT_MESSAGE_TIMEOUT_MS, COMMIT_MESSAGE_GIT_ABSENT, COMMIT_MESSAGE_NOTHING, COMMIT_MESSAGE_PROMPT, pickDiff, commitMessagePrompt, cleanCommitMessage, gitRepository, runBackgroundTurn, generateCommitMessage, DIAGNOSTIC_FIX_COMMAND, DIAGNOSTIC_FIX_TITLE, DIAGNOSTIC_TITLE_MAX, DIAGNOSTIC_GLYPH, DIAGNOSTIC_FIX_PROMPT, diagnosticTitle, plainRange, buildDiagnosticFixContext, diagnosticFixAction, AgentFixCodeActionProvider, runDiagnosticFix, clip, ChatView, Sessions, themeFor, STOCK_THEMES, mergeRosters, agentPicks, activate };

@@ -104,7 +104,99 @@ export default async function mount(container, api) {
   folderInput.addEventListener("change", () => api.config.set({ default_folder: folderInput.value || null }));
   settings.appendChild(el("div", "opacity:.6;font-size:12px;",
     "Advanced keys (mod config): engine.command (custom engine template with {port} {token} {folder} {auth} {basepath}), " +
-    "engine.port (pin the loopback port), engine.token (true = connection token; breaks embedding)."));
+    "engine.port (pin the loopback port), engine.token (true = connection token; breaks embedding), " +
+    "kas.idle_minutes (minutes an idle kiro-cli child lives, default 30), kas.kiro_cli (path of the kiro-cli to run)."));
+
+  // --- Kiro modes (kiro-cli): the sessions the hook's kiro-cli children ran, read-only.
+  // These live in kiro-cli's own store (~/.kiro/sessions) and the hook's relay log, never in
+  // KiroCrew's session store, so the dashboard's own session list does not show them.
+  const kas = card("Kiro modes (kiro-cli)");
+  kas.appendChild(el("div", "opacity:.85;",
+    "Kiro's Spec, Quick Spec, Bug Fix and Plan run in a kiro-cli child the hook owns per workspace; " +
+    "their sessions are kept by kiro-cli itself and relayed by the hook. Read-only here: nothing is written to KiroCrew's session store."));
+  const kasStatus = el("div", "opacity:.7;font-size:12px;", "loading\u2026");
+  kas.appendChild(kasStatus);
+  const kasTable = el("table", "border-collapse:collapse;width:100%;font-size:12px;");
+  kas.appendChild(kasTable);
+  const kasTranscript = el("pre", "display:none;max-height:360px;overflow:auto;white-space:pre-wrap;font:12px/1.45 ui-monospace,monospace;border:1px solid var(--border-color,#4443);border-radius:6px;padding:8px 10px;margin:0;", "");
+  kas.appendChild(kasTranscript);
+  const kasRow = el("div", "display:flex;gap:8px;");
+  kasRow.appendChild(button("Refresh", () => refreshKas()));
+  kas.appendChild(kasRow);
+
+  const age = (seconds) => {
+    if (!seconds) return "";
+    const diff = Math.max(0, Date.now() / 1000 - Number(seconds));
+    if (diff < 60) return "just now";
+    if (diff < 3600) return Math.round(diff / 60) + " min ago";
+    if (diff < 86400) return Math.round(diff / 3600) + " h ago";
+    return Math.round(diff / 86400) + " d ago";
+  };
+  // One line per relayed frame of the hook's log: the shapes hook/kas.py buffers (userPrompt,
+  // update with KAS's session/update, ask, askResolved, turnEnd, error, clear).
+  const transcriptText = (frames) => {
+    const lines = [];
+    let agent = "";
+    const flush = () => { if (agent.trim()) lines.push("assistant: " + agent.trim()); agent = ""; };
+    for (const f of frames || []) {
+      if (f.kind === "userPrompt") { flush(); lines.push("user: " + String(f.text || "")); continue; }
+      if (f.kind === "update") {
+        const u = f.update || {};
+        const text = u.content && u.content.type === "text" ? String(u.content.text || "") : "";
+        if (u.sessionUpdate === "user_message_chunk") { flush(); if (text) lines.push("user: " + text); }
+        else if (u.sessionUpdate === "agent_message_chunk") agent += text;
+        else if (u.sessionUpdate === "agent_thought_chunk") { flush(); if (text) lines.push("thinking: " + text.slice(0, 200)); }
+        else if (u.sessionUpdate === "tool_call") { flush(); lines.push("tool: " + (u.title || u.kind || "tool") + (u.status ? " [" + u.status + "]" : "")); }
+        else if (u.sessionUpdate === "tool_call_update" && (u.status === "completed" || u.status === "failed")) { flush(); lines.push("tool " + (u.toolCallId || "") + " " + u.status); }
+        continue;
+      }
+      if (f.kind === "ask") { flush(); lines.push((f.ask === "permission" ? "permission asked: " + (f.title || "tool") : "question: " + String(f.question || "")) + " (#" + f.requestId + ")"); continue; }
+      if (f.kind === "askResolved") { flush(); lines.push("answered #" + f.requestId + ": " + (f.cancelled ? "cancelled" : f.optionId || f.answer || "")); continue; }
+      if (f.kind === "turnEnd") { flush(); lines.push("\u2014 turn ended: " + (f.stopReason || "end_turn") + " \u2014"); continue; }
+      if (f.kind === "error") { flush(); lines.push("error: " + String(f.message || "")); continue; }
+    }
+    flush();
+    return lines.join("\n");
+  };
+  async function showTranscript(row) {
+    kasTranscript.style.display = "";
+    kasTranscript.textContent = "loading transcript of " + row.sessionId + "\u2026";
+    try {
+      const doc = await (await api.routes.fetch("kas/sessions/" + encodeURIComponent(row.sessionId) + "/transcript")).json();
+      const frames = Array.isArray(doc.frames) ? doc.frames : [];
+      kasTranscript.textContent = frames.length ? "session " + row.sessionId + " (" + frames.length + " relayed frames, read-only)\n\n" + transcriptText(frames)
+        : "session " + row.sessionId + ": " + (doc.reason || "no transcript") + ". Open it from the IDE's History (Kiro modes) to load it from kiro-cli's store.";
+    } catch (err) {
+      kasTranscript.textContent = "transcript unavailable (" + err + ")";
+    }
+  }
+  async function refreshKas() {
+    let st, doc;
+    try {
+      [st, doc] = await Promise.all([api.routes.fetch("kas/status").then((r) => r.json()), api.routes.fetch("kas/sessions").then((r) => r.json())]);
+    } catch (err) {
+      kasStatus.textContent = "kas routes unreachable (" + err + ") \u2014 the hook predates this feature; restart the gateway once";
+      return;
+    }
+    const cli = st.kiroCli || {};
+    const children = (st.workspaces || []).map((w) => (w.folder || "").split("/").pop() + " (pid " + w.pid + ", " + (w.sessions || []).length + " session" + ((w.sessions || []).length === 1 ? "" : "s") + ")");
+    kasStatus.textContent = (st.available ? (/^kiro-cli/.test(cli.version || "") ? cli.version : "kiro-cli " + (cli.version || "")) + (st.login && st.login.loggedIn === false ? " \u2014 not logged in" : "") : "unavailable: " + (st.reason || "")) +
+      " \u00b7 idle stop after " + st.idleMinutes + " min \u00b7 " + (children.length ? "running for " + children.join(", ") : "no kiro-cli child running");
+    kasTable.innerHTML = "";
+    const rows = Array.isArray(doc.sessions) ? doc.sessions : [];
+    if (!rows.length) { kasTable.appendChild(el("caption", "text-align:left;opacity:.6;", "No Kiro-mode sessions yet \u2014 pick a Kiro mode in the IDE's agent picker.")); return; }
+    const head = el("tr", "");
+    for (const h of ["Title", "Mode", "Spec", "State", "Last activity", "Workspace", "Source"]) head.appendChild(el("th", "text-align:left;padding:3px 6px;border-bottom:1px solid var(--border-color,#4443);opacity:.7;font-weight:600;", h));
+    kasTable.appendChild(head);
+    for (const r of rows.slice(0, 100)) {
+      const tr = el("tr", "cursor:pointer;");
+      tr.title = r.sessionId + " \u2014 click for the read-only transcript";
+      const cells = [r.title || r.sessionId, r.mode || "", r.feature || "", r.state + (r.pendingAsks ? " (waiting)" : ""), age(r.lastActivity), (r.folder || "").split("/").pop(), r.source === "kas" ? "kiro-cli store" : "hook relay"];
+      for (const c of cells) tr.appendChild(el("td", "padding:3px 6px;border-bottom:1px solid var(--border-color,#4442);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;", c));
+      tr.addEventListener("click", () => showTranscript(r));
+      kasTable.appendChild(tr);
+    }
+  }
 
   async function refresh() {
     let data;
@@ -152,6 +244,8 @@ export default async function mount(container, api) {
   }
 
   await refresh();
+  refreshKas().catch(() => undefined);
   const timer = setInterval(refresh, 15000);
-  return () => clearInterval(timer);
+  const kasTimer = setInterval(() => refreshKas().catch(() => undefined), 30000);
+  return () => { clearInterval(timer); clearInterval(kasTimer); };
 }

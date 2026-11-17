@@ -22,6 +22,7 @@ def main():
     assert hook._seed_machine_settings(path) is True, "created"
     doc = json.load(open(path))
     assert doc["chat.disableAIFeatures"] is True and doc["workbench.secondarySideBar.defaultVisibility"] == "visible"
+    assert doc["workbench.sash.size"] == 8 and doc["workbench.sash.hoverDelay"] == 100, "thicker, quicker sashes"
     assert hook._seed_machine_settings(path) is False, "idempotent"
 
     # An operator's own value for a seeded key is kept; unrelated keys are kept; missing ones added.

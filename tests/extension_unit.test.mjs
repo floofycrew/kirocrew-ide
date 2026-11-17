@@ -17,7 +17,7 @@ const stub = {
   ThemeIcon: class { constructor(id) { this.id = id; } },
   FileType: { Directory: 2 },
   Uri: { joinPath: (base, ...parts) => ({ path: [base.path, ...parts].join("/") }), parse: (s) => ({ toString: () => s }) },
-  workspace: { getConfiguration: () => ({ get: (k) => (k === "kiroModeAgents" ? true : undefined) }), workspaceFolders: [] },
+  workspace: { getConfiguration: () => ({ get: () => undefined }), workspaceFolders: [] },
   window: {},
   commands: {},
   StatusBarAlignment: { Left: 1 },
@@ -264,7 +264,7 @@ test("a spec phase dispatched from the editor runs in a Spec-mode tab through th
   assert.equal(tab.title, "spec x: design");
 });
 
-test("a task run dispatched to Kiro's Spec agent sends Kiro's own request, shows Kiro's short turn, runs on Autopilot; the crew agent gets the paraphrase", async () => {
+test("a task run from the Specs view sends the mod's request with the Spec frame, shows the short turn, runs on Autopilot", async () => {
   const { ChatView, parseTaskTree, parseTasks, kiroRunAllRequest, runAllPrompt } = ext.__test;
   const md = "- [x] 1. a\n- [ ] 2. b";
   const spec = { name: "f", dir: { path: "/w/.kiro/specs/f" }, workspace: { uri: { path: "/w" } }, taskTree: parseTaskTree(md), tasks: parseTasks(md), tasksText: md };
@@ -281,22 +281,18 @@ test("a task run dispatched to Kiro's Spec agent sends Kiro's own request, shows
     chat.post = (m) => calls.posted.push(m);
     return { chat, calls };
   };
-  // With kiro-spec-plan installed: Kiro's sentence to Kiro's agent, no prompt frame, Autopilot on, "Run all tasks" shown.
-  const kiro = make([{ name: "spec" }]);
-  await kiro.chat.dispatch((agent) => (agent ? kiroRunAllRequest(spec) : runAllPrompt(spec)), { mode: "spec", title: "Run all tasks", kind: "spec", display: "Run all tasks", autopilot: true });
-  assert.equal(kiro.calls.sent[0].agent, "spec");
-  assert.equal(kiro.calls.sent[0].text, "Run all tasks for this spec. Resume from prior progress: tasks [1. a] are already completed (per tasks.md). Skip them and continue from the next ready task.");
-  assert.equal(kiro.calls.injected.length, 0, "Kiro's own agent gets no paraphrase frame");
-  assert.deepEqual(kiro.calls.trust, [["k1", true]], "Autopilot applied to the task session");
-  assert.equal(kiro.calls.posted.find((m) => m.type === "user").text, "Run all tasks", "the transcript shows the short turn, like Kiro's IDE");
-  const next = kiro.chat.newTab();
-  assert.equal(next.settings.autopilot, false, "the forced Autopilot is not inherited by the next ordinary tab");
-  // Without it: the paraphrase on the crew agent, with the Spec frame.
-  const crew = make([]);
+  // The gateway path: the mod's paraphrase on the crew agent, with the Spec frame injected,
+  // Autopilot on, the short "Run all tasks" shown. (Kiro's own request goes to Kiro's engine
+  // through _kiro/spec/invoke when kirocrew.specEngine is kas; never to a gateway agent.)
+  const crew = make([{ name: "spec" }]);
   await crew.chat.dispatch((agent) => (agent ? kiroRunAllRequest(spec) : runAllPrompt(spec)), { mode: "spec", title: "Run all tasks", kind: "spec", display: "Run all tasks", autopilot: true });
+  assert.equal(crew.calls.sent[0].agent, "", "an agent named spec in the roster is never substituted for the pick");
   assert.match(crew.calls.sent[0].text, /PHASE: EXECUTE REMAINING TASKS\. Run all tasks for this spec\./);
   assert.equal(crew.calls.injected.length, 1);
-  assert.deepEqual(crew.calls.trust, [["k1", true]]);
+  assert.deepEqual(crew.calls.trust, [["k1", true]], "Autopilot applied to the task session");
+  assert.equal(crew.calls.posted.find((m) => m.type === "user").text, "Run all tasks", "the transcript shows the short turn, like Kiro's IDE");
+  const next = crew.chat.newTab();
+  assert.equal(next.settings.autopilot, false, "the forced Autopilot is not inherited by the next ordinary tab");
 });
 
 
@@ -458,130 +454,8 @@ test("chat webview: steering indicator, `#name` hint, and a resizable input box 
   assert.ok(/textarea\{[^}]*max-height:45vh/.test(html) && /textarea\.manual\{max-height:none\}/.test(html), "auto height capped, manual height free");
 });
 
-test("a host that reserves Kiro's mode ids: the refusal falls back to the prompt-guided workflow on the pick, once per window", async () => {
-  // KiroCrew 0.8.0.9 refuses a session whose agent is `spec`/`plan`/… ("reserved for a built-in agent"),
-  // which is exactly the name kiro-spec-plan's handles carry. The tab must not die on it.
-  const { ChatView, isReservedModeRefusal } = ext.__test;
-  assert.equal(isReservedModeRefusal("Rename this crewmate's template: “spec” is reserved for a built-in agent, so …"), true);
-  assert.equal(isReservedModeRefusal("'spec' is reserved by the KAS agent engine"), true);
-  assert.equal(isReservedModeRefusal("HTTP 500 /chat"), false);
-  // KiroCrew 0.11's coat of the same refusal (the verbatim host text of 2026-11-03): the id it
-  // looked for was the wire alias `spec-crewmate`, which nothing registered. Only the four mode
-  // ids count; the identical sentence about any other agent is a genuinely missing file.
-  const v011 = "kiro_crew.acp.session_handle.AcpRuntimeError: Agent mode 'spec' is not available on this session (advertised modes: ['vibe', 'spec', 'quick-spec', 'bug-fix', 'plan', 'o3r_default']); its ~/.kiro/agents/spec.json is likely missing. Refusing to run the backend default mode vibe in its place. Run `kirocrew setup --agent-only` to materialize the agent config.";
-  assert.equal(isReservedModeRefusal(v011), true);
-  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'quick-spec'")), true);
-  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'bug-fix'")), true);
-  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'plan'")), true);
-  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'o3r_default'")), false, "a missing ordinary agent is not a reserved-mode refusal");
-  assert.equal(isReservedModeRefusal(v011.replace(/'spec'/, "'spec-crewmate'")), false);
-  const calls = { sent: [], injected: [], slotAgent: [], posted: [] };
-  let refuse = true;
-  const sessions = {
-    projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }, { name: "o3r" }],
-    create: async () => "k1", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {},
-    inject: async (key, content, source) => { calls.injected.push(source); }, setSlotAgent: async (key, a) => { calls.slotAgent.push(a); },
-    send: async (key, text, agent) => { calls.sent.push(agent); if (refuse && agent === "spec") throw new Error("Rename this crewmate's template: “spec” is reserved for a built-in agent, so the crewmate's own prompt and tools would not run under it."); },
-  };
-  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
-  chat.post = (m) => calls.posted.push(m);
-  const t = chat.newTab(true); t.settings.mode = "spec"; t.settings.agent = "o3r";
-  await chat.send(t, { text: "build the thing" });
-  assert.deepEqual(calls.sent, ["spec", "o3r"], "sent to Kiro's agent, refused, re-sent on the pick");
-  assert.deepEqual(calls.slotAgent, ["o3r"], "the slot is retargeted to the pick");
-  assert.ok(calls.injected.includes("kirocrew-ide workflow"), "the prompt-guided Spec frame is injected for the retry");
-  assert.match(calls.posted.find((m) => m.type === "error").text, /refuses Kiro's mode agent "spec"/);
-  // The next tab skips the doomed attempt.
-  const t2 = chat.newTab(true); t2.settings.mode = "spec"; t2.settings.agent = "o3r";
-  await chat.send(t2, { text: "again" });
-  assert.equal(calls.sent[calls.sent.length - 1], "o3r");
-  assert.equal(calls.sent.filter((a) => a === "spec").length, 1, "no second attempt on the reserved id in this window");
-  // An unrelated error still surfaces.
-  refuse = false;
-  sessions.send = async () => { throw new Error("HTTP 502 /chat"); };
-  await assert.rejects(chat.send(chat.newTab(true), { text: "x" }), /502/);
-});
 
-test("Spec on a KAS host: the steering receipt names the agent and is re-posted for the fallback agent after the mode-id refusal", async () => {
-  const { ChatView } = ext.__test;
-  const home = "/local/home/someone";
-  const tree = { [home + "/proj/.kiro/steering"]: [["rules.md", 1], ["amazon-builder", 2]], [home + "/proj/.kiro/steering/amazon-builder"]: [["git.md", 1]], [home + "/.kiro/steering"]: [["crux.md", 1]] };
-  const files = {
-    [home + "/proj/.kiro/steering/rules.md"]: "always",
-    [home + "/proj/.kiro/steering/amazon-builder/git.md"]: "always too",
-    [home + "/.kiro/steering/crux.md"]: "---\ninclusion: manual\n---\nmanual",
-    [home + "/.kiro/crew/config.json"]: JSON.stringify({ acp_backend: "kas", default_agent: "o3r" }),
-    [home + "/.kiro/agents/spec.json"]: JSON.stringify({ name: "spec", prompt: "handle" }),            // no resources key
-    [home + "/.kiro/agents/o3r.json"]: JSON.stringify({ name: "o3r", resources: ["file://README.md"] }), // resources omit steering
-  };
-  const saved = { fs: stub.workspace.fs, folders: stub.workspace.workspaceFolders, FileType: stub.FileType, window: stub.window };
-  stub.FileType = { Directory: 2, File: 1 };
-  stub.workspace.workspaceFolders = [{ uri: { path: home + "/proj", with: ({ path }) => ({ path }) } }];
-  stub.workspace.fs = {
-    readDirectory: async (uri) => { if (!(uri.path in tree)) throw new Error("ENOENT"); return tree[uri.path].map((e) => [...e]); },
-    readFile: async (uri) => { if (!(uri.path in files)) throw new Error("ENOENT"); return new TextEncoder().encode(files[uri.path]); },
-  };
-  stub.window = { visibleTextEditors: [] };
-  const calls = { sent: [], posted: [] };
-  const sessions = {
-    projectPath: () => home + "/proj", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }, { name: "o3r" }],
-    create: async () => "k2", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, inject: async () => {}, setSlotAgent: async () => {},
-    send: async (key, text, agent) => { calls.sent.push(agent); if (agent === "spec") throw new Error("“spec” is reserved for a built-in agent"); },
-  };
-  try {
-    const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
-    chat.post = (m) => calls.posted.push(m);
-    const t = chat.newTab(true); t.settings.mode = "spec"; t.settings.agent = "o3r";
-    await chat.send(t, { text: "build the thing" });
-    assert.deepEqual(calls.sent, ["spec", "o3r"]);
-    const notes = calls.posted.filter((m) => m.type === "status").map((m) => m.text);
-    assert.equal(notes.length, 2, "one receipt before the send, one after the fallback");
-    assert.match(notes[0], /^Steered by workspace amazon-builder\/git\.md, rules\.md \(always, loaded with agent spec on KAS\)\. crux\.md is manual \(#crux\)$/, "nested workspace file listed; KAS loads steering for the mode agent too");
-    assert.match(notes[1], /loaded with agent o3r on KAS/, "the fallback agent's receipt: on KAS its resources omitting steering does not matter");
-    assert.ok(!notes.some((n) => /does not load/.test(n)), "no false warning on KAS");
-  } finally {
-    stub.workspace.fs = saved.fs; stub.workspace.workspaceFolders = saved.folders; stub.FileType = saved.FileType; stub.window = saved.window;
-  }
-});
 
-test("the refusal that arrives as the turn's streamed error row (the send was accepted) also falls back, once", async () => {
-  // On this host `/chat?ws=1` answers 200 and the turn runs asynchronously; the
-  // KasReservedAgentIdError lands as an `error` row in the slot's history and a
-  // chat_message frame. Seen 2026-10-23 in kirocrew-ide-chat-20261023042311.
-  const { ChatView, isErrorRow } = ext.__test;
-  assert.equal(isErrorRow({ role: "error", content: "x" }), true);
-  assert.equal(isErrorRow({ role: "assistant", cls: "msg msg-err", content: "x" }), true);
-  assert.equal(isErrorRow({ role: "assistant", content: "❌ failed" }), true);
-  assert.equal(isErrorRow({ role: "assistant", content: "fine" }), false);
-  const refusal = "Rename this crewmate's template: “spec” is reserved for a built-in agent, so the crewmate's own prompt and tools would not run under it.";
-  const calls = { sent: [], injected: [], slotAgent: [], posted: [] };
-  const sessions = {
-    projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents: [{ name: "spec" }, { name: "o3r" }],
-    create: async () => "k9", setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {},
-    inject: async (key, content, source) => { calls.injected.push(source); }, setSlotAgent: async (key, a) => { calls.slotAgent.push(a); },
-    send: async (key, text, agent, meta) => { calls.sent.push([agent, text, meta]); },
-  };
-  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
-  chat.post = (m) => calls.posted.push(m);
-  const t = chat.newTab(true); t.settings.mode = "spec"; t.settings.agent = "o3r";
-  await chat.send(t, { text: "check the drafted requirements file", files: [] });
-  assert.equal(calls.sent.length, 1, "the send was accepted");
-  assert.equal(calls.sent[0][0], "spec");
-  // The host streams the refusal as the turn's error row.
-  chat.onFrame({ type: "chat_message", data: { slot: "k9", role: "error", content: refusal } });
-  await new Promise((r) => setTimeout(r, 0)); await new Promise((r) => setTimeout(r, 0));
-  assert.equal(calls.sent.length, 2, "re-sent on the pick");
-  assert.deepEqual(calls.sent[1].slice(0, 2), ["o3r", "check the drafted requirements file"], "the same text, on the picked agent");
-  assert.deepEqual(calls.slotAgent, ["o3r"]);
-  assert.ok(calls.injected.includes("kirocrew-ide workflow"));
-  assert.ok(!calls.posted.some((m) => m.type === "row" && /reserved for a built-in/.test(m.row && m.row.content)), "the host's refusal row is replaced by our one-line note");
-  assert.match(calls.posted.find((m) => m.type === "error").text, /refuses Kiro's mode agent "spec"/);
-  // A second copy of the same row (history replay) does nothing more.
-  chat.onFrame({ type: "chat_message", data: { slot: "k9", role: "error", content: refusal } });
-  await new Promise((r) => setTimeout(r, 0));
-  assert.equal(calls.sent.length, 2, "the fallback runs once per turn");
-  assert.equal(chat.modeAgentsRefused, true);
-});
 
 test("tool lifecycle frames reach the webview: tool_result and a tool_call update are forwarded by tool_call_id, the initial tool_call is not", async () => {
   const { ChatView } = ext.__test;
@@ -1060,51 +934,15 @@ test("Sessions.history() lists the most recent activity first from the host's IS
 });
 
 
-test("kasAgentFor: a Kiro Spec & Plan agent takes over a mode; otherwise the prompt frame stays", async () => {
-  const { kasAgentFor, ChatView } = ext.__test;
-  const agents = [{ name: "desk-default" }, { name: "spec" }, { name: "plan" }];
-  assert.equal(kasAgentFor("spec", agents), "spec");
-  assert.equal(kasAgentFor("plan", agents), "plan");
-  assert.equal(kasAgentFor("bug-fix", agents), null, "mod agent absent -> fall back");
-  assert.equal(kasAgentFor("default", agents), null);
-  assert.equal(kasAgentFor("spec", []), null);
 
-  // Through send(): with the agent present, the session is created ON it and no frame is injected.
-  const calls = { created: [], injected: [], sent: [] };
-  const sessions = {
-    projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents,
-    create: async (o) => { calls.created.push(o); return "k2"; },
-    inject: async (k, c, src) => { calls.injected.push(src); },
-    send: async (k, text, agent) => { calls.sent.push(agent); },
-    setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, setSlotAgent: async () => {},
-  };
-  const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
-  await chat.dispatch("PHASE: DESIGN …", { mode: "spec", title: "t", kind: "spec" });
-  assert.equal(calls.created[0].agent, "spec");
-  assert.deepEqual(calls.injected, [], "Kiro's own workflow: no paraphrased frame");
-  assert.deepEqual(calls.sent, ["spec"]);
-});
-
-test("agentPicks: one sectioned picker — Kiro modes when the mod's agents exist, prompt workflows otherwise, then agents", () => {
-  const { agentPicks, modeOfAgent, mergeRosters } = ext.__test;
-  const withMod = agentPicks([{ name: "desk-default" }, { name: "spec" }, { name: "plan" }, { name: "kirocrew-skill-view-abc" }]);
-  assert.deepEqual(withMod.map((p) => p.section + "|" + p.id), [
-    "Kiro modes|agent:spec", "Kiro modes|agent:plan", "Your agents|", "Your agents|agent:desk-default",
-  ], "mode agents and skill views never appear as plain agents");
-  assert.ok(withMod[0].kiro);
-  const without = agentPicks([{ name: "desk-default" }]);
-  // Seen live: with kiro-spec-plan absent the picker showed the stand-ins with nothing saying
-  // where Kiro's own modes come from, and "Spec" silently ran on the default agent. The
-  // section now opens with a hint row that names the mod; it is not a pick (id kind `hint`).
-  assert.deepEqual(without.map((p) => p.id), ["hint:kiro-spec-plan", "workflow:spec", "workflow:quick-spec", "workflow:bug-fix", "workflow:plan", "", "agent:desk-default"]);
-  assert.equal(without[0].section, "Workflows (prompt-guided)");
-  assert.ok(without[0].hint && /kiro-spec-plan/.test(without[0].label) && /floofy install kiro-spec-plan/.test(without[0].description));
-  assert.ok(without.slice(1).every((p) => !p.hint), "exactly one hint row");
-  assert.ok(!withMod.some((p) => p.hint), "no hint once the mode agents exist");
-  // The webview's pick handler derives kind from the id; a hint must never be mistaken for an agent or a workflow.
-  assert.ok(!without[0].kiro && without[0].id.split(":")[0] === "hint");
-  assert.equal(modeOfAgent("quick-spec"), "quick-spec");
-  assert.equal(modeOfAgent("desk-default"), null);
+test("agentPicks: the prompt-guided workflows, the crew default, then every agent (the Kiro-modes group is kasPicks', prepended by the caller)", () => {
+  const { agentPicks, mergeRosters } = ext.__test;
+  const picks = agentPicks([{ name: "desk-default" }, { name: "spec" }, { name: "kirocrew-skill-view-abc" }, { name: "kirocrew-lite" }]);
+  assert.deepEqual(picks.map((p) => p.section + "|" + p.id), [
+    "Workflows (prompt-guided)|workflow:spec", "Workflows (prompt-guided)|workflow:quick-spec", "Workflows (prompt-guided)|workflow:bug-fix", "Workflows (prompt-guided)|workflow:plan",
+    "Your agents|", "Your agents|agent:desk-default", "Your agents|agent:spec",
+  ], "skill views and the lite agent never appear; an agent named spec is just an agent");
+  assert.ok(picks.every((p) => !p.hint && !p.kiro), "no hint row and no mode-agent entries");
   const merged = mergeRosters([{ name: "desk-default", description: "d" }], [{ name: "desk-default" }, { name: "spec", description: "Kiro mode" }, { name: "kirocrew-lite" }]);
   assert.deepEqual(merged.map((a) => a.name + ":" + a.source), ["desk-default:crew", "spec:installed"]);
 });
@@ -1313,8 +1151,8 @@ test("a task run resumes itself from tasks.md when the host's ceiling card arriv
     assert.ok(calls.posted.some((m) => m.type === "row" && m.row.role === "error" && m.row.content === card), "the card itself is shown (the webview adds Continue)");
     assert.match(calls.posted.filter((m) => m.type === "status").at(-1).text, /^The host stopped this turn at its 4-hour limit; resuming the run from tasks\.md \(1 of 3\)…$/);
     assert.equal(calls.sent.length, 2, "resumed once");
-    assert.equal(calls.sent[1].agent, "spec", "on the same Spec agent");
-    assert.match(calls.sent[1].text, /^Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\] are already completed/, "Kiro's request rebuilt from the current tasks.md");
+    assert.equal(calls.sent[1].agent, "", "on the same (picked) agent");
+    assert.match(calls.sent[1].text, /PHASE: EXECUTE REMAINING TASKS\. Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\] are already completed/, "the run's request rebuilt from the current tasks.md");
     assert.ok(calls.sent[1].text.endsWith(RESUME_NOTE));
     assert.equal(calls.posted.filter((m) => m.type === "user").at(-1).text, "Resume: Run all tasks (2 left)", "the transcript shows the short label, as Kiro does");
     assert.equal(t.run.resumed, 1);
@@ -1327,7 +1165,7 @@ test("a task run resumes itself from tasks.md when the host's ceiling card arriv
     // The button still works past the cap (the webview posts `resume`).
     await chat.onMessage({ type: "resume", id: t.id });
     assert.equal(calls.sent.length, 3, "Continue resumes by hand");
-    assert.match(calls.sent[2].text, /^Run all tasks for this spec\./);
+    assert.match(calls.sent[2].text, /PHASE: EXECUTE REMAINING TASKS\. Run all tasks for this spec\./);
     // While the session runs, Continue sends nothing.
     slots.k1.running = true;
     await chat.onMessage({ type: "resume", id: t.id });
@@ -1405,7 +1243,7 @@ test("a run that stops without the ceiling card is judged from tasks.md: Kiro's 
     await settle();
     assert.equal(calls.sent.length, 2, "resumed");
     assert.equal(lastOf("status").text, "The turn ended with 1 task in progress and 1 queued, without finishing the run; resuming the run from tasks.md (1 of 3)…");
-    assert.match(calls.sent[1].text, /^Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\]/);
+    assert.match(calls.sent[1].text, /PHASE: EXECUTE REMAINING TASKS\. Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\]/);
     // 2. A non-terminal error row mid-turn ("⟳ Connection unstable — resuming…") arms nothing on its own.
     chat.onFrame({ type: "chat_message", data: { slot: "k1", role: "error", content: "⟳ Connection unstable — resuming…", meta: { mid: "e1" } } });
     await settle();
@@ -1491,8 +1329,8 @@ test("a Spec tab without a run record (an older tab, a dashboard-started run) ad
     await settle();
     assert.equal(calls.sent.length, 1);
     assert.equal(calls.sent[0].key, t.key);
-    assert.match(calls.sent[0].text, /^Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\]/);
-    assert.equal(calls.sent[0].agent, "spec");
+    assert.match(calls.sent[0].text, /PHASE: EXECUTE REMAINING TASKS\. Run all tasks for this spec\. Resume from prior progress: tasks \[1\. Done\]/);
+    assert.equal(calls.sent[0].agent, "");
     // Marks gone but rows still open: a derived run has no say (the spec may simply never have been run further).
     ws.files[ws.spec + "/tasks.md"] = "- [x] 1. Done\n- [x] 2. Next\n- [ ] 3. After";
     const before = calls.sent.length;
@@ -1633,33 +1471,4 @@ test("sendSpecTurn: Spec_Agent in Spec mode, sibling documents as #file contexts
     stub.workspace.workspaceFolders = saved.folders; stub.workspace.fs = saved.fs; stub.commands.executeCommand = saved.exec;
     stub.window.setStatusBarMessage = saved.status; stub.workspace.getConfiguration = saved.cfg;
   }
-});
-test("kiroModeAgents off (the default): the spec turn never goes to the kiro-spec-plan handle; the IDE's own workflow runs on the pick, and the picker shows no install hint", async () => {
-  // Seen live 2026-11-07 on dev-dsk-testing: the host accepted agent `spec`, kiro-cli loaded the mod's
-  // tool-less ~/.kiro/agents/spec.json handle, and the design phase answered "Kiro Spec & Plan needs the
-  // KAS backend" although acp_backend was kas. The mode agents are now opt-in.
-  const { kasAgentFor, agentPicks, ChatView } = ext.__test;
-  const agents = [{ name: "desk-default" }, { name: "spec" }, { name: "plan" }];
-  assert.equal(kasAgentFor("spec", agents, false), null);
-  assert.equal(kasAgentFor("spec", agents, true), "spec");
-  const picks = agentPicks(agents, false).map((p) => p.id);
-  assert.deepEqual(picks, ["workflow:spec", "workflow:quick-spec", "workflow:bug-fix", "workflow:plan", "", "agent:desk-default"], "workflows listed, no hint row, mode agents hidden");
-  const savedCfg = stub.workspace.getConfiguration;
-  stub.workspace.getConfiguration = () => ({ get: () => undefined });
-  try {
-    const calls = { created: [], injected: [], sent: [] };
-    const sessions = {
-      projectPath: () => "/w", slot: () => null, onDidChange: () => ({ dispose() {} }), agents,
-      create: async (o) => { calls.created.push(o); return "k7"; },
-      inject: async (k, c, src) => { calls.injected.push(src); },
-      send: async (k, text, agent) => { calls.sent.push(agent); },
-      setModel: async () => {}, setEffort: async () => {}, setTrust: async () => {}, setSlotAgent: async () => {},
-    };
-    const chat = new ChatView({ workspaceState: { get: () => undefined, update: () => {} } }, sessions, { on: () => ({ dispose() {} }) });
-    chat.post = () => {};
-    await chat.dispatch("PHASE: DESIGN …", { mode: "spec", title: "t", kind: "spec", agent: "o3r" });
-    assert.equal(calls.created[0].agent, "o3r", "created on the pick, not on the handle");
-    assert.deepEqual(calls.sent, ["o3r"]);
-    assert.ok(calls.injected.includes("kirocrew-ide workflow"), "the prompt-guided Spec frame is injected");
-  } finally { stub.workspace.getConfiguration = savedCfg; }
 });
