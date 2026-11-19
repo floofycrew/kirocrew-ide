@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.38.0",
+  "version": "0.38.1",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -82,7 +82,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "44700ef48839ca7e5adb11c769ba3c0c44347d85381f6f36f01cb748a5cc95ca"
+      "sha256": "addac103f3b09b794569de20f927f906f2688f91ccc33d797375c916b8fde565"
     },
     {
       "path": "app/app.json",
@@ -118,7 +118,7 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "59600506c413560797818ab22101ebcf3285aec8bdf2670050acb313adb3cf8a"
+      "sha256": "f4813e206af44e584dfea7c53bc6a9a06f30575bc201c9e307f17517a9d49542"
     },
     {
       "path": "hook/__init__.py",

@@ -1,31 +1,17 @@
-<a id="readme-top"></a>
+# KiroCrew IDE
 
-<div align="center">
-  <a href="https://github.com/floofycrew/kirocrew-ide">
-    <img src="app/ui/art/icon.svg" alt="KiroCrew IDE" width="160" height="160">
-  </a>
-  <h1><b>KiroCrew IDE</b></h1>
-  <p>
-    A full VS Code workbench inside your <a href="https://github.com/kirodotdev/KiroCrew">KiroCrew</a> dashboard &mdash; with KiroCrew chat, durable sessions and the Kiro spec workflow in the editor. One port, no extra tunnel.
-  </p>
-  <p>
-    <a href="https://github.com/floofycrew/kirocrew-ide/issues/new?labels=bug">Report a bug</a>
-    &middot;
-    <a href="https://github.com/floofycrew/kirocrew-ide/issues/new?labels=enhancement">Request a feature</a>
-    &middot;
-    <a href="https://github.com/floofycrew/FloofyCrew">FloofyCrew, the mod manager</a>
-  </p>
-  <p>
-    <a href="https://github.com/floofycrew/kirocrew-ide/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/floofycrew/kirocrew-ide?style=for-the-badge&color=ff6b4a"></a>
-    <a href="https://github.com/floofycrew/kirocrew-ide/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/floofycrew/kirocrew-ide?style=for-the-badge&color=2d2d34"></a>
-    <a href="https://github.com/floofycrew/kirocrew-ide/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/floofycrew/kirocrew-ide?style=for-the-badge&color=ffb347"></a>
-    <a href="https://github.com/floofycrew/kirocrew-ide/issues"><img alt="Issues" src="https://img.shields.io/github/issues/floofycrew/kirocrew-ide?style=for-the-badge&color=2d2d34"></a>
-  </p>
-  <br>
-  <img src=".github/shots/kirocrew-ide-demo.gif" alt="Opening a folder in the KiroCrew IDE, chatting with a crew agent in the editor and running a spec" width="900">
-</div>
+A full VS Code workbench inside your
+[KiroCrew](https://github.com/kirodotdev/KiroCrew) dashboard — with KiroCrew
+chat, durable sessions and the Kiro spec workflow in the editor. One port, no
+extra tunnel.
 
-<br>
+[Report a bug](https://github.com/floofycrew/kirocrew-ide/issues/new?labels=bug)
+· [Request a feature](https://github.com/floofycrew/kirocrew-ide/issues/new?labels=enhancement)
+· [Latest release](https://github.com/floofycrew/kirocrew-ide/releases/latest)
+· [MIT licence](https://github.com/floofycrew/kirocrew-ide/blob/main/LICENSE)
+· [FloofyCrew, the mod manager](https://github.com/floofycrew/FloofyCrew)
+
+![Opening a folder in the KiroCrew IDE, chatting with a crew agent in the editor and running a spec](.github/shots/kirocrew-ide-demo.gif)
 
 ## What is it?
 
@@ -35,7 +21,7 @@ that turns KiroCrew into your IDE. It runs a VS Code web engine
 the dashboard on the dashboard's own port**, and puts KiroCrew into the
 workbench: chat with any crew agent, sessions that survive a dropped ssh
 connection, tool approvals from the editor, and the Kiro spec workflow
-(requirements &rarr; design &rarr; tasks &rarr; **Run all tasks**) over
+(requirements → design → tasks → **Run all tasks**) over
 `.kiro/specs`.
 
 Unofficial. Not affiliated with Kiro or the KiroCrew maintainers.
@@ -66,14 +52,14 @@ kirocrew restart
 
 or click *Install* on the dashboard's **FloofyCrew** page.
 
-**3. Open it.** In the dashboard sidebar: **Apps &rarr; KiroCrew IDE**, pick a
+**3. Open it.** In the dashboard sidebar: **Apps → KiroCrew IDE**, pick a
 folder, press **Start**. The first start offers to download the engine
 (openvscode-server, MIT, ~100 MB) after your confirmation; an
 `openvscode-server` or `code-server` already on PATH is used instead.
 
 That is the whole onboarding. Everything else below is optional reading.
 
-<div align="right">[<a href="#readme-top">back to top</a>]</div>
+[Back to top](#kirocrew-ide)
 
 ---
 
@@ -83,18 +69,14 @@ That is the whole onboarding. Everything else below is optional reading.
 workspaces, Start/Stop, engine install, and the workbench docked right there
 while the engine runs. **Fullscreen** raises it over the whole dashboard.
 
-<div align="center">
-  <img src=".github/shots/kirocrew-ide-app.png" alt="The KiroCrew IDE App page before a workspace is opened" width="860">
-</div>
+![The KiroCrew IDE App page before a workspace is opened](.github/shots/kirocrew-ide-app.png)
 
 **The workbench** is VS Code with KiroCrew in the secondary side bar: one
 session per chat tab, every installed agent in the picker, approvals inline,
 file paths as links into editor tabs. It follows the dashboard's light or dark
 mode until you pick a theme of your own.
 
-<div align="center">
-  <img src=".github/shots/kirocrew-ide.png" alt="The KiroCrew IDE: a VS Code workbench docked in the KiroCrew dashboard, with KiroCrew chat in the side bar" width="860">
-</div>
+![The KiroCrew IDE: a VS Code workbench docked in the KiroCrew dashboard, with KiroCrew chat in the side bar](.github/shots/kirocrew-ide.png)
 
 ## What you get
 
@@ -179,7 +161,7 @@ Kiro's bundled agent ids (`spec`, `plan`, …) to `<id>-crewmate` and refuses an
 id the engine advertises as its own, so no gateway session can be one of
 them. The hook's direct child is the one place they run.
 
-<div align="right">[<a href="#readme-top">back to top</a>]</div>
+[Back to top](#kirocrew-ide)
 
 ---
 
@@ -239,6 +221,6 @@ only its package file.
 
 MIT. The IDE engine you install has its own license (openvscode-server: MIT;
 code-server: MIT; Microsoft's VS Code builds and marketplace have their own
-terms &mdash; this mod ships none of them).
+terms — this mod ships none of them).
 
-<div align="right">[<a href="#readme-top">back to top</a>]</div>
+[Back to top](#kirocrew-ide)
