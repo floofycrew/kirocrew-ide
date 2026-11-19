@@ -40,7 +40,7 @@ Module._resolveFilename = function (request, ...rest) {
 };
 require.cache["vscode-stub"] = { id: "vscode-stub", filename: "vscode-stub", loaded: true, exports: stub };
 const ext = require(path.join(here, "..", "extension", "extension.js")).__test;
-const { kasFramesToMessages, kasTabState, kasTabRecord, kasPicks, kasPromptBlocks, kasPermissionChoice, kasToolOutput, isKasTab, KAS_MODES, KAS_SECTION, chatHtml } = ext;
+const { kasFramesToMessages, kasTabState, kasTabRecord, modePicks, MODES_SECTION, kasPromptBlocks, kasPermissionChoice, kasToolOutput, isKasTab, KAS_MODES, KAS_SECTION, chatHtml } = ext;
 
 const upd = (seq, update, sessionId = "sess_1") => ({ kind: "update", seq, sessionId, update });
 const text = (t) => ({ type: "text", text: t });
@@ -250,23 +250,29 @@ test("config_option_update → _config with autopilot/model/effort/mode; session
   assert.deepEqual(kasFramesToMessages(upd(4, { sessionUpdate: "session_info_update", _meta: { kiro: { kind: "context_usage" } } }), ts), []);
 });
 
-test("kasPicks: the four spec-family modes the status advertises, in order, under the Kiro modes section", () => {
+test("modePicks: one Workflows group; a mode KAS advertises runs on Kiro's engine, the rest on the mod's prompts", () => {
   const status = { available: true, modes: [{ id: "vibe", name: "Default" }, { id: "plan", name: "Plan", description: "p" }, { id: "spec", name: "Spec", description: "s" }, { id: "my-agent", name: "my-agent" }, { id: "bug-fix", name: "Bug Fix" }] };
-  const picks = kasPicks(status);
-  assert.deepEqual(picks.map((p) => p.id), ["kas:spec", "kas:bug-fix", "kas:plan"]);
-  assert.ok(picks.every((p) => p.section === KAS_SECTION && p.kas === true));
-  assert.equal(picks[0].description, "s");
+  const picks = modePicks(status);
+  // Always the same four rows, in the same order, whatever the engine behind each one.
+  assert.deepEqual(picks.map((p) => p.id), ["kas:spec", "workflow:quick-spec", "kas:bug-fix", "kas:plan"]);
+  assert.deepEqual(picks.map((p) => p.label), ["Spec", "Quick Spec", "Bug Fix", "Plan"]);
+  assert.ok(picks.every((p) => p.section === MODES_SECTION), "one section: picking a mode is not picking an engine");
+  assert.ok(picks.every((p) => !p.hint), "no hint row to choose an engine from");
+  // The mod's own wording, so the list reads the same either way.
+  assert.match(picks[0].description, /Structured feature development/);
   assert.deepEqual(KAS_MODES, ["spec", "quick-spec", "bug-fix", "plan"]);
 });
 
-test("kasPicks: unavailable → one hint row with the reason; no status → nothing", () => {
-  const picks = kasPicks({ available: false, reason: "kiro-cli not found on PATH or in ~/.local/bin" });
-  assert.equal(picks.length, 1);
-  assert.equal(picks[0].id, "kashint:");
-  assert.equal(picks[0].hint, true);
+test("modePicks: kiro-cli unusable → the same four rows on the mod's prompts, each naming the reason", () => {
+  const picks = modePicks({ available: false, reason: "kiro-cli not found on PATH or in ~/.local/bin" });
+  assert.deepEqual(picks.map((p) => p.id), ["workflow:spec", "workflow:quick-spec", "workflow:bug-fix", "workflow:plan"]);
+  assert.ok(picks.every((p) => p.section === MODES_SECTION && !p.kas));
   assert.match(picks[0].description, /not found/);
-  assert.deepEqual(kasPicks(null), []);
-  assert.deepEqual(kasPicks({ available: true, modes: [] }), []);
+  // Before the first status read: the mod's own workflows, with nothing to explain yet.
+  const early = modePicks(null);
+  assert.deepEqual(early.map((p) => p.id), ["workflow:spec", "workflow:quick-spec", "workflow:bug-fix", "workflow:plan"]);
+  assert.ok(early.every((p) => !/kiro-cli/.test(p.description)));
+  assert.deepEqual(modePicks({ available: true, modes: [] }).map((p) => p.id), ["workflow:spec", "workflow:quick-spec", "workflow:bug-fix", "workflow:plan"]);
 });
 
 test("kasPromptBlocks: contexts first as labelled text blocks, images inline, other files by path, then the text", () => {
@@ -298,14 +304,17 @@ test("isKasTab and the tab-state record round trip (nothing transient persisted)
   assert.equal(kasTabState(undefined).lastSeq, 0);
 });
 
-test("the webview script knows the Kiro-mode pick, the hint, permissionResolved and the Reload label", () => {
+test("the webview script knows the Kiro-mode pick, permissionResolved and the Reload label", () => {
   const html = chatHtml("");
   assert.match(html, /engine==='kas'/);
-  assert.match(html, /kind==='kashint'/);
+  assert.ok(!/kind==='kashint'/.test(html), "no engine-choice hint row in the picker");
   assert.match(html, /case 'permissionResolved'/);
   assert.match(html, /box\.dataset\.requestId=/);
   assert.match(html, /m\.label\|\|'Resume run'/);
   assert.match(html, /runs in kiro-cli on the gateway host/);
+  // The hint names the engine from the session KEY, not from the pick: a gateway
+  // session read "Kiro-mode session kirocrew-ide-spec-…" before 0.38.0.
+  assert.match(html, /const kas = st && st\.key \? \/\^kas:\/\.test\(st\.key\) : picked;/);
 });
 
 test("spec actions on Kiro's engine: specDocuments are the existing documents' absolute paths; a task link remembers engine kas", () => {

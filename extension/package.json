@@ -2,7 +2,7 @@
   "name": "kirocrew-ide-bridge",
   "displayName": "KiroCrew",
   "description": "KiroCrew chat (tabbed, with per-project history), agents, approvals, and the Kiro spec / steering / skills / hooks workflow inside the IDE. Sessions run in the KiroCrew gateway and survive a dropped connection. Installed by the kirocrew-ide FloofyCrew mod. Unofficial.",
-  "version": "0.36.1",
+  "version": "0.38.0",
   "publisher": "kirocrew-ide",
   "license": "MIT",
   "engines": {
@@ -104,6 +104,10 @@
         "command": "kirocrew.chat.reload",
         "title": "KiroCrew: Reload chat view",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "kirocrew.modes.explain",
+        "title": "KiroCrew: Which engine runs the workflows?"
       },
       {
         "command": "kirocrew.chat.nextTab",
@@ -864,13 +868,13 @@
         },
         "kirocrew.specEngine": {
           "type": "string",
-          "enum": ["gateway", "kas"],
-          "default": "gateway",
+          "enum": ["kas", "gateway"],
+          "default": "kas",
           "enumDescriptions": [
-            "Spec actions (create, Sync / Next, Start task, Run all) run as KiroCrew gateway sessions with the mod's own spec prompts on kirocrew.agent / kirocrew.specAgent.",
-            "Spec actions call Kiro's own spec engine in kiro-cli on the gateway host (_kiro/spec/* over the hook's ACP child) and open as Kiro-mode tabs; falls back to the gateway when kiro-cli is unavailable or does not implement a spec method."
+            "Spec actions call Kiro's own spec engine in kiro-cli on the gateway host (_kiro/spec/* over the hook's ACP child) and open as Kiro-mode tabs; falls back to the gateway when kiro-cli is unavailable or does not implement a spec method.",
+            "Spec actions (create, Sync / Next, Start task, Run all) run as KiroCrew gateway sessions with the mod's own spec prompts on kirocrew.agent / kirocrew.specAgent."
           ],
-          "description": "Which engine runs the spec actions: the KiroCrew gateway (default) or Kiro's spec engine in kiro-cli (Kiro-mode tabs)."
+          "description": "Which engine runs the spec actions: Kiro's own spec engine in kiro-cli (default, Kiro-mode tabs, falling back to the gateway when kiro-cli is not usable) or the KiroCrew gateway with the mod's own spec prompts."
         },
         "kirocrew.specAutopilot": {
           "type": "boolean",
@@ -893,6 +897,13 @@
           "minimum": 0,
           "maximum": 20,
           "description": "How many times one task run resumes itself after an interrupted turn before it stops and waits for Resume run (3 = a run can span four turns)."
+        },
+        "kirocrew.throttleRetries": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 10,
+          "description": "When the model provider throttles a turn (a rate refusal, not anything about the conversation), send the same turn again after a wait — 4 s, then 12 s, 30 s and a minute — up to this many times, on gateway chats and Kiro-mode sessions alike. The chat keeps working through the wait and says which retry it is. 0 turns this off and leaves the error in place. A spent usage limit and a model that is unavailable on the backend are never retried: waiting does not help either one."
         },
         "kirocrew.folderName": {
           "type": "string",

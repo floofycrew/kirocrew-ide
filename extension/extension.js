@@ -151,6 +151,40 @@ function unavailableAgentOf(text) {
   return m ? m[1] : "";
 }
 
+// A provider throttle: the model's backend refused this request for rate, not
+// for anything about the conversation, so the same turn sent again a moment
+// later usually goes through. KiroCrew words it "Bedrock is throttling
+// requests. Try: (1) wait a few seconds and retry, or (2) switch to a different
+// model in the picker." (acp/transport_errors.py; "The model provider" on a
+// non-kiro backend) and kiro-cli / KAS pass the provider's own
+// ThrottlingException, "Too many requests" or a 429 through. The IDE does
+// remedy (1) by itself instead of leaving a dead turn in the transcript.
+//
+// Two neighbours must NOT be auto-retried and are excluded by wording: a spent
+// usage limit (retrying cannot help until it resets) and "unavailable on the
+// backend right now (capacity throttle or region rollout)", whose remedy is a
+// different model, not a wait.
+const THROTTLE_RE = /throttl|too many requests|rate ?limit|(?:^|[^\d.])429(?:[^\d.]|$)/i;
+const THROTTLE_EXCLUDE_RE = /unavailable on the backend|usage limit|monthly limit|limit resets|quota exhausted/i;
+function isThrottleText(text) {
+  const s = String(text || "");
+  return THROTTLE_RE.test(s) && !THROTTLE_EXCLUDE_RE.test(s);
+}
+/** How long the nth automatic retry waits. Backs off, then holds at a minute. */
+const THROTTLE_BACKOFF_MS = [4000, 12000, 30000, 60000];
+const THROTTLE_RETRIES_DEFAULT = 3;
+const THROTTLE_RETRIES_MAX = 10;
+function throttleWaitMs(attempt) {
+  const i = Math.max(1, Math.floor(Number(attempt) || 1)) - 1;
+  return THROTTLE_BACKOFF_MS[Math.min(i, THROTTLE_BACKOFF_MS.length - 1)];
+}
+/** `kirocrew.throttleRetries`, clamped; 0 turns the automatic retry off. */
+function throttleRetryCap() {
+  const n = Math.floor(Number(cfg("throttleRetries", THROTTLE_RETRIES_DEFAULT)));
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, THROTTLE_RETRIES_MAX);
+}
+
 // ------------------------------------------------------------- live feed
 
 /** One WebSocket to the dashboard; frames fan out to listeners. Reconnects with backoff. */
@@ -576,7 +610,7 @@ class ChatView {
     if (dropped.length) log("dropped retired model pick(s) " + dropped.join(", ") + "; those tabs use the agent's model");
     this.post({
       type: "choices",
-      agents: kasPicks(kas).concat(agentPicks(this.sessions.agents)),
+      agents: modePicks(kas).concat(agentPicks(this.sessions.agents)),
       models: [{ id: "", label: "agent's model", description: "the agent's configured default" }].concat(models.map((m) => ({ id: m.id, label: m.label || m.id, description: m.id !== m.label ? m.id : "" }))),
       efforts: [{ id: "", label: "default effort", description: "the model's default" }].concat(efforts.map((e) => ({ id: e, label: e[0].toUpperCase() + e.slice(1), description: "" }))),
     });
@@ -592,14 +626,15 @@ class ChatView {
     this.post({ type: "steering", items: docs.map((d) => ({ name: d.name, label: d.label, scope: d.scope, inclusion: d.inclusion, mode: steeringModeLabel(d), description: d.description, path: d.path })) });
   }
   /**
-   * The picker's hint row was clicked. `kas`: Kiro's modes are unavailable on
-   * this host (kiro-cli missing, too old, or not logged in); the reason from
-   * `kas/status` is shown and "Check again" re-reads it.
+   * Why a workflow is not running on Kiro's engine: the reason from `kas/status`
+   * (kiro-cli missing, too old, or not logged in), with "Check again" to re-read
+   * it. The picker names the same reason in the row's description; this is the
+   * palette command for a closer look.
    */
   async explainModes() {
     const status = await kasStatus(true);
     const reason = status.available ? "kiro-cli is usable now; reopen the picker." : String(status.reason || "kiro-cli is not usable on the gateway host");
-    const choice = await vscode.window.showInformationMessage("Kiro modes (Spec, Quick Spec, Bug Fix, Plan) run in kiro-cli on the gateway host. " + reason, "Check again");
+    const choice = await vscode.window.showInformationMessage("Spec, Quick Spec, Bug Fix and Plan run in kiro-cli on the gateway host (the mod's own prompts stand in when it is not usable). " + reason, "Check again");
     if (choice === "Check again") { invalidateKasStatus(); await this.pushChoices(); }
   }
   pushTabs() {
@@ -652,6 +687,7 @@ class ChatView {
   closeTab(id) {
     const index = this.tabs.findIndex((t) => t.id === id);
     if (index < 0) return;
+    this.cancelThrottleRetry(this.tabs[index]);   // no resend into a tab that is gone
     this.tabs.splice(index, 1);
     if (!this.tabs.length) this.newTab(false);
     if (this.active === id) this.active = this.tabs[Math.max(0, index - 1)].id;
@@ -842,6 +878,7 @@ class ChatView {
   /** Post the Adapter's messages to the tab's pane; the `_`-prefixed ones update the tab record instead. */
   applyKasMessages(t, messages) {
     let tabsChanged = false;
+    let retrying = false;   // a throttle retry was just scheduled: the `done` behind the error row is not this turn's
     for (let m of messages) {
       if (m.type === "_attached") { tabsChanged = true; if (m.title && !t.renamed && (t.title === "New chat" || /^Kiro /.test(t.title))) t.title = String(m.title).slice(0, 60); continue; }
       if (m.type === "_mode") { t.settings.mode = m.mode; tabsChanged = true; continue; }
@@ -855,6 +892,19 @@ class ChatView {
       }
       if (m.type === "_title") { if (!t.renamed && (t.title === "New chat" || /^Kiro /.test(t.title))) { t.title = String(m.title).slice(0, 60); tabsChanged = true; } continue; }
       if (m.type === "done" || m.type === "row" || m.type === "question" || m.type === "questionResolved") tabsChanged = true;
+      // KAS streamed the provider's throttle as this turn's error: wait and send
+      // the same prompt or spec invoke again. The error row still shows (the
+      // transcript says what happened) but the `done` the adapter puts behind it
+      // is dropped, because this turn is not over — the pane keeps working
+      // through the wait. Any assistant output means the throttle passed.
+      if (m.type === "row" && m.row && m.row.role === "assistant" && !isErrorRow(m.row)) this.cancelThrottleRetry(t);
+      if (m.type === "error" && t.kasResend && this.throttleRetry(t, m.text, t.kasResend)) {
+        this.post({ type: "error", id: t.id, text: String(m.text || "") });
+        if (t.kas) t.kas.running = true;
+        retrying = true;
+        continue;
+      }
+      if (retrying && m.type === "done") { retrying = false; continue; }
       // A spec action on Kiro's engine takes its checkpoint in runKasSpec, before the
       // invoke; KAS echoes the turn's user message afterwards, and that is the bubble
       // the Revert action belongs on, so the pending id rides along with it.
@@ -979,9 +1029,24 @@ class ChatView {
     const blocks = kasPromptBlocks(text, contexts, attached);
     const checkpoint = await this.checkpointBeforeTurn(t, msg.display || text);
     this.post({ type: "user", id: t.id, local: msg.local || undefined, checkpoint, text: msg.display || text.trim() || blocks[blocks.length - 1].text, contexts: contexts.map((c) => contextChipEcho(c)), files: attached.map((a) => ({ name: a.name, path: a.path, image: a.image, data: a.preview })) });
-    const accepted = await link.request({ op: "prompt", sessionId: k.sessionId, blocks });
-    this.applyKasMessages(t, kasFramesToMessages(accepted, k));
-    this.pushTabs();
+    // What a throttle retry sends again. kiro-cli reaches the model through
+    // Bedrock, which throttles like any other caller; the error can come back
+    // from the prompt call or later as the session's error frame, so both go
+    // through throttleRetry with this closure (not serialized with the tab).
+    const prompt = async () => {
+      const again = await this.kasLink().request({ op: "prompt", sessionId: k.sessionId, blocks });
+      this.applyKasMessages(t, kasFramesToMessages(again, k));
+      this.pushTabs();
+    };
+    t.kasResend = prompt;
+    try {
+      const accepted = await link.request({ op: "prompt", sessionId: k.sessionId, blocks });
+      this.applyKasMessages(t, kasFramesToMessages(accepted, k));
+      this.pushTabs();
+    } catch (error) {
+      const why = (error && error.message) || String(error);
+      if (!this.throttleRetry(t, why, prompt)) throw error;
+    }
   }
   /** Approve / Reject on a Kiro-mode approval card: the parked request is answered with the matching ACP option. */
   async kasApprove(t, requestId, action) {
@@ -1028,7 +1093,10 @@ class ChatView {
    */
   async specEngine() {
     const front = this.tab(this.active);
-    const wanted = cfg("specEngine", "gateway") === "kas" || (front && isKasTab(front));
+    // Kiro's own engine is the default (package.json: kirocrew.specEngine "kas"):
+    // a Specs / spec-editor action runs the real Spec mode in kiro-cli unless the
+    // setting says gateway, and falls back to the gateway when kiro-cli is not usable.
+    const wanted = cfg("specEngine", "kas") !== "gateway" || (front && isKasTab(front));
     if (!wanted) return "gateway";
     const status = await kasStatus();
     return status && status.available ? "kas" : "gateway";
@@ -1098,7 +1166,15 @@ class ChatView {
     // offers "Revert changes" like every other turn; applyKasMessages puts the id on the
     // user bubble KAS echoes for the invoke.
     t.kas.pendingCheckpoint = (await this.checkpointBeforeTurn(t, title || op)) || null;
-    await this.kasSpec("_kiro/spec/invoke", Object.assign({ operation: op, sessionId }, args));
+    // A throttled spec operation is sent again as the same invoke on the same session.
+    const invoke = () => this.kasSpec("_kiro/spec/invoke", Object.assign({ operation: op, sessionId }, args));
+    t.kasResend = invoke;
+    try {
+      await invoke();
+    } catch (error) {
+      const why = (error && error.message) || String(error);
+      if (!this.throttleRetry(t, why, invoke)) throw error;
+    }
     t.kas.running = true;   // the invoke's turn (KAS echoes its user message; turnEnd closes it)
     this.pushTabs();
     // The task metadata is polled while this run is live (requirement 5.4), event or not.
@@ -1149,9 +1225,12 @@ class ChatView {
       } else if (msg.type === "image" && msg.path) {
         this.post(Object.assign({ type: "image", id: t.id, path: msg.path }, await imageData(msg.path)));
       } else if (msg.type === "stop" && isKasTab(t)) {
+        t.stopped = true;
+        this.cancelThrottleRetry(t);   // Stop also means "do not send this turn again"
         await this.kasStop(t);
       } else if (msg.type === "stop" && t.key) {
         t.stopped = true; // a run the user stopped is not resumed on its own
+        this.cancelThrottleRetry(t);
         this.noteLinkOutcome(t, "stopped");
         await this.sessions.stop(t.key);
       } else if (msg.type === "resume" && isKasTab(t)) {
@@ -1194,6 +1273,8 @@ class ChatView {
     const files = Array.isArray(msg.files) ? msg.files : [];
     const contexts = Array.isArray(msg.contexts) ? msg.contexts : [];
     if (!text.trim() && !files.length && !contexts.length) return;
+    // A turn the user sends now replaces whatever a throttle retry was waiting to resend.
+    this.cancelThrottleRetry(t);
     // The page drew this turn's bubble already (`msg.local`) and set its pane to running;
     // should anything below throw, the error row lands under it and the pane is released.
     const release = () => { if (msg.local) this.post({ type: "done", id: t.id }); };
@@ -1279,14 +1360,21 @@ class ChatView {
     // row; onFrame resends this turn once from here (set before the POST so the row
     // cannot outrun it).
     t.retryTurn = { text, agent: gatewayAgent(agent), meta, tried: false };
+    const resend = () => this.sessions.send(t.key, text, gatewayAgent(agent), meta);
     try {
       await this.sessions.send(t.key, text, agent, meta);
     } catch (error) {
+      const why = (error && error.message) || String(error);
       // An old session pinned to an agent the gateway no longer has (a retired
       // kiro-spec-plan handle such as "spec"): re-pin to the crew default once and resend.
-      if (!(await this.repinUnavailableAgent(t, error && error.message))) throw error;
-      t.retryTurn.tried = true;
-      await this.sessions.send(t.key, text, gatewayAgent(agent), meta);
+      if (await this.repinUnavailableAgent(t, why)) {
+        t.retryTurn.tried = true;
+        await resend();
+        return;
+      }
+      // The provider throttled the send itself: wait and send the same turn again.
+      if (this.throttleRetry(t, why, resend)) return;
+      throw error;
     }
   }
   /**
@@ -1307,6 +1395,56 @@ class ChatView {
     this.saveTabs(); this.pushTabs();
     this.post({ type: "status", id: t.id, text: "This session was pinned to '" + name + "', a Kiro mode id the gateway cannot run (it came from the retired kiro-spec-plan handles). It now runs on the crew default agent; pick another agent from the picker if you want one. Kiro's own modes run in kiro-cli through the Kiro modes group." });
     return true;
+  }
+  /**
+   * A turn the provider throttled (isThrottleText): wait and send the same turn
+   * again, up to `kirocrew.throttleRetries` times with a backoff, which is
+   * remedy (1) of the host's own message. The waiting row replaces the previous
+   * one and keeps the pane working, so the chat does not look finished while a
+   * retry is pending.
+   *
+   * Answers true when a retry is scheduled — the caller must then swallow the
+   * error, because this turn is not over. Answers false when the text is not a
+   * throttle, the feature is off, the user stopped the tab, or the attempts ran
+   * out; the last case says so in the transcript and leaves the caller to
+   * surface the error as usual.
+   *
+   * `resend` runs the same send again; its own failure comes back here, so a
+   * throttle that repeats keeps backing off and anything else surfaces.
+   */
+  throttleRetry(t, text, resend) {
+    if (!t || !isThrottleText(text)) return false;
+    const th = t.throttle || (t.throttle = { tries: 0, timer: null });
+    const cap = throttleRetryCap();
+    if (!cap || t.stopped) { this.cancelThrottleRetry(t); return false; }
+    if (th.tries >= cap) {
+      this.post({ type: "status", id: t.id, text: "Still throttled after " + th.tries + " automatic " + (th.tries === 1 ? "retry" : "retries") + "; this turn is not being resent again. Send it again in a minute, or pick a different model in the picker (kirocrew.throttleRetries sets how many retries are allowed)." });
+      th.tries = 0;
+      return false;
+    }
+    th.tries += 1;
+    const wait = throttleWaitMs(th.tries);
+    // `starting` is the row kind that both says something and holds the pane in
+    // its working state, and it replaces the one before it — one live line.
+    this.post({ type: "starting", id: t.id, text: "The provider is throttling requests — sending this turn again in " + Math.round(wait / 1000) + " s (retry " + th.tries + " of " + cap + ")." });
+    if (th.timer) clearTimeout(th.timer);
+    th.timer = setTimeout(() => {
+      th.timer = null;
+      if (t.stopped) { th.tries = 0; return; }
+      Promise.resolve().then(resend).catch((error) => {
+        const why = (error && error.message) || String(error);
+        if (!this.throttleRetry(t, why, resend)) this.post({ type: "error", id: t.id, text: why });
+      });
+    }, wait);
+    return true;
+  }
+  /** Drop a pending throttle retry and its count: the user stopped, sent something else, or the turn ended. */
+  cancelThrottleRetry(t) {
+    const th = t && t.throttle;
+    if (!th) return;
+    if (th.timer) clearTimeout(th.timer);
+    th.timer = null;
+    th.tries = 0;
   }
   /**
    * The steering of one turn: { contexts, note }. `contexts` are the fileMatch
@@ -1853,7 +1991,10 @@ class ChatView {
         // The answer's text decides later whether a stop was a question; a
         // failure row (the ceiling card included) is the reason the run check
         // reads once the turn is judged from tasks.md.
-        if (row.role === "assistant" && !isErrorRow(row)) t.lastAssistant = row.content || "";
+        // An answer means the throttle passed: the next one starts its own count.
+        // (A `chat_done` cannot do this — one arrives right behind the error row
+        // whose retry is pending.)
+        if (row.role === "assistant" && !isErrorRow(row)) { t.lastAssistant = row.content || ""; this.cancelThrottleRetry(t); }
         if (isErrorRow(row)) {
           // The unavailable-agent refusal streamed as the turn's error row: re-pin once and resend the same turn.
           const retry = t.retryTurn;
@@ -1863,6 +2004,9 @@ class ChatView {
               .catch((e) => this.post({ type: "error", id, text: "resend: " + e.message }));
             break;
           }
+          // A provider throttle streamed as the turn's error row: the turn is not
+          // over, so wait and send it again instead of judging the run.
+          if (retry && t.key && this.throttleRetry(t, row.content, () => this.sessions.send(t.key, retry.text, retry.agent, retry.meta))) break;
           this.noteTurnEnd(t, { error: row.content });
         }
         break;
@@ -4509,9 +4653,16 @@ function renderCompose(){
     const rm=document.createElement('button'); rm.className='rm'; rm.textContent='×'; rm.title='Remove'; rm.onclick=(e)=>{ e.stopPropagation(); st.files.splice(it.i,1); renderCompose(); }; ch.appendChild(rm); chipsEl.appendChild(ch); }
   renderHint();
 }
-function renderHint(){ const st=state.get(active); const kas = st && (st.engine==='kas' || (st.settings&&st.settings.engine==='kas'));
+/* Where this tab's turns actually run. A live session is named by its KEY — only a
+   kas: key is a kiro-cli session — because a pick made after the session exists
+   cannot move it; the pick decides only for a draft tab that has no key yet. (Before
+   0.38.0 the pick alone decided, so a gateway session read "Kiro-mode session
+   kirocrew-ide-spec-…", which it never was.) */
+function renderHint(){ const st=state.get(active);
+  const picked = st && (st.engine==='kas' || (st.settings&&st.settings.engine==='kas'));
+  const kas = st && st.key ? /^kas:/.test(st.key) : picked;
   $('hint').textContent = kas ? (st.key ? 'Kiro-mode session '+st.key.replace(/^kas:/,'')+' — runs in kiro-cli on the gateway host; find it again under History.' : "Kiro's own engine: this tab will run in kiro-cli on the gateway host (KAS permissions and Autopilot apply).")
-    : (st&&st.key ? 'session '+st.key+' — runs in the gateway; find it again under History.' : 'Sessions run in the KiroCrew gateway and keep going if this window disconnects.'); }
+    : (st&&st.key ? 'session '+st.key+' — runs in the gateway'+(picked?" (this session was created there; a new tab runs Kiro's engine)":'')+'; find it again under History.' : 'Sessions run in the KiroCrew gateway and keep going if this window disconnects.'); }
 // In-page popover menu (never window.prompt/confirm: those are no-ops in the desktop app).
 function openMenu(anchor, header, items, current, onPick){
   menu.innerHTML=''; if(header){ const h=document.createElement('div'); h.className='h'; h.textContent=header; menu.appendChild(h); }
@@ -4553,8 +4704,6 @@ $('p-agent').onclick=(e)=>{ const st=state.get(active); if(!choices.agents.lengt
   openMenu(e.currentTarget, null, choices.agents, st?pickId(st.settings):'', (it)=>{ if(!st) return;
     // Mirror the extension's derivation so the bar updates before the round trip.
     const [kind, ...rest]=it.id.split(':'); const name=rest.join(':');
-    if(kind==='hint'){ vscode.postMessage({type:'hint', value:name}); return; }
-    if(kind==='kashint'){ vscode.postMessage({type:'hint', value:'kas'}); return; }
     // Mirror the extension's derivation so the bar updates before the round trip (a live tab's
     // engine cannot change; the extension's tabs push restores the bar if the pick was refused).
     if(kind==='kas'){ if(!st.key) st.settings.engine='kas'; if(!st.key || st.engine==='kas') st.settings.mode=name; }
@@ -9013,16 +9162,13 @@ function liveSettings(slot) {
 }
 
 /**
- * The single Agent picker, sectioned like Kiro's: the Kiro-modes group is
- * prepended by the caller (kasPicks, from kas/status), then the mod's
- * prompt-guided workflows, then the crew default and every other agent. Each
- * entry's id encodes the kind so the webview stays dumb: `agent:<name>`,
- * `workflow:<mode>`, `kas:<mode>`, `kashint:`, or "".
+ * The single Agent picker, sectioned like Kiro's: the four workflow modes
+ * (modePicks, prepended by the caller), then the crew default and every other
+ * agent. Each entry's id encodes the kind so the webview stays dumb:
+ * `agent:<name>`, `workflow:<mode>`, `kas:<mode>` or "".
  */
-const WORKFLOWS_SECTION = "Workflows (prompt-guided)";
 function agentPicks(agents) {
   const out = [];
-  for (const w of WORKFLOWS) if (w.id !== "default") out.push({ id: "workflow:" + w.id, label: w.label, description: w.description, section: WORKFLOWS_SECTION });
   out.push({ id: "", label: "Default", description: "the crew default agent — general coding assistance", section: "Your agents" });
   for (const a of agents || []) {
     if (/^kirocrew(-lite|-skill-view-)/.test(a.name)) continue;
@@ -9098,22 +9244,28 @@ async function kasStatus(force) {
 function invalidateKasStatus() { kasStatusCache = { at: 0, value: null, promise: null }; }
 
 /**
- * The picker entries of the "Kiro modes" group (requirements 3.1, 7.1, 7.4):
- * one `kas:<mode>` pick per spec-family mode the hook's status advertises, or a
- * single non-selectable hint row naming the reason when KAS is unavailable.
- * Pure; `status` is the `kas/status` document (or null before the first read).
+ * Spec, Quick Spec, Bug Fix and Plan as ONE group in the picker: picking a mode
+ * is picking the workflow, never the engine behind it. Each row runs Kiro's own
+ * mode in kiro-cli (`kas:<mode>`) when the hook's status advertises it, and the
+ * mod's prompt-guided frame on the picked agent (`workflow:<mode>`) when
+ * kiro-cli is not usable on the gateway host — the same fallback `specEngine()`
+ * makes for the Specs actions, and the same derivation the empty chat's tiles
+ * use (pickMode). Labels stay the mod's own so the list reads the same either
+ * way; a fallback row says in its description why it is not on Kiro's engine.
+ * Pure; `status` is the `kas/status` document (null before the first read).
  */
-function kasPicks(status) {
-  if (!status) return [];
-  if (!status.available) {
-    return [{ id: "kashint:", label: "Kiro modes unavailable", description: String(status.reason || "kiro-cli is not usable on the gateway host"), section: KAS_SECTION, hint: true }];
-  }
-  const advertised = Array.isArray(status.modes) ? status.modes : [];
+const MODES_SECTION = "Workflows";
+function modePicks(status) {
+  const advertised = status && status.available && Array.isArray(status.modes) ? status.modes : [];
+  const why = status && !status.available ? String(status.reason || "kiro-cli is not usable on the gateway host") : "";
   const out = [];
   for (const id of KAS_MODES) {
+    const w = WORKFLOWS.find((x) => x.id === id);
     const m = advertised.find((x) => x && x.id === id);
-    if (!m) continue;
-    out.push({ id: "kas:" + id, label: m.name || id, description: m.description || "", section: KAS_SECTION, kas: true, mode: id });
+    const label = (w && w.label) || (m && m.name) || id;
+    const description = (w && w.description) || (m && m.description) || "";
+    if (m) out.push({ id: "kas:" + id, label, description, section: MODES_SECTION, kas: true, mode: id });
+    else out.push({ id: "workflow:" + id, label, description: description + (why ? " — on the mod's own prompts: " + why : ""), section: MODES_SECTION, mode: id });
   }
   return out;
 }
@@ -11123,6 +11275,7 @@ function activate(context) {
     vscode.commands.registerCommand("kirocrew.newSession", async () => { chat.newTab(); await vscode.commands.executeCommand("kirocrew.chat.focus"); }),
     vscode.commands.registerCommand("kirocrew.toggleChat", () => vscode.commands.executeCommand("workbench.action.toggleAuxiliaryBar")),
     vscode.commands.registerCommand("kirocrew.chat.reload", () => chat.reload("command")),
+    vscode.commands.registerCommand("kirocrew.modes.explain", () => chat.explainModes()),
     // Kiro's tab shortcuts while the chat view has focus (package.json binds them with
     // `focusedView == kirocrew.chat`); Rename also sits in the view's title menu.
     vscode.commands.registerCommand("kirocrew.chat.nextTab", () => chat.stepTab(1)),
@@ -11485,4 +11638,4 @@ function activate(context) {
 
 module.exports = { activate, deactivate() {} };
 // Pure helpers, exposed for `tests/extension_unit.test.mjs` (never used by the host).
-module.exports.__test = { gatewayAgent, GATEWAY_RESERVED_AGENT_IDS, unavailableAgentOf, kasHistoryItems, KAS_SESSIONS_ROUTE, mergeKasTaskState, kasFeatureOfPath, resolveKasViewSession, KasTaskStore, KAS_TASK_POLL_MS, KAS_WS_PATH, KAS_MODES, KAS_SECTION, KAS_TAB_NOTICE, kasStatus, invalidateKasStatus, kasPicks, isKasTab, kasTabState, kasTabRecord, kasPromptBlocks, kasContentText, kasToolOutput, kasPermissionChoice, kasFramesToMessages, toolInputPreview, KasLink, isErrorRow, isTurnLimitRow, turnLimitOf, resumeRequest, isSpecTab, runState, describeLeft, looksLikeQuestion, listSpecs, imageData, IMAGE_PREVIEW_MAX, RESUME_CHAT_TEXT, RESUME_NOTE, readText, readWholeText, SPEC_CONFIG_FILE, WORKFLOW_TYPES, SPEC_TYPES, DEFAULT_WORKFLOW_TYPE, DEFAULT_SPEC_TYPE, DOCUMENT_ORDER, uuid, parseSpecConfig, readSpecConfig, newSpecConfig, serializeSpecConfig, writeSpecConfig, documentOrder, requirementsFileOf, specDocumentRows, SPEC_NAME_PATTERN, SPEC_NAME_MAX, SPEC_NAME_FALLBACK, WORKFLOW_TYPE_PICKS, SPEC_TYPE_PICKS, specNameFromIdea, validateSpecName, existingSpecNames, createSpecFromIdea, specFolderOf, renameSpec, SPEC_DELETE_BUTTON, deleteSpec, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, invalidateSteeringCache, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, taskBlockEnd, findTask, serializeTask, makeAllTasksRequired, parseRequirements, findRequirement, parseProperties, findProperty, correctnessSection, buildSpecModel, loadSpecModel, specDirOf, specFileOf, SpecModelStore, specModelStore, SPEC_MODEL_DEBOUNCE_MS, SPEC_MODEL_FILES, TASK_SESSION_LINKS_KEY, TASK_SESSION_LINKS_MAX, LINK_OUTCOMES, normalizeLink, readLinks, pruneLinks, latestLink, linkMatchesFeature, latestLinkForTask, latestLinkForFeature, findLink, viewSessionTarget, resolveViewSessionLink, TASK_STATES, taskStateLink, taskState, TaskSessionLinks, taskSessionLinks, TASK_LENS_PATTERN, TASK_STATE_LENS_TITLES, TASK_LENS_RETRY, TASK_LENS_FIX, TASK_LENS_VIEW_SESSION, TASK_LENS_MAKE_REQUIRED, taskLensSpecs, optionalMarkRange, SpecTaskCodeLensProvider, TASK_DECORATION_COLORS, TASK_DECORATION_OPTIONAL_OPACITY, TASK_DECORATION_DEBOUNCE_MS, mergeLineRanges, taskDecorationRanges, SpecTaskDecorations, SPEC_CONTEXT_KEYS, SPEC_CONFIG_DIAGNOSTICS, specContextKeyValues, positionAt, specConfigDiagnostic, toVscodeDiagnostic, specDirUri, SpecContextKeys, SpecConfigDiagnostics, SPEC_TASK_DIAGNOSTICS, TASK_FORMAT_RULES, TASK_FORMAT_BOXES, TASK_FORMAT_INDENT, TASK_FORMAT_LINE, TASK_DIAGNOSTICS_DEBOUNCE_MS, taskFormatIssues, toTaskDiagnostic, createDiagnosticCollection, SpecTaskDiagnostics, TASK_FIX_TITLE, TASK_FIX_NUMBER_RULES, taskNumbersOf, fixTaskLine, rangesIntersect, taskFixAction, SpecTaskFixProvider, SPEC_HOVER_PATTERN, REVEAL_REQUIREMENT_COMMAND, requirementRefsAt, requirementRefsAfter, activeRefs, revealRequirementUri, requirementHoverMarkdown, hoverMarkdown, makeHover, requirementHoverResolver, PROPERTY_HOVER_FILE, propertyRefsAt, propertyHoverMarkdown, propertyAtLine, propertyHoverResolver, SpecRequirementHoverProvider, revealRequirement, SPEC_NAV_DOCUMENTS, SPEC_GOTO_COMMAND_PREFIX, SPEC_RESOURCE_WHEN, specDocumentName, specGotoCommand, specNavigationTargets, adjacentSpecDocument, specGotoMenuEntries, specGotoPaletteEntries, specCommandSource, specRunNode, gotoSpecDocument, stepSpecDocument, SPEC_CONTENT_KEY, SPEC_SYNC_WHEN, SPEC_NEXT_WHEN, SPEC_RUN_ALL_WHEN, specDocumentHasContent, nextDocumentDecision, SpecContentKey, specConfigFor, specDocumentState, syncSpecDocument, nextSpecDocument, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, SPEC_TURN_KINDS, specTurnDocument, specSiblings, specTurnText, specTurnDisplay, specTurnTitle, specSiblingContexts, SPEC_START_ANY, SPEC_START_NEW, SpecStartGuard, specStartKey, specTabRecord, specTabMatches, normalizeRow, findMatches, markTextNode, pendingApprovalCards, TOOL_CARD_DISPLAY_MODES, DEFAULT_TOOL_CARD_DISPLAY_MODE, toolRowShouldCollapse, findPathLinks, chatHtml, nextTabIndex, tabLabel, TAB_TITLE_MAX, validateTabTitle, sameDir, slotTime, slotActivity, ageLabel, HOOK_FILE_RE, HOOK_TRIGGERS, HOOK_MATCHER_TRIGGERS, HOOK_ACTION_KINDS, hookNameFromPath, parseHookFile, hookRowLabel, hookRowDescription, hookRowIcon, hookContextValue, hookRowTooltip, toggleHookEnabled, HooksTree, toggleHook, HOOK_RUN_COMMAND, HOOK_RUN_CONFIRM, HOOK_RUN_BUTTON, hookRunDisplay, hookTerminalName, hookRunDecision, hookTerminal, runHook, HOOK_TEMPLATE, HOOK_TRIGGER_DESCRIPTIONS, HOOK_FILE_TRIGGERS, HOOK_DEFAULT_FILE_MATCHER, HOOK_FILE_EXT, HOOK_DOCS_URL, HOOK_DOCS_COMMAND, HOOK_VIEW_MESSAGE, HOOK_VIEW_MESSAGE_PLAIN, setHookViewMessage, buildHookFile, serializeHookFile, hookFileName, hookScopePicks, createHookWizard, MCP_CONFIG_FILE, MCP_DOCS_URL, MCP_OPEN_CONFIG_COMMAND, MCP_CONFIG_ABSENT_MESSAGE, parseMcpConfig, mcpUrlHost, mcpRowDescription, mcpRowIcon, mcpRowTooltip, mcpServerLine, McpServersTree, openMcpConfig, STEERING_TEMPLATE, SKILL_TEMPLATE, STEERING_EMPTY_CONTEXT_KEY, STEERING_GENERATE_COMMAND, STEERING_GENERATE_DISPLAY, STEERING_GENERATE_FILES, STEERING_GENERATE_PROMPT, steeringIsEmpty, ensureSteeringDir, generateSteeringDocs, STEERING_REFINE_COMMAND, STEERING_REFINE_PROMPT, isSteeringDocument, steeringNameOf, steeringRefineDisplay, steeringDocLabel, refineSteeringDoc, STEERING_IMPORT_COMMAND, IMPORT_SOURCES, IMPORT_FIND_EXCLUDE, IMPORT_FIND_MAX, importStem, importTargetName, withSteeringFrontMatter, scanImportSources, importSteeringFromAssistants, SKILL_IMPORT_COMMAND, SKILL_FILE, SKILL_IMPORT_ROUTE, SKILL_NAME_RE, parseGithubSkillUrl, skillNameFromText, skillScopePicks, importSkillFolder, importSkillFromGithub, revealSkill, importSkill, AssetTree, mdToHtml, stageOf, specNameOf, continueAction, REVIEW_EXCERPT_MAX, reviewBlockId, reviewExcerpt, buildReviewTurn, SPEC_REVIEW_CONTEXT_KEYS, specEditorHtml, isSpecDocument, SpecEditorProvider, openSpecPreview, specReviewTarget, reviewSpecDocument, markSpecEditor, renderMarkdown, localizeImages, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, CONTEXT_FILE_KINDS, CONTEXT_PROVIDERS, CONTEXT_CAP, PROVIDER_CAP, TERMINAL_TAIL_LINES, TERMINAL_HISTORY_MAX, FOLDER_FILES_MAX, GIT_ABSENT_MESSAGE, byteLength, capText, tailLines, stripAnsi, formatProblems, formatFolder, formatSpec, formatGitDiff, providerEntry, contextChipLabel, contextChipTooltip, contextChipEcho, providerContext, plainDiagnostic, clipboardVia, trackTerminalOutput, resolveProblems, resolveTerminal, resolveGitDiff, resolveFolder, resolveSpec, pickContext, looksBinary, fileContextEntry, fileContext, sendTerminalToChat, EXPLORER_MAX_ITEMS, explorerSelection, addExplorerToChat, EDITOR_ACTION_IDS, EDITOR_ACTION_TITLES, DEFAULT_ACTION_PROMPTS, SELECTION_GLYPH, actionPrompt, fenceFor, buildSelectionContext, selectionInput, selectionContext, runEditorAction, fencedBlock, addCodeBlockToChat, COMMIT_MESSAGE_COMMAND, COMMIT_MESSAGE_SESSION_TITLE, COMMIT_MESSAGE_TIMEOUT_MS, COMMIT_MESSAGE_GIT_ABSENT, COMMIT_MESSAGE_NOTHING, COMMIT_MESSAGE_PROMPT, pickDiff, commitMessagePrompt, cleanCommitMessage, gitRepository, runBackgroundTurn, generateCommitMessage, DIAGNOSTIC_FIX_COMMAND, DIAGNOSTIC_FIX_TITLE, DIAGNOSTIC_TITLE_MAX, DIAGNOSTIC_GLYPH, DIAGNOSTIC_FIX_PROMPT, diagnosticTitle, plainRange, buildDiagnosticFixContext, diagnosticFixAction, AgentFixCodeActionProvider, runDiagnosticFix, clip, ChatView, Sessions, themeFor, STOCK_THEMES, mergeRosters, agentPicks, activate };
+module.exports.__test = { gatewayAgent, GATEWAY_RESERVED_AGENT_IDS, unavailableAgentOf, isThrottleText, throttleWaitMs, throttleRetryCap, THROTTLE_BACKOFF_MS, THROTTLE_RETRIES_DEFAULT, kasHistoryItems, KAS_SESSIONS_ROUTE, mergeKasTaskState, kasFeatureOfPath, resolveKasViewSession, KasTaskStore, KAS_TASK_POLL_MS, KAS_WS_PATH, KAS_MODES, KAS_SECTION, KAS_TAB_NOTICE, kasStatus, invalidateKasStatus, modePicks, MODES_SECTION, isKasTab, kasTabState, kasTabRecord, kasPromptBlocks, kasContentText, kasToolOutput, kasPermissionChoice, kasFramesToMessages, toolInputPreview, KasLink, isErrorRow, isTurnLimitRow, turnLimitOf, resumeRequest, isSpecTab, runState, describeLeft, looksLikeQuestion, listSpecs, imageData, IMAGE_PREVIEW_MAX, RESUME_CHAT_TEXT, RESUME_NOTE, readText, readWholeText, SPEC_CONFIG_FILE, WORKFLOW_TYPES, SPEC_TYPES, DEFAULT_WORKFLOW_TYPE, DEFAULT_SPEC_TYPE, DOCUMENT_ORDER, uuid, parseSpecConfig, readSpecConfig, newSpecConfig, serializeSpecConfig, writeSpecConfig, documentOrder, requirementsFileOf, specDocumentRows, SPEC_NAME_PATTERN, SPEC_NAME_MAX, SPEC_NAME_FALLBACK, WORKFLOW_TYPE_PICKS, SPEC_TYPE_PICKS, specNameFromIdea, validateSpecName, existingSpecNames, createSpecFromIdea, specFolderOf, renameSpec, SPEC_DELETE_BUTTON, deleteSpec, HOST_CONTEXT_MAX, CONTEXT_BUDGET, parseSteering, globToRegExp, steeringMatches, steeringMentions, listSteering, invalidateSteeringCache, agentLoadsSteering, parseTasks, parseTaskLine, parseTaskTree, flattenTasks, taskBlockEnd, findTask, serializeTask, makeAllTasksRequired, parseRequirements, findRequirement, parseProperties, findProperty, correctnessSection, buildSpecModel, loadSpecModel, specDirOf, specFileOf, SpecModelStore, specModelStore, SPEC_MODEL_DEBOUNCE_MS, SPEC_MODEL_FILES, TASK_SESSION_LINKS_KEY, TASK_SESSION_LINKS_MAX, LINK_OUTCOMES, normalizeLink, readLinks, pruneLinks, latestLink, linkMatchesFeature, latestLinkForTask, latestLinkForFeature, findLink, viewSessionTarget, resolveViewSessionLink, TASK_STATES, taskStateLink, taskState, TaskSessionLinks, taskSessionLinks, TASK_LENS_PATTERN, TASK_STATE_LENS_TITLES, TASK_LENS_RETRY, TASK_LENS_FIX, TASK_LENS_VIEW_SESSION, TASK_LENS_MAKE_REQUIRED, taskLensSpecs, optionalMarkRange, SpecTaskCodeLensProvider, TASK_DECORATION_COLORS, TASK_DECORATION_OPTIONAL_OPACITY, TASK_DECORATION_DEBOUNCE_MS, mergeLineRanges, taskDecorationRanges, SpecTaskDecorations, SPEC_CONTEXT_KEYS, SPEC_CONFIG_DIAGNOSTICS, specContextKeyValues, positionAt, specConfigDiagnostic, toVscodeDiagnostic, specDirUri, SpecContextKeys, SpecConfigDiagnostics, SPEC_TASK_DIAGNOSTICS, TASK_FORMAT_RULES, TASK_FORMAT_BOXES, TASK_FORMAT_INDENT, TASK_FORMAT_LINE, TASK_DIAGNOSTICS_DEBOUNCE_MS, taskFormatIssues, toTaskDiagnostic, createDiagnosticCollection, SpecTaskDiagnostics, TASK_FIX_TITLE, TASK_FIX_NUMBER_RULES, taskNumbersOf, fixTaskLine, rangesIntersect, taskFixAction, SpecTaskFixProvider, SPEC_HOVER_PATTERN, REVEAL_REQUIREMENT_COMMAND, requirementRefsAt, requirementRefsAfter, activeRefs, revealRequirementUri, requirementHoverMarkdown, hoverMarkdown, makeHover, requirementHoverResolver, PROPERTY_HOVER_FILE, propertyRefsAt, propertyHoverMarkdown, propertyAtLine, propertyHoverResolver, SpecRequirementHoverProvider, revealRequirement, SPEC_NAV_DOCUMENTS, SPEC_GOTO_COMMAND_PREFIX, SPEC_RESOURCE_WHEN, specDocumentName, specGotoCommand, specNavigationTargets, adjacentSpecDocument, specGotoMenuEntries, specGotoPaletteEntries, specCommandSource, specRunNode, gotoSpecDocument, stepSpecDocument, SPEC_CONTENT_KEY, SPEC_SYNC_WHEN, SPEC_NEXT_WHEN, SPEC_RUN_ALL_WHEN, specDocumentHasContent, nextDocumentDecision, SpecContentKey, specConfigFor, specDocumentState, syncSpecDocument, nextSpecDocument, kiroTaskRequest, kiroRunAllRequest, phasePrompt, taskPrompt, runAllPrompt, SPEC_TURN_KINDS, specTurnDocument, specSiblings, specTurnText, specTurnDisplay, specTurnTitle, specSiblingContexts, SPEC_START_ANY, SPEC_START_NEW, SpecStartGuard, specStartKey, specTabRecord, specTabMatches, normalizeRow, findMatches, markTextNode, pendingApprovalCards, TOOL_CARD_DISPLAY_MODES, DEFAULT_TOOL_CARD_DISPLAY_MODE, toolRowShouldCollapse, findPathLinks, chatHtml, nextTabIndex, tabLabel, TAB_TITLE_MAX, validateTabTitle, sameDir, slotTime, slotActivity, ageLabel, HOOK_FILE_RE, HOOK_TRIGGERS, HOOK_MATCHER_TRIGGERS, HOOK_ACTION_KINDS, hookNameFromPath, parseHookFile, hookRowLabel, hookRowDescription, hookRowIcon, hookContextValue, hookRowTooltip, toggleHookEnabled, HooksTree, toggleHook, HOOK_RUN_COMMAND, HOOK_RUN_CONFIRM, HOOK_RUN_BUTTON, hookRunDisplay, hookTerminalName, hookRunDecision, hookTerminal, runHook, HOOK_TEMPLATE, HOOK_TRIGGER_DESCRIPTIONS, HOOK_FILE_TRIGGERS, HOOK_DEFAULT_FILE_MATCHER, HOOK_FILE_EXT, HOOK_DOCS_URL, HOOK_DOCS_COMMAND, HOOK_VIEW_MESSAGE, HOOK_VIEW_MESSAGE_PLAIN, setHookViewMessage, buildHookFile, serializeHookFile, hookFileName, hookScopePicks, createHookWizard, MCP_CONFIG_FILE, MCP_DOCS_URL, MCP_OPEN_CONFIG_COMMAND, MCP_CONFIG_ABSENT_MESSAGE, parseMcpConfig, mcpUrlHost, mcpRowDescription, mcpRowIcon, mcpRowTooltip, mcpServerLine, McpServersTree, openMcpConfig, STEERING_TEMPLATE, SKILL_TEMPLATE, STEERING_EMPTY_CONTEXT_KEY, STEERING_GENERATE_COMMAND, STEERING_GENERATE_DISPLAY, STEERING_GENERATE_FILES, STEERING_GENERATE_PROMPT, steeringIsEmpty, ensureSteeringDir, generateSteeringDocs, STEERING_REFINE_COMMAND, STEERING_REFINE_PROMPT, isSteeringDocument, steeringNameOf, steeringRefineDisplay, steeringDocLabel, refineSteeringDoc, STEERING_IMPORT_COMMAND, IMPORT_SOURCES, IMPORT_FIND_EXCLUDE, IMPORT_FIND_MAX, importStem, importTargetName, withSteeringFrontMatter, scanImportSources, importSteeringFromAssistants, SKILL_IMPORT_COMMAND, SKILL_FILE, SKILL_IMPORT_ROUTE, SKILL_NAME_RE, parseGithubSkillUrl, skillNameFromText, skillScopePicks, importSkillFolder, importSkillFromGithub, revealSkill, importSkill, AssetTree, mdToHtml, stageOf, specNameOf, continueAction, REVIEW_EXCERPT_MAX, reviewBlockId, reviewExcerpt, buildReviewTurn, SPEC_REVIEW_CONTEXT_KEYS, specEditorHtml, isSpecDocument, SpecEditorProvider, openSpecPreview, specReviewTarget, reviewSpecDocument, markSpecEditor, renderMarkdown, localizeImages, workflowContext, splitOptions, WORKFLOWS, CONTEXT_KINDS, CONTEXT_FILE_KINDS, CONTEXT_PROVIDERS, CONTEXT_CAP, PROVIDER_CAP, TERMINAL_TAIL_LINES, TERMINAL_HISTORY_MAX, FOLDER_FILES_MAX, GIT_ABSENT_MESSAGE, byteLength, capText, tailLines, stripAnsi, formatProblems, formatFolder, formatSpec, formatGitDiff, providerEntry, contextChipLabel, contextChipTooltip, contextChipEcho, providerContext, plainDiagnostic, clipboardVia, trackTerminalOutput, resolveProblems, resolveTerminal, resolveGitDiff, resolveFolder, resolveSpec, pickContext, looksBinary, fileContextEntry, fileContext, sendTerminalToChat, EXPLORER_MAX_ITEMS, explorerSelection, addExplorerToChat, EDITOR_ACTION_IDS, EDITOR_ACTION_TITLES, DEFAULT_ACTION_PROMPTS, SELECTION_GLYPH, actionPrompt, fenceFor, buildSelectionContext, selectionInput, selectionContext, runEditorAction, fencedBlock, addCodeBlockToChat, COMMIT_MESSAGE_COMMAND, COMMIT_MESSAGE_SESSION_TITLE, COMMIT_MESSAGE_TIMEOUT_MS, COMMIT_MESSAGE_GIT_ABSENT, COMMIT_MESSAGE_NOTHING, COMMIT_MESSAGE_PROMPT, pickDiff, commitMessagePrompt, cleanCommitMessage, gitRepository, runBackgroundTurn, generateCommitMessage, DIAGNOSTIC_FIX_COMMAND, DIAGNOSTIC_FIX_TITLE, DIAGNOSTIC_TITLE_MAX, DIAGNOSTIC_GLYPH, DIAGNOSTIC_FIX_PROMPT, diagnosticTitle, plainRange, buildDiagnosticFixContext, diagnosticFixAction, AgentFixCodeActionProvider, runDiagnosticFix, clip, ChatView, Sessions, themeFor, STOCK_THEMES, mergeRosters, agentPicks, activate };

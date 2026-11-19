@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.36.1",
+  "version": "0.38.0",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -82,7 +82,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "c3e38f6bdde93151eb3c5c1208684f883ebd68bbae4156dcb7ffb4d906c9f938"
+      "sha256": "44700ef48839ca7e5adb11c769ba3c0c44347d85381f6f36f01cb748a5cc95ca"
     },
     {
       "path": "app/app.json",
@@ -102,11 +102,11 @@
     },
     {
       "path": "docs/reference.md",
-      "sha256": "0f08c1236a42c7f9d2db1273fddc5ed35df67d807b6c6bf094f52ee0d7730d47"
+      "sha256": "980f67bf1205652fa5bd898a5281587144a420d457d10bc6bcae3e58466b5ecf"
     },
     {
       "path": "extension/extension.js",
-      "sha256": "eb7abbae97f9ebddf902c57c7e0579015d955f02b633408f1e67230f7b54e31c"
+      "sha256": "11c1d2b1d892f83e1b79909df8043081d6d765c40960fa5e786c5a6815fb7d46"
     },
     {
       "path": "extension/media/fox.svg",
@@ -118,7 +118,7 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "c8bd5f9e0b381adfbd5be31fd3e6c56438913596b612d033822a0fe803ea9703"
+      "sha256": "59600506c413560797818ab22101ebcf3285aec8bdf2670050acb313adb3cf8a"
     },
     {
       "path": "hook/__init__.py",
@@ -338,7 +338,7 @@
     },
     {
       "path": "tests/extension_unit.test.mjs",
-      "sha256": "d02ad4e4f8aedca2edded20eb228b612fcc1aa1a3607f27510304a4d4dc6f62d"
+      "sha256": "388366fa7519cd3b51ca2f51129208f06fd9047105bc2cca9d2b6ef1f47dc420"
     },
     {
       "path": "tests/gallery_test.py",
@@ -346,7 +346,7 @@
     },
     {
       "path": "tests/gateway_agent.test.mjs",
-      "sha256": "263dec68b83a68856f630f6319b4b71268a85c13641809f3556dc06db190dc07"
+      "sha256": "093f4afe7dcb4ac4c0aa6678e402e98b8681d60a228121324f884b3ec34a6b6b"
     },
     {
       "path": "tests/gitdiff_test.py",
@@ -370,7 +370,7 @@
     },
     {
       "path": "tests/kas_adapter.test.mjs",
-      "sha256": "bc07f8c8732edbdc5ab36fea4a8b79959ed4888fb37368e4d8667725961f2f04"
+      "sha256": "5d4fa86500a85652d0fc3912b16fa13f7c9a187988b0fe6e2636163775d5492b"
     },
     {
       "path": "tests/kas_link_test.py",
@@ -507,6 +507,10 @@
     {
       "path": "tests/theme_test.py",
       "sha256": "6f42453bb0756b2e7fe6244e61050559d40ad50e16b840b7bb6c66fe33b2ad7a"
+    },
+    {
+      "path": "tests/throttle_retry.test.mjs",
+      "sha256": "1c792d7a7f46229676825b6bb832406f875172ba2077f0bf2cddf3e026a0316a"
     },
     {
       "path": "tests/trampoline_test.py",

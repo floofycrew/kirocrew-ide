@@ -674,7 +674,7 @@ test("chat webview: KiroCrew's transcript shape — user bubble on the right, ba
   assert.ok(/for\(let i=0;i<4;i\+\+\)/.test(html) && /function setWork\(st\)/.test(html), "the indicator is built per pane and driven by setWork");
 });
 
-test("chat webview: every inline script parses (it is JavaScript inside a template literal), and a hint pick only asks", async () => {
+test("chat webview: every inline script parses (it is JavaScript inside a template literal), and the agent picker holds no engine choice", async () => {
   const vm = await import("node:vm");
   const { chatHtml } = ext.__test;
   const html = chatHtml("fox.svg");
@@ -682,7 +682,10 @@ test("chat webview: every inline script parses (it is JavaScript inside a templa
   assert.ok(scripts.length >= 1, "the composer script is inline");
   for (const body of scripts) new vm.Script(body, { filename: "chat-webview.js" });
   const composer = scripts.find((s) => s.includes("p-agent"));
-  assert.ok(composer && composer.includes("kind==='hint'") && composer.includes("type:'hint'"), "a hint row posts `hint` and changes no setting");
+  assert.ok(composer, "the composer script is inline");
+  // One Workflows group, one row per mode: the picker never asks which engine runs it.
+  assert.ok(!composer.includes("kind==='kashint'"), "no engine-choice hint row");
+  assert.ok(composer.includes("kind==='kas'"), "a mode row still carries its engine for the bar");
 });
 
 test("ChatView remembers which tab was in front: a restored window opens on it, not on the first tab", async () => {
@@ -941,11 +944,10 @@ test("Sessions.history() lists the most recent activity first from the host's IS
 
 
 
-test("agentPicks: the prompt-guided workflows, the crew default, then every agent (the Kiro-modes group is kasPicks', prepended by the caller)", () => {
+test("agentPicks: the crew default, then every agent (the Workflows group is modePicks', prepended by the caller)", () => {
   const { agentPicks, mergeRosters } = ext.__test;
   const picks = agentPicks([{ name: "desk-default" }, { name: "spec" }, { name: "kirocrew-skill-view-abc" }, { name: "kirocrew-lite" }]);
   assert.deepEqual(picks.map((p) => p.section + "|" + p.id), [
-    "Workflows (prompt-guided)|workflow:spec", "Workflows (prompt-guided)|workflow:quick-spec", "Workflows (prompt-guided)|workflow:bug-fix", "Workflows (prompt-guided)|workflow:plan",
     "Your agents|", "Your agents|agent:desk-default", "Your agents|agent:spec",
   ], "skill views and the lite agent never appear; an agent named spec is just an agent");
   assert.ok(picks.every((p) => !p.hint && !p.kiro), "no hint row and no mode-agent entries");

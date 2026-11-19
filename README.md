@@ -114,8 +114,9 @@ mode until you pick a theme of your own.
   (so a diff shows the source); *Review* in the Specs view, the editor's
   preview action and Ctrl/Cmd+K V open the spec editor.
 - **An empty chat offers the four workflows.** Spec, Quick Spec, Bug Fix and
-  Plan as tiles, Kiro's own modes in kiro-cli when they are available and the
-  mod's prompt-guided ones otherwise.
+  Plan as tiles — and as the picker's single *Workflows* group. Each runs
+  Kiro's own mode in kiro-cli when it is available and the mod's prompt frame
+  otherwise; you pick the workflow, never the engine.
 - **Workflows like Kiro.** Steering, Skills and Agent Hooks views with
   generate / refine / import, the editor's *KiroCrew* right-click menu, *Ask the
   agent to fix* on any diagnostic, a commit message from the staged diff.
@@ -128,6 +129,14 @@ mode until you pick a theme of your own.
   *KiroCrew: Revert workspace to a checkpoint…* in the palette lists them all.
   Folders that are not git repositories get no checkpoints (the chat says so
   once). `kirocrew.checkpoints: false` turns it off.
+- **A throttled turn sends itself again.** When the model provider refuses a
+  turn for rate ("Bedrock is throttling requests…"), the chat waits — 4 s, then
+  12 s, 30 s, a minute — and sends the same turn again, up to
+  `kirocrew.throttleRetries` times (3; 0 turns it off), on gateway chats and
+  Kiro-mode sessions alike. The pane keeps working through the wait and names
+  the retry, Stop or a new message cancels it, and when the retries run out the
+  transcript says so. A spent usage limit and a model that is unavailable on the
+  backend are never retried: waiting does not help either one.
 - **Several workspaces, one engine.** A tab row like a browser's; idle
   workspaces sleep and wake in seconds. Profiles and themes follow you between
   browsers.
@@ -139,14 +148,16 @@ each release fixed, is in [docs/reference.md](docs/reference.md).
 
 ## Two engines
 
-A chat tab runs in one of two places, and the agent picker's first two groups
-are the choice:
+The picker has one **Workflows** group — Spec, Quick Spec, Bug Fix, Plan — and
+one *Your agents* group. Picking a workflow is picking the workflow, never the
+engine behind it: each runs **Kiro's own mode in kiro-cli** when a logged-in
+`kiro-cli` is usable on the gateway host, and the mod's prompt frame on your
+agent when it is not (the row says so). The spec actions follow the same rule:
+`kirocrew.specEngine` ships as `kas`, so Create spec, Sync / Next, Start task,
+Run all and Analyze requirements run Kiro's real Spec engine, falling back to
+the gateway path when kiro-cli is unavailable or lacks a spec method.
+`kirocrew.specEngine: gateway` keeps every spec action on the mod's prompts.
 
-- **Gateway sessions** (the default; *Your agents* and *Workflows
-  (prompt-guided)*): a KiroCrew session like the dashboard's, with your crew
-  agents, KiroCrew's policy, approvals, memory and steering injection. The
-  Spec / Quick Spec / Bug Fix / Plan workflows here are the mod's own prompt
-  frames on your agent.
 - **Kiro modes (kiro-cli)**: Kiro's real Spec, Quick Spec, Bug Fix and Plan
   engines, run in a `kiro-cli acp --agent-engine v3` child that the mod's hook
   owns on the gateway host, one per open workspace, spoken to over the Agent
@@ -156,16 +167,17 @@ are the choice:
   Kiro itself. Sessions live in kiro-cli's store (`~/.kiro/sessions`); close
   the laptop mid-turn and the turn keeps running; a reload replays what you
   missed. History lists them under *Kiro modes*; the mod's FloofyCrew page has
-  a read-only table of them. Needs a logged-in `kiro-cli` on the gateway host
-  (`kiro-cli login`); otherwise the picker says why the group is missing.
+  a read-only table of them. Needs `kiro-cli login` on the gateway host;
+  *KiroCrew: Which engine runs the workflows?* says what is missing.
+- **Gateway sessions** (*Your agents*, and the Workflows fallback): a KiroCrew
+  session like the dashboard's, with your crew agents, KiroCrew's policy,
+  approvals, memory and steering injection. The Spec / Quick Spec / Bug Fix /
+  Plan frames here are the mod's own prompts on your agent.
 
 Why the gateway cannot run the built-in modes itself: KiroCrew rewrites
 Kiro's bundled agent ids (`spec`, `plan`, …) to `<id>-crewmate` and refuses an
 id the engine advertises as its own, so no gateway session can be one of
-them. The hook's direct child is the one place they run. Set
-`kirocrew.specEngine` to `kas` to send the spec actions (create spec, Sync /
-Next, Start task, Run all, Analyze requirements) to Kiro's engine as well;
-they fall back to the gateway path when kiro-cli is unavailable.
+them. The hook's direct child is the one place they run.
 
 <div align="right">[<a href="#readme-top">back to top</a>]</div>
 
@@ -189,7 +201,7 @@ the FloofyCrew page):
 | `kas.kiro_cli` | path of the kiro-cli the hook runs (default: PATH, then `~/.local/bin/kiro-cli`) |
 
 IDE-side settings (`kirocrew.*` in VS Code settings): `agent` and `specAgent`
-(which crew agent chats and task runs use), `specEngine` (`gateway` | `kas`), `specAutopilot`, `specAutoResume`, `checkpoints`,
+(which crew agent chats and task runs use), `specEngine` (`kas`, the default, | `gateway`), `specAutopilot`, `specAutoResume`, `checkpoints`, `throttleRetries`,
 `chatFontSize`, `chatWidth`, `toolCardDisplayMode`. The full table of both is
 in [docs/reference.md](docs/reference.md#config-keys-mod-config).
 

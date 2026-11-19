@@ -672,13 +672,20 @@ The engine binds `127.0.0.1` only and, by default, runs without a connection
 token (see `engine.token`); the dashboard's own session is what guards the
 proxy.
 
-**The four modes** (Spec, Quick Spec, Bug Fix, Plan) come in two forms in
-the chat's Agent picker. Under *Kiro modes (kiro-cli)* they are Kiro's own
-engines, run in a `kiro-cli acp` child the hook owns (see *Kiro modes in
-kiro-cli* below); under *Workflows (prompt-guided)* they are the IDE's own
-paraphrases: a workflow frame injected on `kirocrew.agent` (or
-`kirocrew.specAgent` for task runs) in an ordinary gateway session. The
-retired kiro-spec-plan mod (agent files named after the mode ids) never
+**The four modes** (Spec, Quick Spec, Bug Fix, Plan) are **one group** in the
+chat's Agent picker, *Workflows* (0.38.0). Picking a mode is picking the
+workflow, never the engine: `modePicks` gives each row the id `kas:<mode>`
+when the hook's `kas/status` advertises that mode — Kiro's own engine in a
+`kiro-cli acp` child (see *Kiro modes in kiro-cli* below) — and
+`workflow:<mode>` when kiro-cli is not usable, which is the IDE's own
+paraphrase: a workflow frame injected on `kirocrew.agent` (or
+`kirocrew.specAgent` for task runs) in an ordinary gateway session. Labels and
+order never change; a fallback row carries the reason from `kas/status` in its
+description, and *KiroCrew: Which engine runs the workflows?* in the palette
+re-reads it. Before 0.38.0 the picker showed both forms as two groups
+(*Kiro modes (kiro-cli)* and *Workflows (prompt-guided)*) plus a hint row, so
+the same four workflows appeared twice and the engine was the user's problem.
+The retired kiro-spec-plan mod (agent files named after the mode ids) never
 reached the bundled modes: KiroCrew rewrites those ids before the wire and
 kiro-cli loaded the mod's own handle file instead, so its support, the
 `kirocrew.kiroModeAgents` setting and the refusal fallback are gone (0.33.0).
@@ -689,14 +696,14 @@ are ticked): one click, one durable session, every remaining required task
 back to back — no "run task N" per task. Each open row has its own **Start
 task** for a single task; queued (`[~]`) and in-progress (`[-]`) rows show
 their state instead. Both run with Autopilot on (`kirocrew.specAutopilot`),
-as Kiro does, so the run is not interrupted by tool approvals. With
-`kirocrew.specEngine: "kas"` the run is Kiro's own: `_kiro/spec/invoke`
+as Kiro does, so the run is not interrupted by tool approvals. By default
+(`kirocrew.specEngine: "kas"`, 0.38.0) the run is Kiro's own: `_kiro/spec/invoke`
 (`executeTask` / `runAllTasks`) on the spec's session in kiro-cli, whose Task
 Orchestrator queues the tasks, runs them through its task-execution sub-agent
 and writes `[~]` / `[-]` / `[x]` back into `tasks.md` as it goes, with the
-lenses following its task metadata. On the gateway (the default) a paraphrase
-carrying the same task block asks your crew agent for the same non-stop
-loop. Optional tasks (`- [ ]* …`) are skipped by Run all; the spec's
+lenses following its task metadata. With `kirocrew.specEngine: "gateway"` — or
+when kiro-cli is not usable — a paraphrase carrying the same task block asks
+your crew agent for the same non-stop loop. Optional tasks (`- [ ]* …`) are skipped by Run all; the spec's
 context menu has **Run all required and optional tasks**, which removes the
 `*` marks first (Kiro's "make all required").
 
@@ -852,9 +859,11 @@ mint one) and is recorded under 6.1 when run.
 
 ### Spec actions on Kiro's engine (0.34.0)
 
-`kirocrew.specEngine` picks where the spec actions run. `gateway` (default)
-is the path above: the mod's own prompts in a gateway session. `kas` sends
-them to Kiro's spec engine in kiro-cli with Kiro IDE's own argument shapes:
+`kirocrew.specEngine` picks where the spec actions run. **`kas` is the default
+since 0.38.0**: a click in the Specs view or the spec editor launches Kiro's
+own Spec mode in kiro-cli, and only `gateway` keeps them on the path above
+(the mod's own prompts in a gateway session). `kas` uses Kiro IDE's own
+argument shapes:
 `_kiro/spec/resolveSession` (`fresh` for a new spec, `reuse` for a feature's
 existing session) then `_kiro/spec/invoke` — `createSpec` (the ＋ flow),
 `generateDocument` (the title bar's Sync / Next and the Specs view's phase
@@ -935,6 +944,49 @@ in place), so the chat is never a blank tab while the host works.
 session mint takes 3 s: two Run all tasks 400 ms apart, one session, one turn,
 one bubble, one tab.
 
+### A throttled turn sends itself again (0.37.0)
+
+The model's backend sometimes refuses a request for rate rather than for
+anything about the conversation. KiroCrew formats that as
+`❌ Bedrock is throttling requests. Try: (1) wait a few seconds and retry, or
+(2) switch to a different model in the picker. (request_id: …)` — "The model
+provider" on a non-kiro backend — and kiro-cli / KAS pass the provider's own
+`ThrottlingException`, "Too many requests" or a 429 through. Either way the
+turn used to end there: a red row in the transcript, the run abandoned, and on
+a spec run-all the orchestrator stopped mid-list.
+
+The IDE now does remedy (1) itself. A throttle recognised by wording
+(`isThrottleText`) schedules a resend of the **same** turn after 4 s, then
+12 s, 30 s and a minute, up to `kirocrew.throttleRetries` times (3 by default,
+0 off, 10 at most). While the wait runs, one row — replaced on each retry —
+reads *The provider is throttling requests — sending this turn again in 12 s
+(retry 2 of 3)*, and the pane stays in its working state, so the chat never
+looks finished with a pending resend. When an answer arrives the count starts
+over; when the retries run out the transcript says *Still throttled after 3
+automatic retries…* and the provider's own error is left in place.
+
+Covered on every send path:
+
+- **Gateway, thrown at the POST** — `_send` swallows the rejection and resends
+  with the same text, agent and `meta` (the re-pin of an unavailable agent is
+  tried first, as before).
+- **Gateway, streamed as the turn's error row** — `onFrame` resends instead of
+  calling `noteTurnEnd`, so an interrupted spec run is not judged from
+  `tasks.md` while a retry is pending.
+- **Kiro-mode tab** — the `prompt` call and the session's later `error` frame
+  both resend the same ACP blocks; the `done` the adapter puts behind that
+  error row is dropped, because the turn is not over.
+- **Spec action on Kiro's engine** — the same `_kiro/spec/invoke` is sent again
+  on the same session, so Run all tasks survives a throttle.
+
+Stop, closing the tab and sending something else all cancel a pending resend
+(Stop means *do not send this turn again*). Two neighbouring errors are
+excluded by wording and never retried, because waiting cannot help either: a
+spent usage limit, and "unavailable on the backend right now (capacity throttle
+or region rollout)", whose remedy is a different model.
+`tests/throttle_retry.test.mjs` covers the classifier, the backoff, the cap,
+all four paths and the cancellations.
+
 ## Config keys (mod config)
 
 | Key | Meaning |
@@ -956,11 +1008,15 @@ one bubble, one tab.
 
 IDE-side settings (VS Code settings, `kirocrew.*`): `agent` (default agent
 for chats and spec phases), `specAgent` (agent that executes tasks),
-`specEngine` (`gateway`, the default, or `kas`: spec actions run on Kiro's own
-engine in kiro-cli, see *Kiro modes in kiro-cli*),
+`specEngine` (`kas`, the default: spec actions run on Kiro's own engine in
+kiro-cli, falling back to the gateway when it is not usable — see *Kiro modes
+in kiro-cli*; `gateway` keeps them on the mod's own prompts),
 `specAutopilot` (task runs approve their tools, default on), `specAutoResume`
 and `specResumeLimit` (an interrupted task run resumes itself from tasks.md,
-whatever cut it, default on, 3 times), `chatFontSize` and `chatWidth` (the
+whatever cut it, default on, 3 times), `throttleRetries` (a turn the provider
+throttled is sent again after a backoff, default 3, 0 off, see *A throttled
+turn sends itself again*), `checkpoints` (a workspace checkpoint before every
+turn so each message offers Revert changes, default on), `chatFontSize` and `chatWidth` (the
 transcript's font size and reading column: `compact` | `comfortable` | `full`),
 `folderName` (dashboard folder, default "KiroCrew IDE"), `notifyApprovals`,
 `toolCardDisplayMode` (`collapseOnComplete` | `alwaysExpanded`, see *Workflows

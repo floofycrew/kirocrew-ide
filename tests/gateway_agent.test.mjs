@@ -103,10 +103,22 @@ test("the slot's refusal at send time re-pins the session once, says so, and res
   await assert.rejects(chat.send(t, { text: "again" }), /unavailable/);
 });
 
+test("Kiro's own spec engine is the default: the setting ships as kas and only 'gateway' opts out", async () => {
+  const pkg = JSON.parse(await (await import("node:fs/promises")).readFile(path.join(here, "..", "extension", "package.json"), "utf8"));
+  const setting = pkg.contributes.configuration.properties["kirocrew.specEngine"];
+  assert.equal(setting.default, "kas", "a spec action runs Kiro's Spec mode in kiro-cli unless told otherwise");
+  assert.deepEqual(setting.enum, ["kas", "gateway"]);
+  // The opt-out answers gateway without probing kiro-cli at all.
+  const { chat } = make();
+  cfgValues = { specEngine: "gateway" };
+  assert.equal(await chat.specEngine(), "gateway");
+  cfgValues = {};
+});
+
 test("specEngine follows a Kiro-mode tab in front when kiro-cli is usable, and the setting otherwise", async () => {
   const { chat } = make();
   const kas = ext.__test;
-  cfgValues = {};
+  cfgValues = { specEngine: "gateway" };
   assert.equal(await chat.specEngine(), "gateway");
   const t = chat.newTab(true); t.kind = "kas"; t.settings.engine = "kas"; t.kas = kas.kasTabState({ mode: "spec" });
   assert.ok(kas.isKasTab(t));
