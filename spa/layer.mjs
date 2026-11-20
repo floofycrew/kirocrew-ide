@@ -393,7 +393,9 @@ export class IdeLayer {
     this.scheduleAssociationReport();
     // The dashboard's own folder picker for "Open a folder…", when this dashboard carries it.
     this.hostPicker = null;       // mounted controller, or null (the menu's own browser then)
-    loadHostPicker(this.doc).then((Component) => {
+    // `scoped`: the layer has no app scope of its own, so the SDK picker (0.13+) renders under the
+    // mod's app name with the listing paths app.json declares; the chunk route (≤ 0.12) needs none.
+    loadHostPicker(this.doc, { win: this.win, scoped: true }).then((Component) => {
       if (!Component || this.disposed) return;
       const picker = mountHostPicker(Component, {
         win: this.win, doc: this.doc,

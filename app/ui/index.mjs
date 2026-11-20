@@ -211,11 +211,14 @@ function progressTitle(progress) {
 }
 
 /**
- * The folder field. With the dashboard's own ProjectPicker reachable (its
- * preloaded chunk; see spa/hostpicker.mjs) the field opens THAT — the same
- * Recent / Browse picker the chat composer and the Spec Builder use, so the
- * IDE's folder choice looks and behaves like the rest of the dashboard. A
- * dashboard without it gets the mod's own combobox below.
+ * The folder field. With the dashboard's own ProjectPicker reachable (the App
+ * SDK's `ProjectPicker` on KiroCrew 0.13+, behind the listing paths app.json
+ * declares; the preloaded chunk on ≤ 0.12; see spa/hostpicker.mjs) the field
+ * opens THAT — the same Recent / Favorites / Browse picker the chat composer
+ * and the Spec Builder use, so the IDE's folder choice looks and behaves like
+ * the rest of the dashboard. This page runs under the App Kit's own scope, so
+ * the unscoped component is the right one here. A dashboard without either
+ * gets the mod's own combobox below.
  */
 function FolderPicker(props) {
   // Boxed: a bare component function handed to setState would be taken for an updater.

@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "kirocrew-ide",
   "name": "KiroCrew IDE",
-  "version": "0.38.1",
+  "version": "0.38.2",
   "description": "Use KiroCrew as your main IDE: a VS Code web engine (openvscode-server) runs as a loopback sidecar of the gateway and the full workbench is served same-origin inside the KiroCrew IDE App, with KiroCrew inside the IDE - chat with any crew agent, durable sessions that survive a dropped connection, tool approvals from the editor, and the Kiro spec workflow over .kiro/specs. Downloads the MIT engine from GitHub releases on your confirmation (the only network use). Unofficial.",
   "authors": [
     "Oscar Tseng"
@@ -86,7 +86,7 @@
     },
     {
       "path": "app/app.json",
-      "sha256": "f61cea2ef2d29c7fa6c4989966f529f47b088112da1a85dfd06ad9b0051904a0"
+      "sha256": "024cc1a148ff9f73c4b17b75ecbf2a31e623aa9f638f80a2f10d3fbc0961137c"
     },
     {
       "path": "app/ui/art/fox.svg",
@@ -98,11 +98,11 @@
     },
     {
       "path": "app/ui/index.mjs",
-      "sha256": "f6f5dbff92fea371c0dbedb5a87cb9991268360384cb2c2cc18af7b1e089b4b6"
+      "sha256": "39688b8dd536e9ecd6f6b17fcf386708faf3bb19ce08f42e1462d82afef8cd25"
     },
     {
       "path": "docs/reference.md",
-      "sha256": "980f67bf1205652fa5bd898a5281587144a420d457d10bc6bcae3e58466b5ecf"
+      "sha256": "c58ecf9ae78f6a0b3f15557649a89f8ff049d23316c080c852ef68d35c18e0c0"
     },
     {
       "path": "extension/extension.js",
@@ -118,7 +118,7 @@
     },
     {
       "path": "extension/package.json",
-      "sha256": "f4813e206af44e584dfea7c53bc6a9a06f30575bc201c9e307f17517a9d49542"
+      "sha256": "d321af8fb87dfc893600b42b3e6ef1b7c687b1759b5d26afd75924eb2dc48202"
     },
     {
       "path": "hook/__init__.py",
@@ -154,7 +154,7 @@
     },
     {
       "path": "preview/package.json",
-      "sha256": "2f50378bd6e6d751d304989578c84467c86aa06b93e470daa6f894c2c71c03e7"
+      "sha256": "15b090c8cbaed39185f1791623799eebd4a7b59219b8b0aff1f0346cbae261ed"
     },
     {
       "path": "spa/hostmodel.mjs",
@@ -162,11 +162,11 @@
     },
     {
       "path": "spa/hostpicker.mjs",
-      "sha256": "fda439a2feca0e1541ba647cdc72185c42dac385fcfd9c0383de32f7a6282358"
+      "sha256": "87da9464c3cd8cdd33da08b996f58182bf0e83623f4b6ac16b5747add9098711"
     },
     {
       "path": "spa/layer.mjs",
-      "sha256": "46282b7971dc66b7baec61da1d4409d1dae5dda251862f074d597792b060e776"
+      "sha256": "bffa0353e38d7b4cd94b0921fb1bd844998dac467938c51304b8ba9d6d34cacd"
     },
     {
       "path": "spa/progress.mjs",
@@ -358,7 +358,7 @@
     },
     {
       "path": "tests/hostpicker.test.mjs",
-      "sha256": "5fe7712a3004bb6a2b9897229c4731048aae92a908f1bafb5da3c18638c8b1c0"
+      "sha256": "c6b0bd133dcb03a8cc6cdba63d312aff193d47977754d62140c7df72ad3e1540"
     },
     {
       "path": "tests/import_check.py",

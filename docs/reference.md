@@ -35,9 +35,19 @@ the README names in one line.
   Spec Builder use, fed by the dashboard's recent-projects and browse APIs),
   anchored under the tag and painted over the fullscreen IDE, so another
   project opens without leaving fullscreen. The App page's folder field opens
-  the same picker. The dashboard does not export that component, so the mod
-  reaches it through the chunk the dashboard preloads (`spa/hostpicker.mjs`,
-  no build hash hardcoded); a dashboard without it gets the mod's own
+  the same picker. How the mod reaches it depends on the host
+  (`spa/hostpicker.mjs`): on KiroCrew 0.13+ the App SDK exports it as
+  `ProjectPicker` (App Kit level 7), gated behind the listing paths an app
+  declares — `app/app.json` declares `/api/browse-dirs`,
+  `/api/browse-dirs/create`, `/api/recent-projects` and
+  `/api/favorite-projects`, so the App page renders it under the App Kit's own
+  scope, and the layer, which has no app scope, renders it under the SDK's
+  `AppApiProvider` with the mod's app name and those same four paths. On
+  KiroCrew ≤ 0.12 the picker was a chunk of its own that the dashboard
+  preloaded, and the mod imports that chunk (no build hash hardcoded). 0.13's
+  bundler folded the picker into a `first-load-*` chunk, so until 0.38.2 a 0.13
+  host found no chunk and got the mod's own combobox instead (seen on the
+  testing host, 2026-11-20). A dashboard with neither route gets the mod's own
   combobox (recent workspaces, then the engine-side directory listing). The picker's box is
   raised above the fullscreen IDE by a rule keyed on its own `pp-…` element ids on *any*
   of its tabs; until 0.30.7 the rule named the Recent and Browse lists only, and KiroCrew
